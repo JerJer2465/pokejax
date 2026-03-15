@@ -46,6 +46,7 @@ function extractPokemonState(pokemon) {
         types: [...(pokemon.types || [])],
         fainted: pokemon.fainted || false,
         isActive: pokemon.isActive || false,
+        volatiles: Object.keys(pokemon.volatiles || {}),
     };
 }
 
@@ -54,18 +55,29 @@ function extractPokemonState(pokemon) {
  */
 function extractBattleState(battle) {
     const sides = battle.sides.map(side => {
+        // Extract side conditions with layer counts / turn data
+        const sc = {};
+        for (const [key, val] of Object.entries(side.sideConditions || {})) {
+            sc[key] = {
+                layers: val.layers || (val['-1']?.layers) || 1,
+                duration: val.duration || 0,
+            };
+        }
         return {
             name: side.name,
             pokemon: side.pokemon.map(p => extractPokemonState(p)),
             active: side.active?.map(p => p ? p.species?.id || '' : '') || [],
             pokemonLeft: side.pokemonLeft,
-            sideConditions: Object.keys(side.sideConditions || {}),
+            sideConditions: sc,
         };
     });
     return {
         turn: battle.turn,
         weather: battle.field?.weatherState?.id || '',
+        weatherTurns: battle.field?.weatherState?.duration || 0,
         terrain: battle.field?.terrainState?.id || '',
+        terrainTurns: battle.field?.terrainState?.duration || 0,
+        trickRoom: battle.field?.pseudoWeather?.trickroom?.duration || 0,
         sides,
         ended: battle.ended,
         winner: battle.winner || '',

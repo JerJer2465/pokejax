@@ -111,14 +111,54 @@ def translate_action(action_str, side, ps_to_jax_map):
     return 0
 
 
-def sync_state_from_ps(state, ps_state, ps_to_jax_maps):
-    """Force-sync JAX state from PS state using slot mapping."""
+weather_map = {
+    '': 0, 'none': 0,
+    'sunnyday': 1, 'desolateland': 1,
+    'raindance': 2, 'primordialsea': 2,
+    'sandstorm': 3,
+    'hail': 4, 'snow': 4,
+}
+
+# PS side condition name -> (JAX SC index, is_layer_based)
+sc_name_map = {
+    'spikes':       (0, True),   # SC_SPIKES: layer count 0-3
+    'toxicspikes':  (1, True),   # SC_TOXICSPIKES: layer count 0-2
+    'stealthrock':  (2, False),  # SC_STEALTHROCK: 0 or 1
+    'stickyweb':    (3, False),  # SC_STICKYWEB: 0 or 1
+    'reflect':      (4, False),  # SC_REFLECT: turns remaining
+    'lightscreen':  (5, False),  # SC_LIGHTSCREEN: turns remaining
+    'auroraveil':   (6, False),  # SC_AURORAVEIL: turns remaining
+    'tailwind':     (7, False),  # SC_TAILWIND: turns remaining
+    'safeguard':    (8, False),  # SC_SAFEGUARD: turns remaining
+    'mist':         (9, False),  # SC_MIST: turns remaining
+}
+
+
+def sync_state_from_ps(state, ps_state, ps_to_jax_maps, item_lookup=None):
+    """Force-sync JAX state from PS state using slot mapping.
+
+    Syncs: HP, status, fainted, boosts, active_idx, PP, items, weather,
+    side conditions, status_turns.
+    """
     new_hp = np.array(state.sides_team_hp)
     new_status = np.array(state.sides_team_status)
+    new_status_turns = np.array(state.sides_team_status_turns)
     new_fainted = np.array(state.sides_team_fainted)
     new_boosts = np.array(state.sides_team_boosts)
     new_active = np.array(state.sides_active_idx)
     new_pp = np.array(state.sides_team_move_pp)
+    new_items = np.array(state.sides_team_item_id)
+    new_side_conds = np.array(state.sides_side_conditions)
+    new_pokemon_left = np.array(state.sides_pokemon_left)
+
+    # Sync weather
+    new_weather = np.array(state.field.weather)
+    new_weather_turns = np.array(state.field.weather_turns)
+    ps_weather = normalize_id(ps_state.get('weather', ''))
+    new_weather = np.int8(weather_map.get(ps_weather, 0))
+    ps_weather_turns = ps_state.get('weatherTurns', 0)
+    if ps_weather_turns:
+        new_weather_turns = np.int8(ps_weather_turns)
 
     for side_idx in range(2):
         ps_mons = ps_state['sides'][side_idx]['pokemon']
@@ -132,6 +172,11 @@ def sync_state_from_ps(state, ps_state, ps_to_jax_maps):
             new_status[side_idx, jax_slot] = status_map.get(mon.get('status', ''), 0)
             new_fainted[side_idx, jax_slot] = mon.get('fainted', False)
 
+            # Status turns (toxic counter, sleep turns, etc.)
+            new_status_turns[side_idx, jax_slot] = mon.get('statusData', 0)
+            if isinstance(mon.get('statusData'), dict):
+                new_status_turns[side_idx, jax_slot] = mon['statusData'].get('turns', 0)
+
             if mon.get('boosts'):
                 boost_order = ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy', 'evasion']
                 for bi, bname in enumerate(boost_order):
@@ -144,13 +189,56 @@ def sync_state_from_ps(state, ps_state, ps_to_jax_maps):
             for mi, ps_move in enumerate(ps_moves[:4]):
                 new_pp[side_idx, jax_slot, mi] = min(ps_move.get('pp', 0), 64)
 
+            # Sync items (consumed items become '')
+            if item_lookup is not None:
+                item_name = normalize_id(mon.get('item', ''))
+                new_items[side_idx, jax_slot] = item_lookup.get(item_name, 0)
+
+        # Sync side conditions
+        new_side_conds[side_idx, :] = 0  # Reset all
+        ps_sc = ps_state['sides'][side_idx].get('sideConditions', {})
+        if isinstance(ps_sc, dict):
+            for sc_name, sc_data in ps_sc.items():
+                sc_key = normalize_id(sc_name)
+                if sc_key in sc_name_map:
+                    sc_idx, is_layer = sc_name_map[sc_key]
+                    if isinstance(sc_data, dict):
+                        if is_layer:
+                            new_side_conds[side_idx, sc_idx] = sc_data.get('layers', 1)
+                        else:
+                            new_side_conds[side_idx, sc_idx] = sc_data.get('duration', 1)
+                            if new_side_conds[side_idx, sc_idx] == 0:
+                                new_side_conds[side_idx, sc_idx] = 1
+                    else:
+                        new_side_conds[side_idx, sc_idx] = 1
+        elif isinstance(ps_sc, list):
+            # Old format: just list of names
+            for sc_name in ps_sc:
+                sc_key = normalize_id(sc_name)
+                if sc_key in sc_name_map:
+                    sc_idx, _ = sc_name_map[sc_key]
+                    new_side_conds[side_idx, sc_idx] = 1
+
+        # Sync pokemonLeft
+        new_pokemon_left[side_idx] = ps_state['sides'][side_idx].get('pokemonLeft', 6)
+
+    new_field = state.field._replace(
+        weather=jnp.int8(new_weather),
+        weather_turns=jnp.int8(new_weather_turns),
+    )
+
     state = state._replace(
         sides_team_hp=jnp.array(new_hp, dtype=jnp.int16),
         sides_team_status=jnp.array(new_status, dtype=jnp.int8),
+        sides_team_status_turns=jnp.array(new_status_turns, dtype=jnp.int8),
         sides_team_fainted=jnp.array(new_fainted, dtype=jnp.bool_),
         sides_team_boosts=jnp.array(new_boosts, dtype=jnp.int8),
         sides_active_idx=jnp.array(new_active, dtype=jnp.int8),
         sides_team_move_pp=jnp.array(new_pp, dtype=jnp.int8),
+        sides_team_item_id=jnp.array(new_items, dtype=jnp.int16),
+        sides_side_conditions=jnp.array(new_side_conds, dtype=jnp.int8),
+        sides_pokemon_left=jnp.array(new_pokemon_left, dtype=jnp.int8),
+        field=new_field,
     )
     return state
 
@@ -389,7 +477,7 @@ def run_differential_test(battles_path, limit=None):
                         ps_to_jax_maps[side_idx] = build_ps_to_jax_map(
                             ps_mons, initial_species[side_idx]
                         )
-                    state = sync_state_from_ps(state, ps_state_turn, ps_to_jax_maps)
+                    state = sync_state_from_ps(state, ps_state_turn, ps_to_jax_maps, item_lookup)
                 continue
 
             if bool(state.finished):
@@ -503,7 +591,7 @@ def run_differential_test(battles_path, limit=None):
                     ps_to_jax_maps[side_idx] = build_ps_to_jax_map(
                         ps_mons, initial_species[side_idx]
                     )
-                state = sync_state_from_ps(state, ps_state_turn, ps_to_jax_maps)
+                state = sync_state_from_ps(state, ps_state_turn, ps_to_jax_maps, item_lookup)
 
         # ---- WINNER CHECK ----
         ps_finished = battle.get('winner') is not None
