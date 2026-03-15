@@ -1,9 +1,11 @@
 """
 Generate a pre-computed pool of Gen 4 random battle teams.
 
-Reads gen4randombattle.json and gen4_base_stats.json from the
-PokemonShowdownClaude data directory, then generates N_TEAMS teams
-using the same sampling logic as Showdown's random team builder.
+Uses the engine's own Tables for species/move/ability/item ID mappings,
+ensuring the team pool is compatible with the battle engine.
+
+Reads gen4randombattle.json from PokemonShowdownClaude/data for the
+set/role/movepool definitions, but maps all names to engine IDs.
 
 Output: data/team_pool.npz containing:
   - teams: int16[N_TEAMS, 6, FIELDS_PER_MON]
@@ -17,6 +19,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -25,7 +28,7 @@ import numpy as np
 # Fields per Pokemon in the pool array
 # species_id, ability_id, item_id, type1, type2,
 # base_hp, base_atk, base_def, base_spa, base_spd, base_spe,
-# max_hp, move_id_0..3, move_pp_0..3, level
+# max_hp, move_id_0..3, move_pp_0..3, level, weight_hg
 FIELDS_PER_MON = 22
 
 FIELD_NAMES = [
@@ -46,159 +49,40 @@ TYPE_MAP = {
 }
 
 
-def load_data(bot_data_dir: str):
-    """Load randbats JSON and base stats."""
-    with open(os.path.join(bot_data_dir, 'gen4randombattle.json')) as f:
-        randbats = json.load(f)
-
-    # Try to load base stats if available
-    base_stats_path = os.path.join(bot_data_dir, 'gen4_base_stats.json')
-    base_stats = {}
-    if os.path.exists(base_stats_path):
-        with open(base_stats_path) as f:
-            base_stats = json.load(f)
-
-    return randbats, base_stats
+def normalize_name(name: str) -> str:
+    """Normalize a Pokemon/move/ability/item name for lookup.
+    Converts to lowercase, removes non-alphanumeric chars.
+    """
+    return re.sub(r'[^a-z0-9]', '', name.lower())
 
 
 def compute_stat(base: int, iv: int, ev: int, level: int, nature_mult: float = 1.0) -> int:
-    """Compute a non-HP stat."""
     return int((int((2 * base + iv + ev // 4) * level / 100) + 5) * nature_mult)
 
 
 def compute_hp(base: int, iv: int, ev: int, level: int) -> int:
-    """Compute HP stat."""
     if base == 1:  # Shedinja
         return 1
     return int((2 * base + iv + ev // 4) * level / 100) + level + 10
 
 
-def build_name_to_id_maps(randbats: dict, base_stats: dict):
-    """Build name→ID mappings for species, abilities, items, moves."""
-    species_names = sorted(randbats.keys())
-    species_to_id = {name: i for i, name in enumerate(species_names)}
-
-    # Collect all abilities, items, moves
-    all_abilities = set()
-    all_items = set()
-    all_moves = set()
-
-    for species, data in randbats.items():
-        all_abilities.update(data.get('abilities', []))
-        all_items.update(data.get('items', []))
-        for role_data in data.get('roles', {}).values():
-            all_abilities.update(role_data.get('abilities', []))
-            all_items.update(role_data.get('items', []))
-            all_moves.update(role_data.get('moves', []))
-
-    ability_to_id = {name: i + 1 for i, name in enumerate(sorted(all_abilities))}
-    item_to_id = {name: i + 1 for i, name in enumerate(sorted(all_items))}
-    move_to_id = {name: i + 1 for i, name in enumerate(sorted(all_moves))}
-
-    return species_to_id, ability_to_id, item_to_id, move_to_id
+def build_normalized_lookup(name_to_id: dict) -> dict:
+    """Pre-build a normalized name → id lookup for fast matching."""
+    lookup = {}
+    for k, v in name_to_id.items():
+        lookup[k] = v
+        lookup[normalize_name(k)] = v
+    return lookup
 
 
-def sample_team(randbats: dict, base_stats: dict,
-                species_to_id: dict, ability_to_id: dict,
-                item_to_id: dict, move_to_id: dict) -> np.ndarray:
-    """Sample one random team. Returns int16[6, FIELDS_PER_MON]."""
-    species_list = list(randbats.keys())
-    team = np.zeros((6, FIELDS_PER_MON), dtype=np.int16)
-
-    # Sample 6 unique species
-    chosen = random.sample(species_list, min(6, len(species_list)))
-
-    for slot, species_name in enumerate(chosen):
-        data = randbats[species_name]
-        level = data.get('level', 80)
-
-        # Pick random role
-        roles = data.get('roles', {})
-        if not roles:
-            continue
-        role_name = random.choice(list(roles.keys()))
-        role = roles[role_name]
-
-        # Ability
-        abilities = role.get('abilities', data.get('abilities', ['']))
-        ability_name = random.choice(abilities) if abilities else ''
-        ability_id = ability_to_id.get(ability_name, 0)
-
-        # Item
-        items = role.get('items', data.get('items', ['']))
-        item_name = random.choice(items) if items else ''
-        item_id = item_to_id.get(item_name, 0)
-
-        # Moves (pick 4 from role's move pool)
-        move_pool = role.get('moves', [])
-        if len(move_pool) > 4:
-            chosen_moves = random.sample(move_pool, 4)
-        else:
-            chosen_moves = move_pool[:4]
-        # Pad to 4
-        while len(chosen_moves) < 4:
-            chosen_moves.append('')
-
-        move_ids = [move_to_id.get(m, 0) for m in chosen_moves]
-
-        # EVs/IVs
-        evs = role.get('evs', data.get('evs', {}))
-        ivs = role.get('ivs', data.get('ivs', {}))
-        ev_hp  = evs.get('hp', 85)
-        ev_atk = evs.get('atk', 85)
-        ev_def = evs.get('def', 85)
-        ev_spa = evs.get('spa', 85)
-        ev_spd = evs.get('spd', 85)
-        ev_spe = evs.get('spe', 85)
-        iv_hp  = ivs.get('hp', 31)
-        iv_atk = ivs.get('atk', 31)
-        iv_def = ivs.get('def', 31)
-        iv_spa = ivs.get('spa', 31)
-        iv_spd = ivs.get('spd', 31)
-        iv_spe = ivs.get('spe', 31)
-
-        # Get base stats
-        bs = base_stats.get(species_name, {})
-        b_hp  = bs.get('hp', 80)
-        b_atk = bs.get('atk', 80)
-        b_def = bs.get('def', 80)
-        b_spa = bs.get('spa', 80)
-        b_spd = bs.get('spd', 80)
-        b_spe = bs.get('spe', 80)
-
-        # Types
-        types = bs.get('types', ['Normal'])
-        type1 = TYPE_MAP.get(types[0], 1)
-        type2 = TYPE_MAP.get(types[1], 0) if len(types) > 1 else 0
-
-        # Compute stats
-        max_hp = compute_hp(b_hp, iv_hp, ev_hp, level)
-        # Compute battle stats (stored as base_stats in the state)
-        stat_atk = compute_stat(b_atk, iv_atk, ev_atk, level)
-        stat_def = compute_stat(b_def, iv_def, ev_def, level)
-        stat_spa = compute_stat(b_spa, iv_spa, ev_spa, level)
-        stat_spd = compute_stat(b_spd, iv_spd, ev_spd, level)
-        stat_spe = compute_stat(b_spe, iv_spe, ev_spe, level)
-
-        # Move PP (simplified: all moves have 16 PP with 3/5 PP ups = ~24)
-        move_pp = [24, 24, 24, 24]
-
-        # Weight
-        weight_hg = bs.get('weightkg', 80) * 10  # convert kg to hectograms
-
-        # Fill team array
-        team[slot] = [
-            species_to_id.get(species_name, 0),
-            ability_id, item_id, type1, type2,
-            b_hp, b_atk, b_def, b_spa, b_spd, b_spe,  # raw base stats
-            max_hp,
-            *move_ids,
-            *move_pp,
-            level,
-            int(weight_hg),
-        ]
-
-    return team
+def find_id(name: str, lookup: dict) -> int:
+    """Find ID using exact match, then normalized match."""
+    if name in lookup:
+        return lookup[name]
+    norm = normalize_name(name)
+    if norm in lookup:
+        return lookup[norm]
+    return 0  # Not found
 
 
 def main():
@@ -218,35 +102,151 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    print(f"Loading data from {args.bot_data_dir}...")
-    randbats, base_stats = load_data(args.bot_data_dir)
+    # Load the engine's tables for ID mapping
+    print("Loading engine tables...")
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from pokejax.data.tables import load_tables
+    tables = load_tables(4)
+    print(f"  Species: {len(tables.species_name_to_id)}, "
+          f"Moves: {len(tables.move_name_to_id)}, "
+          f"Abilities: {len(tables.ability_name_to_id)}, "
+          f"Items: {len(tables.item_name_to_id)}")
+
+    # Pre-build normalized lookups for fast matching
+    species_lookup = build_normalized_lookup(tables.species_name_to_id)
+    move_lookup = build_normalized_lookup(tables.move_name_to_id)
+    ability_lookup = build_normalized_lookup(tables.ability_name_to_id)
+    item_lookup = build_normalized_lookup(tables.item_name_to_id)
+
+    # Convert JAX device arrays to numpy for fast CPU access
+    moves_np = np.array(tables.moves)
+
+    # Load randbats and base stats
+    print(f"Loading randbats data from {args.bot_data_dir}...")
+    with open(os.path.join(args.bot_data_dir, 'gen4randombattle.json')) as f:
+        randbats = json.load(f)
+
+    base_stats_path = os.path.join(args.bot_data_dir, 'gen4_base_stats.json')
+    base_stats = {}
+    if os.path.exists(base_stats_path):
+        with open(base_stats_path) as f:
+            base_stats = json.load(f)
+
     print(f"  {len(randbats)} species in gen4randombattle.json")
 
-    species_to_id, ability_to_id, item_to_id, move_to_id = \
-        build_name_to_id_maps(randbats, base_stats)
+    # Validate: check how many species/moves map successfully
+    species_mapped = 0
+    species_unmapped = []
+    for name in randbats:
+        sid = find_id(name, species_lookup)
+        if sid > 0:
+            species_mapped += 1
+        else:
+            species_unmapped.append(name)
 
-    print(f"  {len(ability_to_id)} abilities, {len(item_to_id)} items, {len(move_to_id)} moves")
+    print(f"  Species mapped: {species_mapped}/{len(randbats)}")
+    if species_unmapped and len(species_unmapped) <= 20:
+        print(f"  Unmapped: {species_unmapped}")
 
+    # Generate teams
     print(f"Generating {args.n_teams} teams...")
+    species_list = list(randbats.keys())
     pool = np.zeros((args.n_teams, 6, FIELDS_PER_MON), dtype=np.int16)
+    skipped = 0
+
     for i in range(args.n_teams):
-        pool[i] = sample_team(randbats, base_stats,
-                              species_to_id, ability_to_id,
-                              item_to_id, move_to_id)
+        # Sample 6 unique species
+        chosen = random.sample(species_list, min(6, len(species_list)))
+
+        for slot, species_name in enumerate(chosen):
+            data = randbats[species_name]
+            level = data.get('level', 80)
+
+            # Species ID from engine tables
+            species_id = find_id(species_name, species_lookup)
+
+            # Pick random role
+            roles = data.get('roles', {})
+            if not roles:
+                continue
+            role_name = random.choice(list(roles.keys()))
+            role = roles[role_name]
+
+            # Ability
+            abilities = role.get('abilities', data.get('abilities', ['']))
+            ability_name = random.choice(abilities) if abilities else ''
+            ability_id = find_id(ability_name, ability_lookup)
+
+            # Item
+            items = role.get('items', data.get('items', ['']))
+            item_name = random.choice(items) if items else ''
+            item_id = find_id(item_name, item_lookup)
+
+            # Moves (pick 4 from role's move pool)
+            move_pool = role.get('moves', [])
+            if len(move_pool) > 4:
+                chosen_moves = random.sample(move_pool, 4)
+            else:
+                chosen_moves = move_pool[:4]
+            while len(chosen_moves) < 4:
+                chosen_moves.append('')
+
+            move_ids = []
+            move_pps = []
+            for m in chosen_moves:
+                mid = find_id(m, move_lookup)
+                move_ids.append(mid)
+                # Get PP from engine's move data
+                if mid > 0 and mid < len(moves_np):
+                    pp = int(moves_np[mid, 5])  # MF_PP = 5
+                    # Apply PP ups (randbats get max PP ups = pp * 8/5)
+                    pp = pp * 8 // 5
+                    move_pps.append(min(pp, 64))
+                else:
+                    move_pps.append(24)  # default
+
+            # EVs/IVs
+            evs = role.get('evs', data.get('evs', {}))
+            ivs = role.get('ivs', data.get('ivs', {}))
+            ev_hp  = evs.get('hp', 85)
+            iv_hp  = ivs.get('hp', 31)
+
+            # Get base stats from base_stats.json
+            bs = base_stats.get(species_name, {})
+            b_hp  = bs.get('hp', 80)
+            b_atk = bs.get('atk', 80)
+            b_def = bs.get('def', 80)
+            b_spa = bs.get('spa', 80)
+            b_spd = bs.get('spd', 80)
+            b_spe = bs.get('spe', 80)
+
+            # Types
+            types = bs.get('types', ['Normal'])
+            type1 = TYPE_MAP.get(types[0], 1)
+            type2 = TYPE_MAP.get(types[1], 0) if len(types) > 1 else 0
+
+            # Compute max HP
+            max_hp = compute_hp(b_hp, iv_hp, ev_hp, level)
+
+            # Weight
+            weight_hg = int(bs.get('weightkg', 80) * 10)
+
+            pool[i, slot] = [
+                species_id, ability_id, item_id, type1, type2,
+                b_hp, b_atk, b_def, b_spa, b_spd, b_spe,
+                max_hp,
+                *move_ids,
+                *move_pps,
+                level,
+                weight_hg,
+            ]
+
         if (i + 1) % 10000 == 0:
             print(f"  {i + 1}/{args.n_teams}")
 
     # Save
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    np.savez_compressed(
-        args.output,
-        teams=pool,
-        field_names=FIELD_NAMES,
-        species_names=sorted(randbats.keys()),
-        ability_names=[''] + sorted(ability_to_id.keys()),
-        item_names=[''] + sorted(item_to_id.keys()),
-        move_names=[''] + sorted(move_to_id.keys()),
-    )
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    np.savez_compressed(args.output, teams=pool, field_names=FIELD_NAMES)
     print(f"Saved to {args.output} ({os.path.getsize(args.output) / 1024 / 1024:.1f} MB)")
 
 
