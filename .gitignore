@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Data files (large)
+data/*.jsonl
+data/*.npz
+data/team_pool*
+
+# JAX cache
+/tmp/jax_compile_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Checkpoints
+checkpoints/
+*.ckpt
+
+# Logs
+*.log

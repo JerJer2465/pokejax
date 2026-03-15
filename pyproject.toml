@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pokejax"
+version = "0.1.0"
+description = "GPU-accelerated Pokemon battle simulator in JAX"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4.25",
+    "jaxlib>=0.4.25",
+    "numpy>=1.24",
+    "pytest>=7.0",
+]
+
+[project.optional-dependencies]
+cuda = ["jax[cuda12]>=0.4.25"]
+dev = ["pytest>=7.0", "pytest-xdist"]
+rl = ["flax>=0.9.0", "optax>=0.2.4", "orbax-checkpoint>=0.6.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pokejax*"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: marks tests as slow (skipped by default; run with -m slow)",
+]
