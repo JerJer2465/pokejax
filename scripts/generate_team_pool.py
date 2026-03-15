@@ -212,13 +212,17 @@ def main():
             iv_hp  = ivs.get('hp', 31)
 
             # Get base stats from base_stats.json
-            bs = base_stats.get(species_name, {})
+            # Keys in JSON: hp, attack, defense, special-attack, special-defense, speed
+            # base_stats uses lowercase keys, randbats uses TitleCase
+            bs = base_stats.get(species_name,
+                 base_stats.get(species_name.lower(),
+                 base_stats.get(normalize_name(species_name), {})))
             b_hp  = bs.get('hp', 80)
-            b_atk = bs.get('atk', 80)
-            b_def = bs.get('def', 80)
-            b_spa = bs.get('spa', 80)
-            b_spd = bs.get('spd', 80)
-            b_spe = bs.get('spe', 80)
+            b_atk = bs.get('attack', bs.get('atk', 80))
+            b_def = bs.get('defense', bs.get('def', 80))
+            b_spa = bs.get('special-attack', bs.get('spa', 80))
+            b_spd = bs.get('special-defense', bs.get('spd', 80))
+            b_spe = bs.get('speed', bs.get('spe', 80))
 
             # Types
             types = bs.get('types', ['Normal'])

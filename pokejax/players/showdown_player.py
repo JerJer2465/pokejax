@@ -16,7 +16,9 @@ from __future__ import annotations
 import os
 import re
 import pickle
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
+
+import orjson
 
 import numpy as np
 import jax
@@ -281,7 +283,10 @@ class ObsBridge:
             acc = getattr(move, 'accuracy', 100) or 100
             type_id = _TYPE_MAP.get(getattr(move, 'type', None), 1)
             category = 2 if bp == 0 else 0  # rough guess
-            priority = getattr(move, 'priority', 0) or 0
+            try:
+                priority = getattr(move, 'priority', 0) or 0
+            except (KeyError, AttributeError):
+                priority = 0
 
         # PS type index (0-based)
         ps_type = max(0, min(type_id - 1, _N_PS_TYPES - 1))
@@ -363,11 +368,12 @@ class ObsBridge:
         buf[_OFF_HP_BIN + _bin_idx(hp_pct, _HP_THRESHOLDS)] = 1.0
 
         # Base stats (normalized /255)
+        # Model was trained with engine's team pool which now has real stats
+        # and the model handles them fine (100% vs random in engine)
         bst = getattr(pokemon, 'base_stats', {}) or {}
-        stats = [bst.get('hp', 80), bst.get('atk', 80), bst.get('def', 80),
-                 bst.get('spa', 80), bst.get('spd', 80), bst.get('spe', 80)]
-        for i, s in enumerate(stats):
-            buf[_OFF_BASE_STATS + i] = s / 255.0
+        stat_order = ['hp', 'atk', 'def', 'spa', 'spd', 'spe']
+        for i, sname in enumerate(stat_order):
+            buf[_OFF_BASE_STATS + i] = bst.get(sname, 80) / 255.0
 
         # Boosts (7 stats × 13 levels)
         boosts = dict(pokemon.boosts) if pokemon.boosts else {}
@@ -389,16 +395,19 @@ class ObsBridge:
                 vol_idx = _VOLATILE_NAMES[vol_name]
                 buf[_OFF_VOLATILE + vol_idx] = 1.0
 
-        # Types
-        types_raw = pokemon.types if pokemon.types else (PokemonType.NORMAL,)
-        t1 = _TYPE_MAP.get(types_raw[0], 1) if types_raw[0] else 1
-        ps_t1 = max(0, min(t1 - 1, _N_PS_TYPES - 1))
-        buf[_OFF_TYPE1 + ps_t1] = 1.0
-        if len(types_raw) > 1 and types_raw[1] is not None:
-            t2 = _TYPE_MAP.get(types_raw[1], 0)
-            if t2 > 0:
-                ps_t2 = max(0, min(t2 - 1, _N_PS_TYPES - 1))
-                buf[_OFF_TYPE2 + ps_t2] = 1.0
+        # Types (one-hot, PS uses 0-based: Normal=0, Fire=1, ...)
+        types = pokemon.types if hasattr(pokemon, 'types') and pokemon.types else (PokemonType.NORMAL,)
+        if types[0] is not None:
+            pokejax_type = _TYPE_MAP.get(types[0], 1)  # pokejax 1-based
+            ps_type1 = max(0, min(pokejax_type - 1, _N_PS_TYPES - 1))
+            buf[_OFF_TYPE1 + ps_type1] = 1.0
+        else:
+            buf[_OFF_TYPE1 + 0] = 1.0  # Normal fallback
+        if len(types) > 1 and types[1] is not None:
+            pokejax_type2 = _TYPE_MAP.get(types[1], 0)
+            if pokejax_type2 > 0:
+                ps_type2 = max(0, min(pokejax_type2 - 1, _N_PS_TYPES - 1))
+                buf[_OFF_TYPE2 + ps_type2] = 1.0
 
         # Fainted, active, slot, is_own
         buf[_OFF_IS_FAINTED] = 1.0 if pokemon.fainted else 0.0
@@ -422,24 +431,73 @@ class ObsBridge:
         # Rest turns bin
         buf[_OFF_REST_BIN] = 1.0  # default: 0 rest turns
 
-        # Level
-        level = pokemon.level if pokemon.level else 100
-        buf[_OFF_LEVEL] = level / 100.0
-
-        # Confusion, taunt, encore, yawn from effects
+        # Substitute HP fraction
+        has_sub = False
         for eff, _ in effects.items():
             vol_name = _EFFECT_TO_VOLATILE.get(eff)
+            if vol_name == "substitute":
+                has_sub = True
+                # poke-env doesn't track sub HP; assume 25% of max HP remaining
+                buf[_OFF_SUB_FRAC] = 0.25
+                break
+
+        # Force trapped (partially trapped by moves like Wrap, Fire Spin, etc.)
+        for eff, _ in effects.items():
+            vol_name = _EFFECT_TO_VOLATILE.get(eff)
+            if vol_name == "partiallytrapped":
+                buf[_OFF_FORCE_TRAP] = 1.0
+                break
+
+        # Move disabled flags (4 dims)
+        if is_own and is_active and available_moves is not None:
+            # Check which move slots are disabled
+            all_moves = list(pokemon.moves.values()) if pokemon.moves else []
+            for i, m in enumerate(moves_ordered[:4]):
+                if m is not None and hasattr(m, 'is_disabled') and m.is_disabled:
+                    buf[_OFF_MOV_DIS + i] = 1.0
+
+        # Confusion bin (4 dims)
+        for eff, turns in effects.items():
+            vol_name = _EFFECT_TO_VOLATILE.get(eff)
             if vol_name == "confusion":
-                buf[_OFF_CONF_BIN + 1] = 1.0  # assume 1 turn
-            elif vol_name == "taunt":
+                conf_t = max(0, min(turns if isinstance(turns, int) else 1, 3))
+                buf[_OFF_CONF_BIN + conf_t] = 1.0
+                break
+        else:
+            buf[_OFF_CONF_BIN] = 1.0  # no confusion = bin 0
+
+        # Taunt, encore, yawn flags
+        for eff, _ in effects.items():
+            vol_name = _EFFECT_TO_VOLATILE.get(eff)
+            if vol_name == "taunt":
                 buf[_OFF_TAUNT] = 1.0
             elif vol_name == "encore":
                 buf[_OFF_ENCORE] = 1.0
             elif vol_name == "yawn":
                 buf[_OFF_YAWN] = 1.0
 
-        # Perish bin (default: 0)
-        buf[_OFF_PERISH_BIN] = 1.0
+        # Level
+        level = pokemon.level if pokemon.level else 100
+        buf[_OFF_LEVEL] = level / 100.0
+
+        # Perish count bin (4 dims: 0=none, 1, 2, 3)
+        perish_count = 0
+        for eff, turns in effects.items():
+            vol_name = _EFFECT_TO_VOLATILE.get(eff)
+            if vol_name == "perishsong":
+                perish_count = max(0, min(turns if isinstance(turns, int) else 3, 3))
+                break
+        buf[_OFF_PERISH_BIN + perish_count] = 1.0
+
+        # Protect count (normalized)
+        # poke-env doesn't track protect count; default 0
+        buf[_OFF_PROTECT] = 0.0
+
+        # Locked move (choice item lock or outrage/petal dance)
+        if is_own and is_active:
+            # If only 1 move is available and we have more moves, likely locked
+            if available_moves is not None and len(available_moves) == 1 and len(pokemon.moves) > 1:
+                buf[_OFF_LOCKED_MOV] = 1.0
 
         return int_ids, buf
 
@@ -458,12 +516,17 @@ class ObsBridge:
         buf[_FOFF_WT_TURNS + max(0, min(weather_turns, 7))] = 1.0
 
         # Trick room / gravity
+        # Defaults: engine always sets bin 0 for these when inactive
+        buf[_FOFF_TR_TURNS] = 1.0
+        buf[_FOFF_GRAVITY_T] = 1.0
         for f, turns in (battle.fields or {}).items():
             if f == Field.TRICK_ROOM:
                 buf[_FOFF_PSEUDO] = 1.0
+                buf[_FOFF_TR_TURNS] = 0.0  # clear default
                 buf[_FOFF_TR_TURNS + max(0, min(turns, 3))] = 1.0
             elif f == Field.GRAVITY:
                 buf[_FOFF_PSEUDO + 1] = 1.0
+                buf[_FOFF_GRAVITY_T] = 0.0  # clear default
                 buf[_FOFF_GRAVITY_T + max(0, min(turns, 3))] = 1.0
 
         # Hazards (own side)
@@ -546,6 +609,25 @@ class ObsBridge:
 
         return buf
 
+    def _get_stable_team_order(self, battle: AbstractBattle, is_own: bool):
+        """Return a stable list of up to 6 Pokemon in fixed slot order.
+
+        poke-env's battle.team dict is keyed by species identifier and
+        the order of insertion is preserved (first seen = first entry).
+        We use this insertion order as the stable slot assignment so that
+        each Pokemon always occupies the same token position throughout
+        the battle, matching how pokejax's engine assigns fixed slot
+        indices 0-5.
+        """
+        if is_own:
+            team = list(battle.team.values())
+        else:
+            team = list(battle.opponent_team.values())
+        # Pad to 6 slots (unseen Pokemon → None)
+        while len(team) < 6:
+            team.append(None)
+        return team[:6]
+
     def build_obs(self, battle: AbstractBattle) -> dict:
         """
         Build pokejax observation from poke-env Battle.
@@ -567,27 +649,83 @@ class ObsBridge:
         int_ids_list.append(np.zeros(INT_IDS_PER_TOKEN, dtype=np.int32))
         float_feats_list.append(field_feats)
 
-        # Tokens 1-6: own team
-        own_active = battle.active_pokemon
-        own_team = list(battle.team.values())
-        # Reorder: active first, then reserve (alive), then fainted
-        ordered_own = []
-        if own_active:
-            ordered_own.append(own_active)
-        for p in own_team:
-            if p != own_active and not p.fainted:
-                ordered_own.append(p)
-        for p in own_team:
-            if p != own_active and p.fainted:
-                ordered_own.append(p)
+        # Build stable slot assignments (fixed order, no reordering)
+        own_team = self._get_stable_team_order(battle, is_own=True)
+        opp_team = self._get_stable_team_order(battle, is_own=False)
 
+        own_active = battle.active_pokemon
+        opp_active = battle.opponent_active_pokemon
+
+        # Safety net: verify battle.active_pokemon matches available_moves.
+        # The _handle_battle_message override fixes the main request/turn ordering
+        # issue, but edge cases (Hidden Power variants, etc.) can still cause
+        # mismatches between the active Pokemon's known moves and available_moves.
+        real_active = own_active
+        own_move_list = []
+        if available_moves:
+            avail_names = set(m.id for m in available_moves)
+
+            def _moves_match(pokemon):
+                """Check if ALL available moves are in this Pokemon's known moves.
+                Handles Hidden Power variants (e.g., 'hiddenpowerice' vs 'hiddenpower')."""
+                if not pokemon or not pokemon.moves:
+                    return False
+                p_names = set(m.id for m in pokemon.moves.values())
+                # Also add normalized variants for Hidden Power matching
+                p_names_hp = set()
+                for n in p_names:
+                    p_names_hp.add(n)
+                    if n.startswith('hiddenpower'):
+                        p_names_hp.add('hiddenpower')
+                for n in avail_names:
+                    norm = n if not n.startswith('hiddenpower') else 'hiddenpower'
+                    if n not in p_names and norm not in p_names_hp:
+                        return False
+                return True
+
+            # First check if battle.active_pokemon is correct
+            if _moves_match(own_active):
+                own_move_list = list(own_active.moves.values())[:4]
+            else:
+                # Mismatch — find the real active Pokemon from the team
+                # Use strict matching: ALL available moves must be in the Pokemon's moveset
+                best_match = None
+                best_overlap = 0
+                for p in own_team:
+                    if p is not None and p.moves and not p.fainted:
+                        if _moves_match(p):
+                            real_active = p
+                            own_move_list = list(p.moves.values())[:4]
+                            break
+                        # Track best partial match as fallback
+                        p_names = set(m.id for m in p.moves.values())
+                        overlap = len(avail_names & p_names)
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            best_match = p
+
+                if not own_move_list:
+                    if best_match is not None:
+                        real_active = best_match
+                        own_move_list = list(best_match.moves.values())[:4]
+                    elif own_active and own_active.moves:
+                        own_move_list = list(own_active.moves.values())[:4]
+                    else:
+                        # Last resort: use available_moves directly as the move list
+                        own_move_list = list(available_moves)[:4]
+        elif own_active and own_active.moves:
+            own_move_list = list(own_active.moves.values())[:4]
+
+        # Tokens 1-6: own team (fixed slot order, no reordering)
         for slot in range(6):
-            if slot < len(ordered_own):
-                p = ordered_own[slot]
-                is_active = (p == own_active)
+            p = own_team[slot]
+            if p is not None:
+                is_active = (p is real_active)
+                # For active Pokemon, pass moves in stable slot order
+                slot_moves = own_move_list if is_active else None
                 ii, ff = self._encode_pokemon(
                     p, is_own=True, is_active=is_active, slot=slot,
-                    available_moves=available_moves if is_active else None,
+                    available_moves=slot_moves,
                 )
             else:
                 ii = np.zeros(INT_IDS_PER_TOKEN, dtype=np.int32)
@@ -595,22 +733,10 @@ class ObsBridge:
             int_ids_list.append(ii)
             float_feats_list.append(ff)
 
-        # Tokens 7-12: opponent team
-        opp_active = battle.opponent_active_pokemon
-        opp_team = list(battle.opponent_team.values())
-        ordered_opp = []
-        if opp_active:
-            ordered_opp.append(opp_active)
-        for p in opp_team:
-            if p != opp_active and not p.fainted:
-                ordered_opp.append(p)
-        for p in opp_team:
-            if p != opp_active and p.fainted:
-                ordered_opp.append(p)
-
+        # Tokens 7-12: opponent team (fixed slot order)
         for slot in range(6):
-            if slot < len(ordered_opp):
-                p = ordered_opp[slot]
+            p = opp_team[slot]
+            if p is not None:
                 is_active = (p == opp_active)
                 ii, ff = self._encode_pokemon(
                     p, is_own=False, is_active=is_active, slot=slot,
@@ -629,14 +755,31 @@ class ObsBridge:
         int_ids = np.stack(int_ids_list)      # (15, 8)
         float_feats = np.stack(float_feats_list)  # (15, 394)
 
-        # Legal mask
+        # Legal mask — built from slot positions, matching pokejax engine
         legal_mask = np.zeros(N_ACTIONS, dtype=np.float32)
-        for i in range(min(len(available_moves), 4)):
-            legal_mask[i] = 1.0
-        for i in range(min(len(available_switches), 6)):
-            legal_mask[4 + i] = 1.0
+
+        # Move actions 0-3: legal if the move (by slot order) is in available_moves
+        # Use move.id string matching (not object identity) to handle poke-env
+        # creating new Move objects for variants like Hidden Power Ice
+        available_move_names = set(m.id for m in available_moves)
+        for i, m in enumerate(own_move_list[:4]):
+            if m is not None and m.id in available_move_names:
+                legal_mask[i] = 1.0
+
+        # Switch actions 4-9: legal if Pokemon at that slot is in available_switches
+        # Pokemon objects are persistent, so identity matching works here
+        available_switch_ids = set(id(p) for p in available_switches)
+        for slot in range(6):
+            p = own_team[slot]
+            if p is not None and id(p) in available_switch_ids:
+                legal_mask[4 + slot] = 1.0
+
         if legal_mask.sum() == 0:
             legal_mask[0] = 1.0  # fallback
+
+        # Store mappings for action decoding in choose_move
+        self._last_own_team = own_team
+        self._last_own_move_list = own_move_list
 
         return {
             "int_ids": int_ids,
@@ -701,10 +844,184 @@ class PokejaxPlayer(Player):
         dummy_mask = jnp.ones(N_ACTIONS, dtype=jnp.float32)
         _ = self._forward(self.params, dummy_int, dummy_float, dummy_mask)
 
+        # Track battles waiting for a request after |turn|
+        self._pending_turn_battles: Set[str] = set()
+
+    async def _handle_battle_message(self, split_messages: List[List[str]]):
+        """Override poke-env's message handler to fix request/turn ordering.
+
+        In Pokemon Showdown, |request| and |turn| arrive in separate websocket
+        frames, with |turn| first. poke-env normally calls choose_move from
+        |turn|, but available_moves is stale (from the previous request).
+
+        Fix: defer choose_move until |request| arrives with fresh data.
+        """
+        if (
+            len(split_messages) > 1
+            and len(split_messages[1]) > 1
+            and split_messages[1][1] == "init"
+        ):
+            battle_info = split_messages[0][0].split("-")
+            battle = await self._create_battle(battle_info)
+        else:
+            battle = await self._get_battle(split_messages[0][0])
+
+        saw_turn = False
+        saw_request = False
+
+        for split_message in split_messages[1:]:
+            if len(split_message) <= 1:
+                continue
+            elif split_message[1] == "":
+                battle.parse_message(split_message)
+            elif split_message[1] in self.MESSAGES_TO_IGNORE:
+                pass
+            elif split_message[1] == "request":
+                if split_message[2]:
+                    request = orjson.loads(split_message[2])
+                    battle.parse_request(request)
+                    saw_request = True
+                    if battle.move_on_next_request:
+                        await self._handle_battle_request(battle)
+                        battle.move_on_next_request = False
+            elif split_message[1] == "win" or split_message[1] == "tie":
+                if split_message[1] == "win":
+                    battle.won_by(split_message[2])
+                else:
+                    battle.tied()
+                await self._battle_count_queue.get()
+                self._battle_count_queue.task_done()
+                self._battle_finished_callback(battle)
+                async with self._battle_end_condition:
+                    self._battle_end_condition.notify_all()
+                self._pending_turn_battles.discard(battle.battle_tag)
+            elif split_message[1] == "error":
+                self.logger.log(
+                    25, "Error message received: %s", "|".join(split_message)
+                )
+                if split_message[2].startswith(
+                    "[Invalid choice] Sorry, too late to make a different move"
+                ):
+                    if battle.trapped:
+                        await self._handle_battle_request(battle)
+                elif split_message[2].startswith(
+                    "[Unavailable choice] Can't switch: The active Pokémon is "
+                    "trapped"
+                ) or split_message[2].startswith(
+                    "[Invalid choice] Can't switch: The active Pokémon is trapped"
+                ):
+                    battle.trapped = True
+                    await self._handle_battle_request(battle)
+                elif split_message[2].startswith(
+                    "[Invalid choice] Can't switch: You can't switch to an active "
+                    "Pokémon"
+                ):
+                    await self._handle_battle_request(battle, maybe_default_order=True)
+                elif split_message[2].startswith(
+                    "[Invalid choice] Can't switch: You can't switch to a fainted "
+                    "Pokémon"
+                ):
+                    await self._handle_battle_request(battle, maybe_default_order=True)
+                elif split_message[2].startswith(
+                    "[Invalid choice] Can't move: Invalid target for"
+                ):
+                    await self._handle_battle_request(battle, maybe_default_order=True)
+                elif split_message[2].startswith(
+                    "[Invalid choice] Can't move: You can't choose a target for"
+                ):
+                    await self._handle_battle_request(battle, maybe_default_order=True)
+                elif split_message[2].startswith(
+                    "[Invalid choice] Can't move: "
+                ) and split_message[2].endswith("needs a target"):
+                    await self._handle_battle_request(battle, maybe_default_order=True)
+                elif (
+                    split_message[2].startswith("[Invalid choice] Can't move: Your")
+                    and " doesn't have a move matching " in split_message[2]
+                ):
+                    await self._handle_battle_request(battle, maybe_default_order=True)
+                elif split_message[2].startswith(
+                    "[Invalid choice] Incomplete choice: "
+                ):
+                    await self._handle_battle_request(battle, maybe_default_order=True)
+                elif split_message[2].startswith(
+                    "[Unavailable choice]"
+                ) and split_message[2].endswith("is disabled"):
+                    battle.move_on_next_request = True
+                elif split_message[2].startswith("[Invalid choice]") and split_message[
+                    2
+                ].endswith("is disabled"):
+                    battle.move_on_next_request = True
+                elif split_message[2].startswith(
+                    "[Invalid choice] Can't move: You sent more choices than unfainted"
+                    " Pokémon."
+                ):
+                    await self._handle_battle_request(battle, maybe_default_order=True)
+                elif split_message[2].startswith(
+                    "[Invalid choice] Can't move: You can only Terastallize once per battle."
+                ):
+                    await self._handle_battle_request(battle, maybe_default_order=True)
+                else:
+                    self.logger.critical("Unexpected error message: %s", split_message)
+            elif split_message[1] == "turn":
+                battle.parse_message(split_message)
+                # DON'T call _handle_battle_request here — defer until
+                # |request| arrives with fresh available_moves data.
+                saw_turn = True
+            elif split_message[1] == "teampreview":
+                battle.parse_message(split_message)
+                await self._handle_battle_request(battle, from_teampreview_request=True)
+            elif split_message[1] == "bigerror":
+                self.logger.warning("Received 'bigerror' message: %s", split_message)
+            elif split_message[1] == "uhtml" and len(split_message) > 2 and split_message[2] == "otsrequest":
+                await self._handle_ots_request(battle.battle_tag)
+            else:
+                battle.parse_message(split_message)
+
+        # After processing the batch:
+        if saw_turn and saw_request:
+            # Request and turn in same batch — data is fresh, act now
+            await self._handle_battle_request(battle)
+            self._pending_turn_battles.discard(battle.battle_tag)
+        elif saw_turn:
+            # Turn without request — defer until request arrives
+            self._pending_turn_battles.add(battle.battle_tag)
+        elif saw_request and battle.battle_tag in self._pending_turn_battles:
+            # Request arrived for a deferred turn — act now with fresh data
+            self._pending_turn_battles.discard(battle.battle_tag)
+            await self._handle_battle_request(battle)
+
     def choose_move(self, battle: AbstractBattle):
         """Choose a move for the current turn."""
-        # Build observation
+        try:
+            return self._choose_move_impl(battle)
+        except Exception as e:
+            # Fallback on any error
+            if self.verbose:
+                print(f"  Error in choose_move: {e}, using default")
+            return self.choose_default_move()
+
+    def _choose_move_impl(self, battle: AbstractBattle):
+        """Internal move selection logic."""
+        available_moves = battle.available_moves
+        available_switches = battle.available_switches
+
+        # Check if trapped (can't switch)
+        trapped = battle.trapped if hasattr(battle, 'trapped') else False
+
+        # Build observation (also stores _last_own_team and _last_own_move_list)
         obs = self.obs_bridge.build_obs(battle)
+
+        # Override legal mask: if trapped, disable all switch actions
+        if trapped:
+            obs["legal_mask"][4:] = 0.0
+            # Ensure at least one move is legal
+            if obs["legal_mask"][:4].sum() == 0 and available_moves:
+                available_move_names = set(m.id for m in available_moves)
+                for i, m in enumerate(self.obs_bridge._last_own_move_list[:4]):
+                    if m is not None and m.id in available_move_names:
+                        obs["legal_mask"][i] = 1.0
+            if obs["legal_mask"].sum() == 0:
+                obs["legal_mask"][0] = 1.0
 
         # Convert to JAX arrays
         int_ids = jnp.array(obs["int_ids"])
@@ -718,7 +1035,6 @@ class PokejaxPlayer(Player):
 
         # Select action
         if self.temperature > 0:
-            # Sample from softmax with temperature
             scaled = log_probs / self.temperature
             scaled -= scaled.max()
             p = np.exp(scaled)
@@ -726,29 +1042,46 @@ class PokejaxPlayer(Player):
             p /= p.sum() + 1e-8
             action = np.random.choice(N_ACTIONS, p=p)
         else:
-            # Greedy
             masked_probs = probs * np.array(obs["legal_mask"])
             action = int(np.argmax(masked_probs))
 
         if self.verbose:
             legal = np.where(obs["legal_mask"])[0]
-            print(f"  Turn {battle.turn}: value={float(value):.3f}")
+            trap_str = " [TRAPPED]" if trapped else ""
+            print(f"  Turn {battle.turn}: value={float(value):.3f}{trap_str}")
             for a in sorted(legal, key=lambda x: -probs[x]):
                 marker = " <--" if a == action else ""
                 print(f"    action {a}: {probs[a]*100:.1f}%{marker}")
 
-        # Map action to poke-env order
-        available_moves = battle.available_moves
-        available_switches = battle.available_switches
+        # Map action to poke-env order using stable slot mappings
+        own_team = self.obs_bridge._last_own_team
+        own_move_list = self.obs_bridge._last_own_move_list
 
-        if action < 4 and action < len(available_moves):
-            return self.create_order(available_moves[action])
-        elif action >= 4:
-            switch_idx = action - 4
-            if switch_idx < len(available_switches):
-                return self.create_order(available_switches[switch_idx])
+        if action < 4:
+            # Move action: action i = move slot i from pokemon.moves dict order
+            if action < len(own_move_list) and own_move_list[action] is not None:
+                chosen_move_id = own_move_list[action].id
+                # Find the matching Move in available_moves by string ID
+                # (poke-env may create new objects for variants like Hidden Power)
+                for m in available_moves:
+                    if m.id == chosen_move_id:
+                        return self.create_order(m)
+            # Fallback: try to find any legal move
+            if available_moves:
+                return self.create_order(available_moves[0])
+        else:
+            # Switch action: action 4+slot = switch to Pokemon at team slot
+            slot = action - 4
+            if slot < len(own_team) and own_team[slot] is not None:
+                target_pokemon = own_team[slot]
+                # Verify this Pokemon is actually switchable
+                if target_pokemon in available_switches:
+                    return self.create_order(target_pokemon)
+            # Fallback: try to find any legal switch
+            if available_switches:
+                return self.create_order(available_switches[0])
 
-        # Fallback: pick first legal action
+        # Ultimate fallback
         if available_moves:
             return self.create_order(available_moves[0])
         if available_switches:
