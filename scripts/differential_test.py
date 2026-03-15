@@ -1,29 +1,24 @@
 """
 Differential test: replay Pokemon Showdown battles in PokeJAX engine.
 
-Strategy: Since PRNGs differ (JAX ThreeFry vs PS custom), we SYNC HP after
-each turn to prevent RNG cascade. This lets us focus on deterministic checks:
+Strategy: Since PRNGs differ (JAX ThreeFry vs PS custom), we SYNC state after
+each turn to prevent RNG cascade. We also handle PS's team slot swapping
+(PS swaps active with switch target; JAX uses fixed slots).
 
-  1. Action mask: PS's chosen action must be legal in JAX (engine bug if not)
-  2. Status agreement: with HP synced, status effects should mostly match
-  3. Boost agreement: stat changes from moves are deterministic
-  4. Faint agreement: with HP synced, faint states should match exactly
-  5. HP conservation: HP must stay in [0, maxhp]
-  6. Winner agreement: with HP synced, should be very high
-  7. Random self-play: games should complete, ~50/50 balance
+Key checks:
+  1. Action mask: PS's chosen action must be legal in JAX
+  2. Status/boost/faint agreement (deterministic conditions)
+  3. HP conservation: HP must stay in [0, maxhp]
 
 Usage:
-    python scripts/differential_test.py --battles data/showdown_battles_1000.jsonl --limit 1000
+    python scripts/differential_test.py --battles data/showdown_battles_1000.jsonl --limit 100
 """
 
 import json
 import argparse
-import os
 import sys
 from pathlib import Path
-from collections import defaultdict
 
-# Force unbuffered stdout (needed for WSL piped output)
 sys.stdout = open(sys.stdout.fileno(), 'w', buffering=1, closefd=False)
 
 import numpy as np
@@ -55,40 +50,142 @@ def build_reverse_lookup(name_to_id):
 status_map = {'': 0, 'brn': 1, 'psn': 2, 'tox': 3, 'slp': 4, 'frz': 5, 'par': 6}
 
 
+# ---------------------------------------------------------------------------
+# PS slot mapping
+# ---------------------------------------------------------------------------
+# PS swaps team slot indices on switch (active always at index 0).
+# JAX keeps fixed slot indices with sides_active_idx pointing to the active.
+# We need to translate between the two.
+
+def build_ps_to_jax_map(ps_mons, initial_species):
+    """Build mapping from PS's current slot order to JAX's fixed slot order.
+
+    Uses species name matching (strips form suffixes for robustness).
+    Returns list where result[ps_idx] = jax_idx.
+    """
+    mapping = [None] * len(ps_mons)
+    used_jax = set()
+
+    for ps_idx, mon in enumerate(ps_mons):
+        ps_species = normalize_id(mon['species'])
+        # Try exact match first
+        for jax_idx, init_species in enumerate(initial_species):
+            if jax_idx in used_jax:
+                continue
+            if normalize_id(init_species) == ps_species:
+                mapping[ps_idx] = jax_idx
+                used_jax.add(jax_idx)
+                break
+        # If no exact match (form change), try prefix match
+        if mapping[ps_idx] is None:
+            for jax_idx, init_species in enumerate(initial_species):
+                if jax_idx in used_jax:
+                    continue
+                init_norm = normalize_id(init_species)
+                # Castform -> castformrainy, etc.
+                if ps_species.startswith(init_norm) or init_norm.startswith(ps_species):
+                    mapping[ps_idx] = jax_idx
+                    used_jax.add(jax_idx)
+                    break
+        # Fallback: identity
+        if mapping[ps_idx] is None:
+            mapping[ps_idx] = ps_idx
+
+    return mapping
+
+
+def translate_action(action_str, side, ps_to_jax_map):
+    """Translate PS action string to JAX action int using slot mapping."""
+    if action_str is None:
+        return 0
+    parts = action_str.strip().split()
+    if len(parts) < 2:
+        return 0
+    cmd, num = parts[0], int(parts[1])
+    if cmd == 'move':
+        return num - 1  # moves unaffected by slot mapping
+    elif cmd == 'switch':
+        ps_slot = num - 1  # 0-indexed PS slot
+        jax_slot = ps_to_jax_map[ps_slot]
+        return jax_slot + 4  # JAX switch actions are slot + 4
+    return 0
+
+
+def sync_state_from_ps(state, ps_state, ps_to_jax_maps):
+    """Force-sync JAX state from PS state using slot mapping."""
+    new_hp = np.array(state.sides_team_hp)
+    new_status = np.array(state.sides_team_status)
+    new_fainted = np.array(state.sides_team_fainted)
+    new_boosts = np.array(state.sides_team_boosts)
+    new_active = np.array(state.sides_active_idx)
+    new_pp = np.array(state.sides_team_move_pp)
+
+    for side_idx in range(2):
+        ps_mons = ps_state['sides'][side_idx]['pokemon']
+        mapping = ps_to_jax_maps[side_idx]
+
+        for ps_slot in range(min(6, len(ps_mons))):
+            jax_slot = mapping[ps_slot]
+            mon = ps_mons[ps_slot]
+
+            new_hp[side_idx, jax_slot] = mon['hp']
+            new_status[side_idx, jax_slot] = status_map.get(mon.get('status', ''), 0)
+            new_fainted[side_idx, jax_slot] = mon.get('fainted', False)
+
+            if mon.get('boosts'):
+                boost_order = ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy', 'evasion']
+                for bi, bname in enumerate(boost_order):
+                    new_boosts[side_idx, jax_slot, bi] = mon['boosts'].get(bname, 0)
+
+            if mon.get('isActive', False):
+                new_active[side_idx] = jax_slot
+
+            ps_moves = mon.get('moves', [])
+            for mi, ps_move in enumerate(ps_moves[:4]):
+                new_pp[side_idx, jax_slot, mi] = min(ps_move.get('pp', 0), 64)
+
+    state = state._replace(
+        sides_team_hp=jnp.array(new_hp, dtype=jnp.int16),
+        sides_team_status=jnp.array(new_status, dtype=jnp.int8),
+        sides_team_fainted=jnp.array(new_fainted, dtype=jnp.bool_),
+        sides_team_boosts=jnp.array(new_boosts, dtype=jnp.int8),
+        sides_active_idx=jnp.array(new_active, dtype=jnp.int8),
+        sides_team_move_pp=jnp.array(new_pp, dtype=jnp.int8),
+    )
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Team builder
+# ---------------------------------------------------------------------------
+
 def build_team_arrays(team_data, ps_pokemon_states, tables, species_lookup,
                       move_lookup, ability_lookup, item_lookup):
-    """Convert Showdown team JSON to numpy arrays for make_battle_state.
-
-    Uses PS's maxhp from turn 0 state directly (avoids nature computation bugs).
-    """
+    """Convert Showdown team JSON to numpy arrays for make_battle_state."""
     while len(team_data) < 6:
         team_data.append(team_data[0])
-    n = 6
 
-    species_ids = np.zeros(n, dtype=np.int16)
-    ability_ids = np.zeros(n, dtype=np.int16)
-    item_ids = np.zeros(n, dtype=np.int16)
-    types = np.zeros((n, 2), dtype=np.int8)
-    base_stats = np.zeros((n, 6), dtype=np.int16)
-    max_hp = np.zeros(n, dtype=np.int16)
-    move_ids = np.zeros((n, 4), dtype=np.int16)
-    move_pp = np.zeros((n, 4), dtype=np.int8)
-    move_max_pp = np.zeros((n, 4), dtype=np.int8)
-    levels = np.zeros(n, dtype=np.int8)
-    genders = np.zeros(n, dtype=np.int8)
-    natures = np.zeros(n, dtype=np.int8)
-    weights_hg = np.zeros(n, dtype=np.int16)
+    species_ids = np.zeros(6, dtype=np.int16)
+    ability_ids = np.zeros(6, dtype=np.int16)
+    item_ids = np.zeros(6, dtype=np.int16)
+    types = np.zeros((6, 2), dtype=np.int8)
+    base_stats = np.zeros((6, 6), dtype=np.int16)
+    max_hp = np.zeros(6, dtype=np.int16)
+    move_ids = np.zeros((6, 4), dtype=np.int16)
+    move_pp = np.zeros((6, 4), dtype=np.int8)
+    move_max_pp = np.zeros((6, 4), dtype=np.int8)
+    levels = np.zeros(6, dtype=np.int8)
+    genders = np.zeros(6, dtype=np.int8)
+    natures = np.zeros(6, dtype=np.int8)
+    weights_hg = np.zeros(6, dtype=np.int16)
 
     for i, poke in enumerate(team_data[:6]):
         species_key = normalize_id(poke['species'])
         sid = species_lookup.get(species_key, 0)
         species_ids[i] = sid
 
-        ability_key = normalize_id(poke.get('ability', ''))
-        ability_ids[i] = ability_lookup.get(ability_key, 0)
-
-        item_key = normalize_id(poke.get('item', ''))
-        item_ids[i] = item_lookup.get(item_key, 0)
+        ability_ids[i] = ability_lookup.get(normalize_id(poke.get('ability', '')), 0)
+        item_ids[i] = item_lookup.get(normalize_id(poke.get('item', '')), 0)
 
         if sid < len(tables.species):
             sp = np.array(tables.species[sid])
@@ -102,51 +199,41 @@ def build_team_arrays(team_data, ps_pokemon_states, tables, species_lookup,
         level = int(poke.get('level', 100))
         levels[i] = level
 
-        natures[i] = 0  # nature not in logs, doesn't matter since we use PS maxhp
-
-        # Use PS maxhp directly
+        # Use PS maxhp directly (avoids nature computation bugs)
         if i < len(ps_pokemon_states):
             max_hp[i] = ps_pokemon_states[i]['maxhp']
         else:
-            # Fallback: compute (shouldn't happen)
             hp_base = int(np.array(tables.species[sid])[0]) if sid < len(tables.species) else 80
             max_hp[i] = int((2 * hp_base + 31) * level / 100) + level + 10
 
-        # Compute battle stats using PS maxhp for HP, formula for others
         evs = poke.get('evs', {})
         ivs = poke.get('ivs', {})
         stat_names = ['hp', 'atk', 'def', 'spa', 'spd', 'spe']
         for j, sn in enumerate(stat_names):
             if j == 0:
-                continue  # HP already set from PS
+                continue
             base = int(base_stats[i, j])
             ev = evs.get(sn, 0)
             iv = ivs.get(sn, 31)
-            raw = int((2 * base + iv + ev // 4) * level / 100) + 5
-            # No nature mult since we don't have nature data
-            # This affects non-HP stats but is acceptable since we sync HP
-            base_stats[i, j] = raw
+            base_stats[i, j] = int((2 * base + iv + ev // 4) * level / 100) + 5
 
         moves = poke.get('moves', [])
         for j, move_name in enumerate(moves[:4]):
-            move_key = normalize_id(move_name)
-            mid = move_lookup.get(move_key, 0)
+            mid = move_lookup.get(normalize_id(move_name), 0)
             move_ids[i, j] = mid
-            # Use PS PP directly if available
             if i < len(ps_pokemon_states) and j < len(ps_pokemon_states[i].get('moves', [])):
                 ps_move = ps_pokemon_states[i]['moves'][j]
                 move_pp[i, j] = min(ps_move.get('pp', 10), 64)
                 move_max_pp[i, j] = min(ps_move.get('maxpp', 10), 64)
             elif mid < len(tables.moves):
-                base_pp_val = int(np.array(tables.moves[mid])[5])
-                move_pp[i, j] = min(base_pp_val, 64)
-                move_max_pp[i, j] = min(base_pp_val, 64)
+                bpp = int(np.array(tables.moves[mid])[5])
+                move_pp[i, j] = min(bpp, 64)
+                move_max_pp[i, j] = min(bpp, 64)
             else:
                 move_pp[i, j] = 10
                 move_max_pp[i, j] = 10
 
-        gender_map = {'M': 1, 'F': 2, '': 0, 'N': 0}
-        genders[i] = gender_map.get(poke.get('gender', ''), 0)
+        genders[i] = {'M': 1, 'F': 2, '': 0, 'N': 0}.get(poke.get('gender', ''), 0)
 
     return {
         'species': species_ids, 'abilities': ability_ids, 'items': item_ids,
@@ -157,68 +244,9 @@ def build_team_arrays(team_data, ps_pokemon_states, tables, species_lookup,
     }
 
 
-def parse_action(action_str):
-    """Parse PS action string to pokejax action int.
-    'move 1' -> 0, 'move 4' -> 3, 'switch 2' -> 5, etc.
-    """
-    if action_str is None:
-        return None
-    parts = action_str.strip().split()
-    if len(parts) < 2:
-        return None
-    cmd, num = parts[0], int(parts[1])
-    if cmd == 'move':
-        return num - 1  # 1-indexed -> 0-indexed
-    elif cmd == 'switch':
-        return num - 1 + 4  # switch 1 -> action 4, switch 6 -> action 9
-    return None
-
-
-def sync_state_from_ps(state, ps_state):
-    """Force-sync JAX state from PS state to prevent RNG cascade.
-
-    Syncs: HP, status, fainted, boosts, active index, PP.
-    """
-    new_hp = np.array(state.sides_team_hp)
-    new_status = np.array(state.sides_team_status)
-    new_fainted = np.array(state.sides_team_fainted)
-    new_boosts = np.array(state.sides_team_boosts)
-    new_active = np.array(state.sides_active_idx)
-    new_pp = np.array(state.sides_team_move_pp)
-
-    for side_idx in range(2):
-        ps_mons = ps_state['sides'][side_idx]['pokemon']
-        for slot_idx in range(min(6, len(ps_mons))):
-            mon = ps_mons[slot_idx]
-            new_hp[side_idx, slot_idx] = mon['hp']
-            new_status[side_idx, slot_idx] = status_map.get(mon.get('status', ''), 0)
-            new_fainted[side_idx, slot_idx] = mon.get('fainted', False)
-
-            # Sync boosts
-            if mon.get('boosts'):
-                boost_order = ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy', 'evasion']
-                for bi, bname in enumerate(boost_order):
-                    new_boosts[side_idx, slot_idx, bi] = mon['boosts'].get(bname, 0)
-
-            # Sync active index
-            if mon.get('isActive', False):
-                new_active[side_idx] = slot_idx
-
-            # Sync PP
-            ps_moves = mon.get('moves', [])
-            for mi, ps_move in enumerate(ps_moves[:4]):
-                new_pp[side_idx, slot_idx, mi] = min(ps_move.get('pp', 0), 64)
-
-    state = state._replace(
-        sides_team_hp=jnp.array(new_hp, dtype=jnp.int16),
-        sides_team_status=jnp.array(new_status, dtype=jnp.int8),
-        sides_team_fainted=jnp.array(new_fainted, dtype=jnp.bool_),
-        sides_team_boosts=jnp.array(new_boosts, dtype=jnp.int8),
-        sides_active_idx=jnp.array(new_active, dtype=jnp.int8),
-        sides_team_move_pp=jnp.array(new_pp, dtype=jnp.int8),
-    )
-    return state
-
+# ---------------------------------------------------------------------------
+# Main test
+# ---------------------------------------------------------------------------
 
 def run_differential_test(battles_path, limit=None):
     print("Loading tables...")
@@ -238,7 +266,6 @@ def run_differential_test(battles_path, limit=None):
     ability_lookup = build_reverse_lookup(tables.ability_name_to_id)
     item_lookup = build_reverse_lookup(tables.item_name_to_id)
 
-    # JIT compile execute_turn with tables/cfg captured in closure
     @jax.jit
     def jit_turn(state, reveal, actions):
         return execute_turn(state, reveal, actions, tables, cfg)
@@ -246,12 +273,11 @@ def run_differential_test(battles_path, limit=None):
     print("JIT compiling execute_turn (this takes ~5 minutes first time)...", flush=True)
 
     # =====================================================================
-    # Test 1: MaxHP Accuracy (using PS maxhp directly — should be 100%)
+    # Test 1: MaxHP Accuracy
     # =====================================================================
     print("\n--- Test 1: MaxHP Accuracy (PS values used directly) ---")
     maxhp_correct = 0
     maxhp_total = 0
-
     for bi, battle in enumerate(battles[:100]):
         init_state = battle['turns'][0].get('state') if battle['turns'] else None
         if init_state is None:
@@ -263,22 +289,18 @@ def run_differential_test(battles_path, limit=None):
                 species_lookup, move_lookup, ability_lookup, item_lookup
             )
             for slot_idx in range(min(6, len(ps_mons))):
-                ps_maxhp = ps_mons[slot_idx]['maxhp']
-                jax_maxhp = int(team['max_hp'][slot_idx])
                 maxhp_total += 1
-                if jax_maxhp == ps_maxhp:
+                if int(team['max_hp'][slot_idx]) == ps_mons[slot_idx]['maxhp']:
                     maxhp_correct += 1
-
-    maxhp_acc = maxhp_correct / maxhp_total if maxhp_total > 0 else 0
+    maxhp_acc = maxhp_correct / max(1, maxhp_total)
     print(f"  {maxhp_correct}/{maxhp_total} correct ({maxhp_acc:.2%})")
 
     # =====================================================================
-    # Test 2: Turn-by-turn replay with HP sync + action mask checks
+    # Test 2: Turn-by-turn replay with slot mapping + HP sync
     # =====================================================================
-    print("\n--- Test 2: Turn-by-Turn Replay (HP-Synced) ---")
+    print("\n--- Test 2: Turn-by-Turn Replay (HP-Synced, Slot-Mapped) ---")
     n_games = len(battles)
 
-    # Counters
     total_turns = 0
     action_mask_ok = 0
     action_mask_fail = 0
@@ -304,6 +326,12 @@ def run_differential_test(battles_path, limit=None):
         init_state = battle['turns'][0].get('state') if battle['turns'] else None
         if init_state is None:
             continue
+
+        # Initial species list per side (JAX slot order = PS initial order)
+        initial_species = [[], []]
+        for side_idx in range(2):
+            ps_mons = init_state['sides'][side_idx]['pokemon']
+            initial_species[side_idx] = [m['species'] for m in ps_mons]
 
         ps_mons_0 = init_state['sides'][0]['pokemon']
         ps_mons_1 = init_state['sides'][1]['pokemon']
@@ -337,9 +365,10 @@ def run_differential_test(battles_path, limit=None):
             continue
 
         reveal = make_reveal_state(state)
-
         ps_turns = battle['turns']
-        jax_game_over = False
+
+        # Initial slot mapping is identity
+        ps_to_jax_maps = [list(range(6)), list(range(6))]
 
         for ti in range(1, len(ps_turns)):
             turn = ps_turns[ti]
@@ -347,22 +376,42 @@ def run_differential_test(battles_path, limit=None):
             if actions is None:
                 continue
 
-            # Skip if JAX already finished
+            # Skip forced switch turns (one action is None).
+            # JAX handles forced switches internally in execute_turn.
+            p1_act = actions.get('p1')
+            p2_act = actions.get('p2')
+            if p1_act is None or p2_act is None:
+                # Still sync state from this turn if available
+                ps_state_turn = turn.get('state')
+                if ps_state_turn:
+                    for side_idx in range(2):
+                        ps_mons = ps_state_turn['sides'][side_idx]['pokemon']
+                        ps_to_jax_maps[side_idx] = build_ps_to_jax_map(
+                            ps_mons, initial_species[side_idx]
+                        )
+                    state = sync_state_from_ps(state, ps_state_turn, ps_to_jax_maps)
+                continue
+
             if bool(state.finished):
-                jax_game_over = True
                 early_finish += 1
                 break
 
-            a0 = parse_action(actions.get('p1'))
-            a1 = parse_action(actions.get('p2'))
-            if a0 is None:
-                a0 = 0
-            if a1 is None:
-                a1 = 0
+            # Rebuild slot mapping from PS state of PREVIOUS turn
+            prev_ps_state = ps_turns[ti - 1].get('state')
+            if prev_ps_state:
+                for side_idx in range(2):
+                    ps_mons = prev_ps_state['sides'][side_idx]['pokemon']
+                    ps_to_jax_maps[side_idx] = build_ps_to_jax_map(
+                        ps_mons, initial_species[side_idx]
+                    )
+
+            # Translate PS actions to JAX actions using slot mapping
+            a0 = translate_action(p1_act, 0, ps_to_jax_maps[0])
+            a1 = translate_action(p2_act, 1, ps_to_jax_maps[1])
             a0 = min(max(a0, 0), 9)
             a1 = min(max(a1, 0), 9)
 
-            # ---- ACTION MASK CHECK (before executing turn) ----
+            # ---- ACTION MASK CHECK ----
             mask0 = np.array(get_action_mask(state, 0))
             mask1 = np.array(get_action_mask(state, 1))
 
@@ -371,10 +420,9 @@ def run_differential_test(battles_path, limit=None):
             else:
                 action_mask_fail += 1
                 if len(action_mask_fail_details) < 30:
-                    ps_act_str = actions.get('p1', '?')
                     action_mask_fail_details.append(
-                        f"  B{bi} T{ti} P1: PS chose '{ps_act_str}' (a={a0}) "
-                        f"but JAX mask={mask0.astype(int).tolist()}"
+                        f"  B{bi} T{ti} P1: PS='{actions.get('p1','?')}' -> jax_a={a0} "
+                        f"mask={mask0.astype(int).tolist()}"
                     )
 
             if mask1[a1]:
@@ -382,10 +430,9 @@ def run_differential_test(battles_path, limit=None):
             else:
                 action_mask_fail += 1
                 if len(action_mask_fail_details) < 30:
-                    ps_act_str = actions.get('p2', '?')
                     action_mask_fail_details.append(
-                        f"  B{bi} T{ti} P2: PS chose '{ps_act_str}' (a={a1}) "
-                        f"but JAX mask={mask1.astype(int).tolist()}"
+                        f"  B{bi} T{ti} P2: PS='{actions.get('p2','?')}' -> jax_a={a1} "
+                        f"mask={mask1.astype(int).tolist()}"
                     )
 
             # ---- EXECUTE TURN ----
@@ -405,54 +452,58 @@ def run_differential_test(battles_path, limit=None):
             if (hp < 0).any() or (hp > maxhp).any():
                 hp_violations += 1
 
-            # ---- COMPARE DETERMINISTIC STATE WITH PS ----
-            ps_state = turn.get('state')
-            if ps_state:
+            # ---- COMPARE STATE WITH PS (using slot mapping) ----
+            ps_state_turn = turn.get('state')
+            if ps_state_turn:
+                # Rebuild mapping for this turn
                 for side_idx in range(2):
-                    ps_mons = ps_state['sides'][side_idx]['pokemon']
-                    for slot_idx in range(min(6, len(ps_mons))):
-                        mon = ps_mons[slot_idx]
+                    ps_mons = ps_state_turn['sides'][side_idx]['pokemon']
+                    cur_map = build_ps_to_jax_map(ps_mons, initial_species[side_idx])
+
+                    for ps_slot in range(min(6, len(ps_mons))):
+                        mon = ps_mons[ps_slot]
+                        jax_slot = cur_map[ps_slot]
                         if not mon.get('isActive', False):
                             continue
 
-                        # Faint agreement (before HP sync)
-                        ps_fainted = mon.get('fainted', False)
-                        # For faint check: mon is fainted if hp <= 0
-                        jax_hp = int(hp[side_idx, slot_idx])
+                        # Faint agreement
                         ps_hp = mon['hp']
-                        # Both fainted or both alive?
+                        jax_hp = int(hp[side_idx, jax_slot])
                         if (ps_hp <= 0) == (jax_hp <= 0):
                             faint_agree += 1
                         else:
                             faint_disagree += 1
 
-                        # Status agreement (RNG-dependent but still informative)
+                        # Status agreement
                         ps_status_val = status_map.get(mon.get('status', ''), 0)
-                        jax_status_val = int(state.sides_team_status[side_idx, slot_idx])
+                        jax_status_val = int(state.sides_team_status[side_idx, jax_slot])
                         if ps_status_val == jax_status_val:
                             status_agree += 1
                         else:
                             status_disagree += 1
                             if len(status_disagree_details) < 20:
                                 status_disagree_details.append(
-                                    f"  B{bi} T{ti} S{side_idx} slot{slot_idx}: "
-                                    f"PS={mon.get('status','')}({ps_status_val}) "
-                                    f"JAX={jax_status_val}"
+                                    f"  B{bi} T{ti} S{side_idx} jax_slot{jax_slot}: "
+                                    f"PS={mon.get('status','')}({ps_status_val}) JAX={jax_status_val}"
                                 )
 
-                        # Boost agreement (mostly deterministic)
+                        # Boost agreement
                         if mon.get('boosts'):
-                            boost_order = ['atk', 'def', 'spa', 'spd', 'spe', 'accuracy', 'evasion']
-                            for bj, bname in enumerate(boost_order):
-                                ps_boost = mon['boosts'].get(bname, 0)
-                                jax_boost = int(state.sides_team_boosts[side_idx, slot_idx, bj])
-                                if ps_boost == jax_boost:
+                            for bj, bname in enumerate(['atk','def','spa','spd','spe','accuracy','evasion']):
+                                ps_b = mon['boosts'].get(bname, 0)
+                                jax_b = int(state.sides_team_boosts[side_idx, jax_slot, bj])
+                                if ps_b == jax_b:
                                     boost_agree += 1
                                 else:
                                     boost_disagree += 1
 
-                # ---- SYNC HP/STATUS/BOOSTS FROM PS (prevent RNG cascade) ----
-                state = sync_state_from_ps(state, ps_state)
+                # Sync state using slot mapping
+                for side_idx in range(2):
+                    ps_mons = ps_state_turn['sides'][side_idx]['pokemon']
+                    ps_to_jax_maps[side_idx] = build_ps_to_jax_map(
+                        ps_mons, initial_species[side_idx]
+                    )
+                state = sync_state_from_ps(state, ps_state_turn, ps_to_jax_maps)
 
         # ---- WINNER CHECK ----
         ps_finished = battle.get('winner') is not None
@@ -486,41 +537,34 @@ def run_differential_test(battles_path, limit=None):
             pct_winner = winner_agree / max(1, winner_agree + winner_disagree)
             print(f"  {bi + 1}/{n_games}: mask={pct_mask:.1%} winner={pct_winner:.1%}", flush=True)
 
-    # (Test 3: Random self-play — skipped, not needed for alignment check)
-
     # =====================================================================
     # Summary
     # =====================================================================
     total_mask = action_mask_ok + action_mask_fail
     mask_rate = action_mask_ok / max(1, total_mask)
-    total_status = status_agree + status_disagree
-    status_rate = status_agree / max(1, total_status)
-    total_boost = boost_agree + boost_disagree
-    boost_rate = boost_agree / max(1, total_boost)
-    total_faint = faint_agree + faint_disagree
-    faint_rate = faint_agree / max(1, total_faint)
-    total_winner = winner_agree + winner_disagree
-    winner_rate = winner_agree / max(1, total_winner)
+    status_rate = status_agree / max(1, status_agree + status_disagree)
+    boost_rate = boost_agree / max(1, boost_agree + boost_disagree)
+    faint_rate = faint_agree / max(1, faint_agree + faint_disagree)
+    winner_rate = winner_agree / max(1, winner_agree + winner_disagree)
 
     print("\n" + "=" * 70)
-    print("DIFFERENTIAL TEST SUMMARY (HP-Synced)")
+    print("DIFFERENTIAL TEST SUMMARY (HP-Synced + Slot-Mapped)")
     print("=" * 70)
     print(f"  MaxHP accuracy:     {maxhp_acc:.2%} ({maxhp_correct}/{maxhp_total})")
     print(f"  Turns replayed:     {total_turns}")
     print(f"  HP violations:      {hp_violations}")
     print(f"  Action mask:        {action_mask_ok}/{total_mask} ({mask_rate:.2%} legal)")
-    print(f"  Status agreement:   {status_agree}/{total_status} ({status_rate:.2%})")
-    print(f"  Boost agreement:    {boost_agree}/{total_boost} ({boost_rate:.2%})")
-    print(f"  Faint agreement:    {faint_agree}/{total_faint} ({faint_rate:.2%})")
-    print(f"  Winner agreement:   {winner_agree}/{total_winner} ({winner_rate:.2%})")
+    print(f"  Status agreement:   {status_agree}/{status_agree+status_disagree} ({status_rate:.2%})")
+    print(f"  Boost agreement:    {boost_agree}/{boost_agree+boost_disagree} ({boost_rate:.2%})")
+    print(f"  Faint agreement:    {faint_agree}/{faint_agree+faint_disagree} ({faint_rate:.2%})")
+    print(f"  Winner agreement:   {winner_agree}/{winner_agree+winner_disagree} ({winner_rate:.2%})")
     print(f"  JAX finishes early: {early_finish}")
     print(f"  JAX finishes late:  {late_finish}")
     print(f"  PS games total:     {games_finished_ps}")
     print(f"  JAX games finished: {games_finished_jax}")
-    print(f"  (Self-play skipped)")
 
     if action_mask_fail_details:
-        print(f"\n  Action Mask Failures ({action_mask_fail} total, first {len(action_mask_fail_details)}):")
+        print(f"\n  Action Mask Failures ({action_mask_fail} total, first {min(15, len(action_mask_fail_details))}):")
         for d in action_mask_fail_details[:15]:
             print(d)
 
@@ -530,7 +574,7 @@ def run_differential_test(battles_path, limit=None):
             print(d)
 
     if status_disagree_details:
-        print(f"\n  Status Disagreements (first {len(status_disagree_details)}):")
+        print(f"\n  Status Disagreements (first {min(10, len(status_disagree_details))}):")
         for d in status_disagree_details[:10]:
             print(d)
 
@@ -539,7 +583,6 @@ def run_differential_test(battles_path, limit=None):
         for e in errors:
             print(f"    {e}")
 
-    # Pass criteria (stricter now with HP sync)
     all_pass = (
         maxhp_acc >= 0.99 and
         mask_rate >= 0.95 and
