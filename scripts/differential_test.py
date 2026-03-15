@@ -464,11 +464,32 @@ def run_differential_test(battles_path, limit=None):
             if actions is None:
                 continue
 
-            # Skip forced switch turns (one action is None).
+            # Skip forced switch turns.
             # JAX handles forced switches internally in execute_turn.
+            # Case 1: one action is None (explicit forced switch)
+            # Case 2: both actions present but one side's active is fainted
+            #         (PS records forced switch + opponent's action together)
             p1_act = actions.get('p1')
             p2_act = actions.get('p2')
-            if p1_act is None or p2_act is None:
+
+            is_forced = p1_act is None or p2_act is None
+            if not is_forced:
+                # Check if either side has no active mon (post-faint, forced switch pending)
+                # or active mon is fainted in previous turn's state
+                prev_ps = ps_turns[ti - 1].get('state') if ti > 0 else None
+                if prev_ps:
+                    for si in range(2):
+                        ps_mons_prev = prev_ps['sides'][si]['pokemon']
+                        has_active = False
+                        for mon in ps_mons_prev:
+                            if mon.get('isActive') and not mon.get('fainted'):
+                                has_active = True
+                                break
+                        if not has_active and prev_ps['sides'][si].get('pokemonLeft', 6) > 0:
+                            is_forced = True
+                            break
+
+            if is_forced:
                 # Still sync state from this turn if available
                 ps_state_turn = turn.get('state')
                 if ps_state_turn:
@@ -640,10 +661,14 @@ def run_differential_test(battles_path, limit=None):
     print("=" * 70)
     print(f"  MaxHP accuracy:     {maxhp_acc:.2%} ({maxhp_correct}/{maxhp_total})")
     print(f"  Turns replayed:     {total_turns}")
+    print()
+    print("  --- Deterministic Checks ---")
     print(f"  HP violations:      {hp_violations}")
     print(f"  Action mask:        {action_mask_ok}/{total_mask} ({mask_rate:.2%} legal)")
-    print(f"  Status agreement:   {status_agree}/{status_agree+status_disagree} ({status_rate:.2%})")
     print(f"  Boost agreement:    {boost_agree}/{boost_agree+boost_disagree} ({boost_rate:.2%})")
+    print()
+    print("  --- RNG-Dependent (info only, different PRNGs expected to diverge) ---")
+    print(f"  Status agreement:   {status_agree}/{status_agree+status_disagree} ({status_rate:.2%})")
     print(f"  Faint agreement:    {faint_agree}/{faint_agree+faint_disagree} ({faint_rate:.2%})")
     print(f"  Winner agreement:   {winner_agree}/{winner_agree+winner_disagree} ({winner_rate:.2%})")
     print(f"  JAX finishes early: {early_finish}")
@@ -671,12 +696,13 @@ def run_differential_test(battles_path, limit=None):
         for e in errors:
             print(f"    {e}")
 
+    # PASS criteria: deterministic checks only
+    # Status/faint/winner diverge due to different PRNGs — expected and corrected by sync
     all_pass = (
         maxhp_acc >= 0.99 and
-        mask_rate >= 0.95 and
+        mask_rate >= 0.99 and
         hp_violations == 0 and
-        winner_rate >= 0.80 and
-        boost_rate >= 0.90
+        boost_rate >= 0.98
     )
     print(f"\n  OVERALL: {'PASS' if all_pass else 'NEEDS INVESTIGATION'}")
     return all_pass

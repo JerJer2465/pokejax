@@ -293,7 +293,7 @@ def eval_vs_random(
     wins = 0
     total_turns = 0
 
-    # JIT the model forward pass
+    # JIT the model forward pass, env step, and obs builder
     @jax.jit
     def get_action(params, int_ids, float_feats, legal_mask):
         log_probs, _, _ = model.apply(
@@ -304,6 +304,14 @@ def eval_vs_random(
         )
         return jnp.argmax(log_probs[0])
 
+    @jax.jit
+    def jit_step(env_state, actions, step_key):
+        return env.step(env_state, actions, step_key)
+
+    @jax.jit
+    def jit_obs(battle, reveal):
+        return build_obs(battle, reveal, 0, tables)
+
     for g in range(n_games):
         key, reset_key = jax.random.split(key)
         env_state, _ = env.reset(reset_key)
@@ -313,7 +321,7 @@ def eval_vs_random(
         turn = 0
         while not bool(state.finished) and turn < 300:
             # Model picks action for side 0
-            obs = build_obs(state, reveal, 0, tables)
+            obs = jit_obs(state, reveal)
             model_action = int(get_action(params, obs["int_ids"], obs["float_feats"], obs["legal_mask"]))
 
             # Random picks for side 1
@@ -321,7 +329,7 @@ def eval_vs_random(
 
             actions = jnp.array([model_action, opp_action], dtype=jnp.int32)
             key, step_key = jax.random.split(key)
-            env_state, _, _, _, _ = env.step(env_state, actions, step_key)
+            env_state, _, _, _, _ = jit_step(env_state, actions, step_key)
             state = env_state.battle
             reveal = env_state.reveal
             turn += 1
@@ -363,6 +371,14 @@ def eval_vs_heuristic(
         )
         return jnp.argmax(log_probs[0])
 
+    @jax.jit
+    def jit_step(env_state, actions, step_key):
+        return env.step(env_state, actions, step_key)
+
+    @jax.jit
+    def jit_obs(battle, reveal):
+        return build_obs(battle, reveal, 0, tables)
+
     for g in range(n_games):
         key, reset_key = jax.random.split(key)
         env_state, _ = env.reset(reset_key)
@@ -372,7 +388,7 @@ def eval_vs_heuristic(
         turn = 0
         while not bool(state.finished) and turn < 300:
             # Model picks action for side 0
-            obs = build_obs(state, reveal, 0, tables)
+            obs = jit_obs(state, reveal)
             model_action = int(get_action(params, obs["int_ids"], obs["float_feats"], obs["legal_mask"]))
 
             # Heuristic picks for side 1
@@ -380,7 +396,7 @@ def eval_vs_heuristic(
 
             actions = jnp.array([model_action, opp_action], dtype=jnp.int32)
             key, step_key = jax.random.split(key)
-            env_state, _, _, _, _ = env.step(env_state, actions, step_key)
+            env_state, _, _, _, _ = jit_step(env_state, actions, step_key)
             state = env_state.battle
             reveal = env_state.reveal
             turn += 1

@@ -43,8 +43,10 @@ def main():
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from checkpoint .pkl file")
     parser.add_argument("--eval-interval", type=int, default=50,
-                        help="Eval every N updates")
+                        help="Eval every N updates (0 to disable)")
     parser.add_argument("--eval-games", type=int, default=50)
+    parser.add_argument("--no-eval", action="store_true",
+                        help="Skip all eval (avoids JIT recompilation overhead)")
     parser.add_argument("--data-file", type=str, default=None,
                         help="Load pre-collected BC data from .npz")
     parser.add_argument("--save-data", type=str, default=None,
@@ -191,7 +193,7 @@ def main():
                       f"loss={loss_val:.4f} acc={acc_val:.3f} ent={ent_val:.3f}")
 
             # Eval
-            if global_update % cfg.eval_interval == 0:
+            if not args.no_eval and cfg.eval_interval > 0 and global_update % cfg.eval_interval == 0:
                 print(f"\n  --- Eval at update {global_update} ---")
                 t0 = time.time()
 
@@ -231,11 +233,14 @@ def main():
             pickle.dump({"params": train_state.params, "step": global_update}, f)
 
     # Final eval
-    print("\n=== Final Evaluation ===")
-    wr_random = eval_vs_random(model, train_state.params, env, n_games=100, seed=0)
-    print(f"vs Random (100 games):    win={wr_random['win_rate']:.1%}")
-    wr_heur = eval_vs_heuristic(model, train_state.params, env, n_games=100, seed=1)
-    print(f"vs Heuristic (100 games): win={wr_heur['win_rate']:.1%}")
+    if not args.no_eval:
+        print("\n=== Final Evaluation ===")
+        wr_random = eval_vs_random(model, train_state.params, env, n_games=100, seed=0)
+        print(f"vs Random (100 games):    win={wr_random['win_rate']:.1%}")
+        wr_heur = eval_vs_heuristic(model, train_state.params, env, n_games=100, seed=1)
+        print(f"vs Heuristic (100 games): win={wr_heur['win_rate']:.1%}")
+    else:
+        print("\n=== Eval skipped (--no-eval) ===")
 
     # Save final
     path = os.path.join(cfg.checkpoint_dir, "bc_final.pkl")

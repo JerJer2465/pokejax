@@ -17,9 +17,16 @@
 - Heuristic opponent: implemented (`pokejax/env/heuristic.py`)
 - BC data collection + training: implemented (`pokejax/rl/bc.py`)
 - BC training script: implemented (`scripts/train_bc.py`)
+- Eval script: implemented (`scripts/eval_bc.py`)
 - PPO with BC init + checkpointing: updated (`scripts/train_ppo.py`, `pokejax/rl/self_play.py`)
-- Team pool generation: running (50K teams)
-- BC training: pending team pool completion
+- Team pool: generated (50K teams, `data/team_pool.npz`)
+- BC data: collected 50K transitions at 44 trans/s (`data/bc_data_50k.npz`)
+- **BC training complete** (10 epochs on 50K data):
+  - Final accuracy: 95.5% (action agreement with heuristic teacher)
+  - Loss: 0.14
+  - vs Random: **100% win rate** (20 games)
+  - vs Heuristic: **25% win rate** (20 games) — expected since trained vs random opponent
+- Next step: PPO self-play with BC warm-start (`--bc-init checkpoints/bc_final.pkl`)
 
 ## Differential Test Results (latest)
 
