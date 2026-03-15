@@ -53,11 +53,12 @@ V_MAX    =  1.5
 ACTOR_IDX  = 13
 CRITIC_IDX = 14
 
-# Vocab sizes (conservative upper bounds; real tables may be smaller)
-N_SPECIES   = 500
-N_MOVES     = 750
-N_ABILITIES = 200
-N_ITEMS     = 200
+# Vocab sizes (must exceed max ID in tables; gen4 has 493 species in dex
+# but Showdown uses 1515 entries including formes; move IDs go up to ~954)
+N_SPECIES   = 1600
+N_MOVES     = 1000
+N_ABILITIES = 400
+N_ITEMS     = 600
 
 # Additive attention bias: -inf at Actor↔Critic pairs, 0 elsewhere
 # Shape (1, 1, N_TOKENS, N_TOKENS) for broadcasting over (batch, heads)

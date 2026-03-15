@@ -61,16 +61,38 @@ _HAZARD_MOVES = {"stealthrock", "spikes", "toxicspikes"}
 _FIXED_DAMAGE_MOVES = {"seismictoss", "nightshade"}
 
 
+def _state_to_numpy(state: BattleState) -> dict:
+    """Bulk-convert relevant BattleState fields to numpy once.
+    Avoids repeated device→host transfers.
+    """
+    return {
+        'active_idx': np.array(state.sides_active_idx),           # int8[2]
+        'types': np.array(state.sides_team_types),                # int8[2,6,2]
+        'base_stats': np.array(state.sides_team_base_stats),      # int16[2,6,6]
+        'hp': np.array(state.sides_team_hp),                      # int16[2,6]
+        'max_hp': np.array(state.sides_team_max_hp),              # int16[2,6]
+        'boosts': np.array(state.sides_team_boosts),              # int8[2,6,7]
+        'status': np.array(state.sides_team_status),              # int8[2,6]
+        'fainted': np.array(state.sides_team_fainted),            # bool[2,6]
+        'move_ids': np.array(state.sides_team_move_ids),          # int16[2,6,4]
+        'side_conditions': np.array(state.sides_side_conditions), # int8[2,10]
+        'turn': int(state.turn),
+    }
+
+
 def smart_heuristic_action(
     state: BattleState,
     side: int,
     tables: Tables,
+    _np_cache: dict = None,
 ) -> int:
     """
     Type-aware heuristic that considers STAB, type effectiveness, accuracy,
     status moves, setup moves, and switches to better matchups.
 
     Returns an action index (0-9).
+
+    Pass _np_cache from _state_to_numpy() to avoid repeated device→host transfers.
     """
     mask = np.array(get_action_mask(state, side))
     legal = np.where(mask)[0]
@@ -80,38 +102,41 @@ def smart_heuristic_action(
     move_actions = [a for a in legal if a < 4]
     switch_actions = [a for a in legal if a >= 4]
 
-    active_idx = int(state.sides_active_idx[side])
+    # Use cache or convert
+    s = _np_cache if _np_cache is not None else _state_to_numpy(state)
+
+    active_idx = int(s['active_idx'][side])
     opp_side = 1 - side
-    opp_active_idx = int(state.sides_active_idx[opp_side])
-    turn = int(state.turn)
+    opp_active_idx = int(s['active_idx'][opp_side])
+    turn = s['turn']
 
     # Active mon info
-    own_types = np.array(state.sides_team_types[side, active_idx])  # int8[2]
-    own_stats = np.array(state.sides_team_base_stats[side, active_idx])  # int16[6]
-    own_hp = int(state.sides_team_hp[side, active_idx])
-    own_max_hp = int(state.sides_team_max_hp[side, active_idx])
+    own_types = s['types'][side, active_idx]
+    own_stats = s['base_stats'][side, active_idx]
+    own_hp = int(s['hp'][side, active_idx])
+    own_max_hp = int(s['max_hp'][side, active_idx])
     own_hp_frac = own_hp / max(own_max_hp, 1)
-    own_boosts = np.array(state.sides_team_boosts[side, active_idx])  # int8[7]
+    own_boosts = s['boosts'][side, active_idx]
 
     # Opponent active info
-    opp_types = np.array(state.sides_team_types[opp_side, opp_active_idx])
-    opp_stats = np.array(state.sides_team_base_stats[opp_side, opp_active_idx])
-    opp_hp = int(state.sides_team_hp[opp_side, opp_active_idx])
-    opp_max_hp = int(state.sides_team_max_hp[opp_side, opp_active_idx])
-    opp_status = int(state.sides_team_status[opp_side, opp_active_idx])
+    opp_types = s['types'][opp_side, opp_active_idx]
+    opp_stats = s['base_stats'][opp_side, opp_active_idx]
+    opp_hp = int(s['hp'][opp_side, opp_active_idx])
+    opp_max_hp = int(s['max_hp'][opp_side, opp_active_idx])
+    opp_status = int(s['status'][opp_side, opp_active_idx])
 
-    # Opponent's side conditions (our hazards land on their side)
-    opp_sc = np.array(state.sides_side_conditions[opp_side])
+    # Opponent's side conditions
+    opp_sc = s['side_conditions'][opp_side]
 
     # --- Score each legal move ---
     best_move_a = None
     best_move_score = -1.0
 
     for a in move_actions:
-        move_id = int(state.sides_team_move_ids[side, active_idx, a])
+        move_id = int(s['move_ids'][side, active_idx, a])
         if move_id < 0:
             continue
-        move_data = np.array(tables.moves[move_id])  # int16[MOVE_FIELDS]
+        move_data = _get_np_tables(tables)['moves'][move_id]  # int16[MOVE_FIELDS]
         bp = int(move_data[MF_BASE_POWER])
         move_type = int(move_data[MF_TYPE])
         category = int(move_data[MF_CATEGORY])
@@ -150,24 +175,24 @@ def smart_heuristic_action(
 
     for a in switch_actions:
         slot = a - 4
-        slot_hp = int(state.sides_team_hp[side, slot])
-        slot_max_hp = int(state.sides_team_max_hp[side, slot])
+        slot_hp = int(s['hp'][side, slot])
+        slot_max_hp = int(s['max_hp'][side, slot])
         if slot_max_hp <= 0:
             continue
         hp_frac = slot_hp / max(slot_max_hp, 1)
         if hp_frac < 0.15:
             continue
 
-        slot_types = np.array(state.sides_team_types[side, slot])
-        slot_stats = np.array(state.sides_team_base_stats[side, slot])
+        slot_types = s['types'][side, slot]
+        slot_stats = s['base_stats'][side, slot]
 
         # Best damage this mon can do to opponent
         best_dmg = 0.0
         for m in range(4):
-            mid = int(state.sides_team_move_ids[side, slot, m])
+            mid = int(s['move_ids'][side, slot, m])
             if mid < 0:
                 continue
-            md = np.array(tables.moves[mid])
+            md = _get_np_tables(tables)['moves'][mid]
             mbp = int(md[MF_BASE_POWER])
             if mbp <= 0:
                 continue
@@ -182,10 +207,10 @@ def smart_heuristic_action(
         # Worst incoming damage from opponent
         worst_incoming = 0.0
         for m in range(4):
-            mid = int(state.sides_team_move_ids[opp_side, opp_active_idx, m])
+            mid = int(s['move_ids'][opp_side, opp_active_idx, m])
             if mid < 0:
                 continue
-            md = np.array(tables.moves[mid])
+            md = _get_np_tables(tables)['moves'][mid]
             mbp = int(md[MF_BASE_POWER])
             if mbp <= 0:
                 continue
@@ -219,12 +244,25 @@ def smart_heuristic_action(
     return int(legal[0])
 
 
+_cached_np_tables = {}
+
+def _get_np_tables(tables: Tables) -> dict:
+    """Cache numpy versions of tables for fast CPU access."""
+    tid = id(tables)
+    if tid not in _cached_np_tables:
+        _cached_np_tables[tid] = {
+            'type_chart': np.array(tables.type_chart),
+            'moves': np.array(tables.moves),
+        }
+    return _cached_np_tables[tid]
+
+
 def _type_eff(atk_type: int, def_types: np.ndarray, tables: Tables) -> float:
     """Type effectiveness: atk_type vs defender's dual types."""
-    type_chart = np.array(tables.type_chart)
-    eff = float(type_chart[atk_type, int(def_types[0])])
+    tc = _get_np_tables(tables)['type_chart']
+    eff = float(tc[atk_type, int(def_types[0])])
     if int(def_types[1]) != 0:  # second type exists
-        eff *= float(type_chart[atk_type, int(def_types[1])])
+        eff *= float(tc[atk_type, int(def_types[1])])
     return eff
 
 

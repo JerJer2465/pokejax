@@ -20,7 +20,7 @@ import optax
 from pokejax.rl.obs_builder import build_obs
 from pokejax.rl.model import PokeTransformer
 from pokejax.env.pokejax_env import PokeJAXEnv, EnvState
-from pokejax.env.heuristic import smart_heuristic_action, random_action
+from pokejax.env.heuristic import smart_heuristic_action, random_action, _state_to_numpy
 from pokejax.data.tables import Tables
 
 
@@ -82,6 +82,32 @@ def collect_bc_data(
     games = 0
     opp_side = 1 - teacher_side
 
+    # Pre-JIT the step and obs functions for speed
+    @jax.jit
+    def jit_step(env_state, actions, step_key):
+        return env.step(env_state, actions, step_key)
+
+    @jax.jit
+    def jit_obs(battle, reveal):
+        return build_obs(battle, reveal, teacher_side, tables)
+
+    # Warm up JIT with a dummy run
+    if verbose:
+        print("  JIT compiling step + obs (first time only)...")
+    key, warmup_key = jax.random.split(key)
+    warmup_state, _ = env.reset(warmup_key)
+    warmup_obs = jit_obs(warmup_state.battle, warmup_state.reveal)
+    warmup_actions = jnp.array([0, 0], dtype=jnp.int32)
+    key, warmup_step_key = jax.random.split(key)
+    _ = jit_step(warmup_state, warmup_actions, warmup_step_key)
+    # Force compilation to complete
+    jax.block_until_ready(warmup_obs["int_ids"])
+    if verbose:
+        print("  JIT compiled. Collecting data...")
+
+    import time as _time
+    t0 = _time.time()
+
     while collected < n_transitions:
         # Reset environment
         key, reset_key = jax.random.split(key)
@@ -91,11 +117,14 @@ def collect_bc_data(
 
         turn = 0
         while not bool(state.finished) and turn < 300:
-            # Build observation for teacher
-            obs = build_obs(state, reveal, teacher_side, tables)
+            # Build observation for teacher (JIT-compiled)
+            obs = jit_obs(state, reveal)
 
-            # Teacher picks action
-            teacher_action = smart_heuristic_action(state, teacher_side, tables)
+            # Bulk convert state to numpy once per turn
+            np_state = _state_to_numpy(state)
+
+            # Teacher picks action (CPU heuristic, uses cached numpy)
+            teacher_action = smart_heuristic_action(state, teacher_side, tables, _np_cache=np_state)
 
             # Random opponent picks action
             opp_action = random_action(state, opp_side)
@@ -107,13 +136,13 @@ def collect_bc_data(
             all_actions.append(teacher_action)
             collected += 1
 
-            # Step environment
-            actions = jnp.zeros(2, dtype=jnp.int32)
+            # Step environment (JIT-compiled)
+            actions = jnp.array([0, 0], dtype=jnp.int32)
             actions = actions.at[teacher_side].set(teacher_action)
             actions = actions.at[opp_side].set(opp_action)
 
             key, step_key = jax.random.split(key)
-            env_state, _, _, _, _ = env.step(env_state, actions, step_key)
+            env_state, _, _, _, _ = jit_step(env_state, actions, step_key)
             state = env_state.battle
             reveal = env_state.reveal
             turn += 1
@@ -122,8 +151,12 @@ def collect_bc_data(
                 break
 
         games += 1
-        if verbose and games % 100 == 0:
-            print(f"  Collected {collected}/{n_transitions} from {games} games")
+        if verbose and games % 50 == 0:
+            elapsed = _time.time() - t0
+            rate = collected / max(elapsed, 0.001)
+            eta = (n_transitions - collected) / max(rate, 0.001)
+            print(f"  {collected}/{n_transitions} from {games} games "
+                  f"({rate:.0f} trans/s, ETA {eta:.0f}s)")
 
     if verbose:
         print(f"  Done: {collected} transitions from {games} games")
@@ -141,13 +174,26 @@ def collect_bc_data(
 # ---------------------------------------------------------------------------
 
 def bc_loss(params, model, int_ids, float_feats, legal_mask, actions):
-    """Cross-entropy loss: -log p(expert_action | obs)."""
-    log_probs, _, _ = model.apply(params, int_ids, float_feats, legal_mask)
+    """Cross-entropy loss: -log p(expert_action | obs).
+
+    Handles edge case where expert action may be masked (illegal) by
+    temporarily making it legal in the mask.
+    """
+    # Ensure expert action is always legal in the mask
+    # This handles edge cases where mask/heuristic disagree
+    B = actions.shape[0]
+    action_onehot = jax.nn.one_hot(actions, 10)
+    safe_mask = jnp.maximum(legal_mask, action_onehot)
+
+    log_probs, _, _ = model.apply(params, int_ids, float_feats, safe_mask)
     # log_probs: (B, 10)
     # actions: (B,)
     action_log_probs = jnp.take_along_axis(
         log_probs, actions[:, None], axis=1
     ).squeeze(1)  # (B,)
+
+    # Clip to avoid extreme values from numerical issues
+    action_log_probs = jnp.clip(action_log_probs, -20.0, 0.0)
     loss = -action_log_probs.mean()
 
     # Metrics
@@ -183,8 +229,10 @@ def create_bc_train_state(
         init_params = model.init(key, dummy_int, dummy_float, dummy_mask)
 
     n_updates = cfg.total_steps // cfg.batch_size
+    # alpha controls the minimum: lr * alpha at the end
+    alpha = cfg.lr_end / max(cfg.lr, 1e-10)
     lr_schedule = optax.cosine_decay_schedule(
-        cfg.lr, decay_steps=max(n_updates, 1), end_value=cfg.lr_end,
+        cfg.lr, decay_steps=max(n_updates, 1), alpha=alpha,
     )
     optimizer = optax.chain(
         optax.clip_by_global_norm(cfg.max_grad_norm),
