@@ -27,15 +27,15 @@ import optax
 class PPOConfig:
     # PPO — tuned for Pokemon battles (medium-length episodes, complex action space)
     # References: ps-ppo (Nebraskinator), Karten et al. 2025, 37 PPO details
-    lr:              float = 1e-4    # conservative for 5.67M param transformer
+    lr:              float = 3e-4    # higher LR for smaller ~1.6M param model
     clip_eps:        float = 0.2
     gamma:           float = 0.999   # high discount: early moves matter for win/loss
     gae_lambda:      float = 0.95
     vf_coef:         float = 0.5
     ent_coef:        float = 0.02    # higher entropy for exploration in complex action space
     max_grad_norm:   float = 0.5
-    n_epochs:        int   = 3       # 3 epochs (ps-ppo); slightly less aggressive
-    minibatch_size:  int   = 4096
+    n_epochs:        int   = 2       # 2 epochs: fewer gradient steps = faster + less overfitting
+    minibatch_size:  int   = 8192    # larger minibatch: better GPU utilization, fewer steps
 
     # C51
     n_atoms:   int   = 51
