@@ -392,10 +392,12 @@ def _encode_pokemon_batch(
     )
     rest_bin = jax.nn.one_hot(rest_t, 3, dtype=jnp.float32)  # (6, 3)
 
-    # sub_frac (1)
-    sub_data = volatile_data[:, VOL_SUBSTITUTE].astype(jnp.float32) / 255.0
+    # sub_frac (1) — substitute HP stored as raw HP clamped to int8 [1,127]
+    # Normalize by max_hp/4 (sub HP = 25% of max HP when created)
+    sub_data_raw = volatile_data[:, VOL_SUBSTITUTE].astype(jnp.float32)
+    sub_max_hp = jnp.maximum(1.0, jnp.floor(max_hp.astype(jnp.float32) / 4.0))
     has_sub = (volatiles & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
-    sub_frac = jnp.where(has_sub, sub_data, 0.0)[:, None]  # (6, 1)
+    sub_frac = jnp.where(has_sub, sub_data_raw / sub_max_hp, 0.0)[:, None]  # (6, 1)
 
     # force_trap (1)
     force_trap = ((volatiles & jnp.uint32(1 << VOL_PARTIALLY_TRAPPED)) !=
@@ -615,14 +617,67 @@ def _encode_field(state: BattleState, player: int) -> jnp.ndarray:
 # Legal action mask
 # ---------------------------------------------------------------------------
 
-def _build_legal_mask(state: BattleState, player: int) -> jnp.ndarray:
-    """Return float32[10] legal action mask for player."""
+def _build_legal_mask(state: BattleState, player: int, tables) -> jnp.ndarray:
+    """Return float32[10] legal action mask for player.
+
+    Marks moves as illegal when they would have no effect:
+      - Hazard moves when opponent's side already has max layers
+      - Status moves targeting foe when foe has a Substitute
+    """
+    from pokejax.data.move_effects_data import ME_HAZARD
+    from pokejax.core.damage import MF_CATEGORY, MF_TARGET
+
+    _CATEGORY_STATUS = jnp.int32(2)
+    # Target types that do NOT target the foe (self/field/side)
+    _TARGET_SELF      = jnp.int32(1)
+    _TARGET_ALL       = jnp.int32(8)
+    _TARGET_ALLY_TEAM = jnp.int32(9)
+    _TARGET_FOE_SIDE  = jnp.int32(10)
+    _TARGET_ALLY_SIDE = jnp.int32(11)
+
     s = player
+    opp = 1 - player
     active_idx = state.sides_active_idx[s]
+    opp_active_idx = state.sides_active_idx[opp]
 
     pp  = state.sides_team_move_pp[s, active_idx]            # int8[4]
     dis = state.sides_team_move_disabled[s, active_idx]       # bool[4]
     move_legal = (pp > jnp.int8(0)) & (~dis)
+
+    # Check if opponent's active has a Substitute
+    opp_has_sub = (state.sides_team_volatiles[opp, opp_active_idx]
+                   & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
+
+    move_ids = state.sides_team_move_ids[s, active_idx]       # int16[4]
+    for i in range(4):
+        mid = move_ids[i].astype(jnp.int32)
+        eff_type = tables.move_effects[mid, 0].astype(jnp.int32)
+
+        # --- Hazard moves at max layers ---
+        is_hazard = eff_type == jnp.int32(ME_HAZARD)
+        sc_idx = tables.move_effects[mid, 1].astype(jnp.int32)
+        max_layers = tables.move_effects[mid, 2].astype(jnp.int32)
+        sc_idx_clamped = jnp.clip(sc_idx, 0, 9)
+        cur_layers = state.sides_side_conditions[opp, sc_idx_clamped].astype(jnp.int32)
+        at_max = cur_layers >= max_layers
+        blocked_hazard = is_hazard & at_max
+
+        # --- Status moves vs Substitute ---
+        move_cat = tables.moves[mid, MF_CATEGORY].astype(jnp.int32)
+        move_tgt = tables.moves[mid, MF_TARGET].astype(jnp.int32)
+        is_status = move_cat == _CATEGORY_STATUS
+        targets_foe = ~(
+            (move_tgt == _TARGET_SELF) |
+            (move_tgt == _TARGET_ALL) |
+            (move_tgt == _TARGET_ALLY_TEAM) |
+            (move_tgt == _TARGET_FOE_SIDE) |
+            (move_tgt == _TARGET_ALLY_SIDE)
+        )
+        blocked_sub = is_status & targets_foe & opp_has_sub
+
+        move_legal = move_legal.at[i].set(
+            jnp.where(blocked_hazard | blocked_sub, jnp.bool_(False), move_legal[i])
+        )
 
     fainted_arr = state.sides_team_fainted[s]                 # bool[6]
     is_active_arr = state.sides_team_is_active[s]             # bool[6]
@@ -693,7 +748,7 @@ def build_obs(
         query_float,        # (2, 394)
     ], axis=0)  # (15, 394)
 
-    legal_mask = _build_legal_mask(state, player)  # (10,)
+    legal_mask = _build_legal_mask(state, player, tables)  # (10,)
 
     return {
         "int_ids":    int_ids,
