@@ -132,10 +132,10 @@ def c51_loss(
     v_max: float,
 ) -> jnp.ndarray:
     """C51 cross-entropy loss (projected Bellman for scalar targets)."""
+    B = returns.shape[0]
     targets = jnp.clip(returns, v_min, v_max)
-    support = jnp.linspace(v_min, v_max, n_atoms)
     delta_z = (v_max - v_min) / (n_atoms - 1)
-    b = (targets[:, None] - v_min) / delta_z              # (B, 1) → (B,)
+    b = (targets - v_min) / delta_z                        # (B,)
     lower = jnp.floor(b).astype(jnp.int32)
     upper = jnp.ceil(b).astype(jnp.int32)
     lower = jnp.clip(lower, 0, n_atoms - 1)
@@ -144,16 +144,12 @@ def c51_loss(
     frac_upper = b - lower.astype(jnp.float32)
     frac_lower = 1.0 - frac_upper
 
-    # Scatter into target distribution
-    def _scatter(frac, idx):
-        return jnp.zeros((returns.shape[0], n_atoms), dtype=jnp.float32).at[
-            jnp.arange(returns.shape[0])[:, None],
-            idx[:, None],
-        ].add(frac[:, None])
-
-    target_dist = (
-        _scatter(frac_lower, lower) + _scatter(frac_upper, upper)
-    )  # (B, n_atoms)
+    # Scatter into target distribution — indices must be 1D (B,)
+    batch_idx = jnp.arange(B)
+    target_dist = jnp.zeros((B, n_atoms), dtype=jnp.float32)
+    target_dist = target_dist.at[batch_idx, lower].add(frac_lower)
+    target_dist = target_dist.at[batch_idx, upper].add(frac_upper)
+    # target_dist row sums = 1.0
 
     log_probs = jnp.log(jnp.clip(value_probs, 1e-8, 1.0))
     loss = -(target_dist * log_probs).sum(-1)
