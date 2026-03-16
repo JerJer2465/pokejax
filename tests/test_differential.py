@@ -1113,12 +1113,6 @@ def run_differential_suite(battles_path: Optional[str] = None,
 # pytest interface
 # ═══════════════════════════════════════════════════════════════════════════
 
-def pytest_addoption(parser):
-    """Add custom CLI options for pytest."""
-    parser.addoption("--battles", default=None, help="Path to Showdown battle JSONL")
-    parser.addoption("--num-battles", type=int, default=100, help="Number of battles to run")
-
-
 @pytest.fixture(scope="session")
 def battles_path(request):
     return request.config.getoption("--battles")

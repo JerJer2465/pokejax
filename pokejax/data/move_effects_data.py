@@ -281,7 +281,7 @@ GEN4_MOVE_EFFECTS = {
     "Attract":       _volatile_foe(_VOL_ATTRACT),
     "Heal Block":    _volatile_foe(_VOL_HEALBLOCK),
     "Nightmare":     _volatile_foe(_VOL_NIGHTMARE),
-    "Curse":         _volatile_foe(_VOL_CURSE),  # Ghost-type Curse (non-ghost handled above)
+    "CurseGhost":    _volatile_foe(_VOL_CURSE),  # Ghost-type Curse (keyed separately to avoid overwriting non-ghost Curse boost)
 
     # ---- Substitute ----
     "Substitute":    _simple_effect(ME_SUBSTITUTE),
