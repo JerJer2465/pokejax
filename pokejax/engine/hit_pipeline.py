@@ -21,6 +21,8 @@ from pokejax.types import (
     BattleState,
     VOL_CHARGING, CATEGORY_STATUS,
     TYPE_NONE, STATUS_FRZ, STATUS_NONE,
+    WEATHER_SAND, WEATHER_HAIL,
+    CATEGORY_PHYSICAL,
 )
 from pokejax.core.damage import (
     compute_damage, type_effectiveness, apply_damage,
@@ -127,8 +129,23 @@ def step5_accuracy(tables, state: BattleState,
     Step 5: Accuracy roll.
     Returns (cancelled, new_key).
     """
+    from pokejax.mechanics.abilities import (
+        NO_GUARD_ID, COMPOUND_EYES_ID, HUSTLE_ID,
+        SAND_VEIL_ID, SNOW_CLOAK_ID,
+    )
+
     accuracy = tables.moves[move_id.astype(jnp.int32), MF_ACCURACY].astype(jnp.int32)
     always_hits = accuracy >= jnp.int32(ALWAYS_HITS_SENTINEL)
+
+    # Ability IDs
+    atk_ability = state.sides_team_ability_id[atk_side, atk_idx].astype(jnp.int32)
+    def_ability = state.sides_team_ability_id[def_side, def_idx].astype(jnp.int32)
+
+    # No Guard: both sides' moves always hit
+    no_guard = (
+        ((NO_GUARD_ID >= 0) & (atk_ability == jnp.int32(NO_GUARD_ID))) |
+        ((NO_GUARD_ID >= 0) & (def_ability == jnp.int32(NO_GUARD_ID)))
+    )
 
     # Accuracy boost
     atk_acc_boost = state.sides_team_boosts[atk_side, atk_idx, 5]  # BOOST_ACC
@@ -140,17 +157,35 @@ def step5_accuracy(tables, state: BattleState,
         atk_acc_boost.astype(jnp.int32) - def_eva_boost.astype(jnp.int32),
         -6, 6
     )
-    # Accuracy multiplier
+    # Accuracy multiplier from stages
     num = jnp.maximum(3, 3 + net_boost).astype(jnp.float32)
     den = jnp.maximum(3, 3 - net_boost).astype(jnp.float32)
     acc_mult = num / den
+
+    # Compound Eyes: x1.3 accuracy
+    compound_eyes = (COMPOUND_EYES_ID >= 0) & (atk_ability == jnp.int32(COMPOUND_EYES_ID))
+    acc_mult = jnp.where(compound_eyes, acc_mult * 1.3, acc_mult)
+
+    # Hustle: x0.8 accuracy for physical moves
+    move_category = tables.moves[move_id.astype(jnp.int32), MF_CATEGORY].astype(jnp.int8)
+    hustle = (HUSTLE_ID >= 0) & (atk_ability == jnp.int32(HUSTLE_ID))
+    is_physical = move_category == CATEGORY_PHYSICAL
+    acc_mult = jnp.where(hustle & is_physical, acc_mult * 0.8, acc_mult)
+
+    # Sand Veil: 0.8x evasion in sandstorm (defender)
+    sand_veil = (SAND_VEIL_ID >= 0) & (def_ability == jnp.int32(SAND_VEIL_ID)) & (state.field.weather == WEATHER_SAND)
+    acc_mult = jnp.where(sand_veil, acc_mult * 0.8, acc_mult)
+
+    # Snow Cloak: 0.8x evasion in hail (defender)
+    snow_cloak = (SNOW_CLOAK_ID >= 0) & (def_ability == jnp.int32(SNOW_CLOAK_ID)) & (state.field.weather == WEATHER_HAIL)
+    acc_mult = jnp.where(snow_cloak, acc_mult * 0.8, acc_mult)
 
     effective_acc = jnp.floor(accuracy.astype(jnp.float32) * acc_mult).astype(jnp.int32)
     effective_acc = jnp.clip(effective_acc, 1, 100)
 
     key, subkey = rng_utils.split(key)
     hits = rng_utils.accuracy_roll(subkey, effective_acc)
-    missed = ~hits & ~always_hits
+    missed = ~hits & ~always_hits & ~no_guard
 
     return cancelled | missed, key
 

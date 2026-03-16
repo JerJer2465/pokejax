@@ -29,7 +29,7 @@ def benchmark_config(env, tables, n_envs, n_steps, mb_size, use_scan_ppo=True, n
 
     key = jax.random.PRNGKey(seed)
     key, init_key = jax.random.split(key)
-    model, optimizer, train_state = create_model_and_state(cfg, init_key)
+    model, optimizer, train_state, _lr = create_model_and_state(cfg, init_key)
 
     jit_rollout = make_jit_rollout(model, env, tables, cfg.rollout)
 
@@ -42,7 +42,7 @@ def benchmark_config(env, tables, n_envs, n_steps, mb_size, use_scan_ppo=True, n
         label = f"scan n_envs={n_envs} mb={mb_size}"
         print(f"  Compiling ({label})...")
         key, rk, pk = jax.random.split(key, 3)
-        _, batch = jit_rollout(train_state.params, rk)
+        _, batch, _info = jit_rollout(train_state.params, rk)
         train_state, metrics, _ = jit_epochs(train_state, batch, pk)
         jax.block_until_ready(train_state.params)
 
@@ -50,7 +50,7 @@ def benchmark_config(env, tables, n_envs, n_steps, mb_size, use_scan_ppo=True, n
         t0 = time.perf_counter()
         for i in range(n_updates):
             key, rk, pk = jax.random.split(key, 3)
-            _, batch = jit_rollout(train_state.params, rk)
+            _, batch, _info = jit_rollout(train_state.params, rk)
             train_state, metrics, _ = jit_epochs(train_state, batch, pk)
         jax.block_until_ready(train_state.params)
         elapsed = time.perf_counter() - t0
@@ -64,7 +64,7 @@ def benchmark_config(env, tables, n_envs, n_steps, mb_size, use_scan_ppo=True, n
         label = f"loop n_envs={n_envs} mb={mb_size}"
         print(f"  Compiling ({label})...")
         key, rk = jax.random.split(key)
-        _, batch = jit_rollout(train_state.params, rk)
+        _, batch, _info = jit_rollout(train_state.params, rk)
         # Warmup one step
         mb = jax.tree.map(lambda x: x[:mb_size], batch)
         train_state, _ = jit_step(train_state, mb)
@@ -74,7 +74,7 @@ def benchmark_config(env, tables, n_envs, n_steps, mb_size, use_scan_ppo=True, n
         t0 = time.perf_counter()
         for i in range(n_updates):
             key, rk = jax.random.split(key)
-            _, batch = jit_rollout(train_state.params, rk)
+            _, batch, _info = jit_rollout(train_state.params, rk)
             for epoch in range(n_epochs):
                 key, perm_key = jax.random.split(key)
                 perm = jax.random.permutation(perm_key, B)

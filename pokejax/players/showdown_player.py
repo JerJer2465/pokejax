@@ -16,9 +16,7 @@ from __future__ import annotations
 import os
 import re
 import pickle
-from typing import Optional, Dict, List, Set
-
-import orjson
+from typing import Optional, Dict, List
 
 import numpy as np
 import jax
@@ -356,12 +354,16 @@ class ObsBridge:
             hp = pokemon.current_hp or 0
             maxhp = pokemon.max_hp or max(hp, 1)
         else:
-            bst = getattr(pokemon, 'base_stats', {}) or {}
-            base_hp = bst.get('hp', 80)
-            maxhp = 2 * base_hp + 141  # rough estimate
-            hp = int(pokemon.current_hp_fraction * maxhp)
+            # For opponents, we only know the HP fraction from Showdown
+            # Use it directly instead of estimating absolute HP
+            hp_frac_raw = pokemon.current_hp_fraction if pokemon.current_hp_fraction is not None else 1.0
+            maxhp = 1  # placeholder; hp_frac computed directly below
+            hp = 1  # placeholder
 
-        hp_frac = hp / max(maxhp, 1)
+        if is_own:
+            hp_frac = hp / max(maxhp, 1)
+        else:
+            hp_frac = hp_frac_raw
         buf[_OFF_HP_FRAC] = hp_frac
         hp_pct = max(0, min(int(hp_frac * 100), 100))
         buf[_OFF_HP_BIN:_OFF_HP_BIN + 10] = 0
@@ -796,6 +798,8 @@ class PokejaxPlayer(Player):
     """
     Pokemon Showdown player using the pokejax PokeTransformer model.
 
+    Just overrides choose_move — lets poke-env handle all protocol/messaging.
+
     Usage:
         player = PokejaxPlayer(
             checkpoint_path="checkpoints/bc_final.pkl",
@@ -843,152 +847,6 @@ class PokejaxPlayer(Player):
         dummy_float = jnp.zeros((N_TOKENS, FLOAT_DIM), dtype=jnp.float32)
         dummy_mask = jnp.ones(N_ACTIONS, dtype=jnp.float32)
         _ = self._forward(self.params, dummy_int, dummy_float, dummy_mask)
-
-        # Track battles waiting for a request after |turn|
-        self._pending_turn_battles: Set[str] = set()
-
-    async def _handle_battle_message(self, split_messages: List[List[str]]):
-        """Override poke-env's message handler to fix request/turn ordering.
-
-        In Pokemon Showdown, |request| and |turn| arrive in separate websocket
-        frames, with |turn| first. poke-env normally calls choose_move from
-        |turn|, but available_moves is stale (from the previous request).
-
-        Fix: defer choose_move until |request| arrives with fresh data.
-        """
-        if (
-            len(split_messages) > 1
-            and len(split_messages[1]) > 1
-            and split_messages[1][1] == "init"
-        ):
-            battle_info = split_messages[0][0].split("-")
-            battle = await self._create_battle(battle_info)
-        else:
-            battle = await self._get_battle(split_messages[0][0])
-
-        saw_turn = False
-        saw_request = False
-
-        for split_message in split_messages[1:]:
-            if len(split_message) <= 1:
-                continue
-            elif split_message[1] == "":
-                battle.parse_message(split_message)
-            elif split_message[1] in self.MESSAGES_TO_IGNORE:
-                pass
-            elif split_message[1] == "request":
-                if split_message[2]:
-                    request = orjson.loads(split_message[2])
-                    battle.parse_request(request)
-                    saw_request = True
-                    if battle.move_on_next_request:
-                        await self._handle_battle_request(battle)
-                        battle.move_on_next_request = False
-            elif split_message[1] == "win" or split_message[1] == "tie":
-                if split_message[1] == "win":
-                    battle.won_by(split_message[2])
-                else:
-                    battle.tied()
-                await self._battle_count_queue.get()
-                self._battle_count_queue.task_done()
-                self._battle_finished_callback(battle)
-                async with self._battle_end_condition:
-                    self._battle_end_condition.notify_all()
-                self._pending_turn_battles.discard(battle.battle_tag)
-            elif split_message[1] == "error":
-                self.logger.log(
-                    25, "Error message received: %s", "|".join(split_message)
-                )
-                if split_message[2].startswith(
-                    "[Invalid choice] Sorry, too late to make a different move"
-                ):
-                    if battle.trapped:
-                        await self._handle_battle_request(battle)
-                elif split_message[2].startswith(
-                    "[Unavailable choice] Can't switch: The active Pokémon is "
-                    "trapped"
-                ) or split_message[2].startswith(
-                    "[Invalid choice] Can't switch: The active Pokémon is trapped"
-                ):
-                    battle.trapped = True
-                    await self._handle_battle_request(battle)
-                elif split_message[2].startswith(
-                    "[Invalid choice] Can't switch: You can't switch to an active "
-                    "Pokémon"
-                ):
-                    await self._handle_battle_request(battle, maybe_default_order=True)
-                elif split_message[2].startswith(
-                    "[Invalid choice] Can't switch: You can't switch to a fainted "
-                    "Pokémon"
-                ):
-                    await self._handle_battle_request(battle, maybe_default_order=True)
-                elif split_message[2].startswith(
-                    "[Invalid choice] Can't move: Invalid target for"
-                ):
-                    await self._handle_battle_request(battle, maybe_default_order=True)
-                elif split_message[2].startswith(
-                    "[Invalid choice] Can't move: You can't choose a target for"
-                ):
-                    await self._handle_battle_request(battle, maybe_default_order=True)
-                elif split_message[2].startswith(
-                    "[Invalid choice] Can't move: "
-                ) and split_message[2].endswith("needs a target"):
-                    await self._handle_battle_request(battle, maybe_default_order=True)
-                elif (
-                    split_message[2].startswith("[Invalid choice] Can't move: Your")
-                    and " doesn't have a move matching " in split_message[2]
-                ):
-                    await self._handle_battle_request(battle, maybe_default_order=True)
-                elif split_message[2].startswith(
-                    "[Invalid choice] Incomplete choice: "
-                ):
-                    await self._handle_battle_request(battle, maybe_default_order=True)
-                elif split_message[2].startswith(
-                    "[Unavailable choice]"
-                ) and split_message[2].endswith("is disabled"):
-                    battle.move_on_next_request = True
-                elif split_message[2].startswith("[Invalid choice]") and split_message[
-                    2
-                ].endswith("is disabled"):
-                    battle.move_on_next_request = True
-                elif split_message[2].startswith(
-                    "[Invalid choice] Can't move: You sent more choices than unfainted"
-                    " Pokémon."
-                ):
-                    await self._handle_battle_request(battle, maybe_default_order=True)
-                elif split_message[2].startswith(
-                    "[Invalid choice] Can't move: You can only Terastallize once per battle."
-                ):
-                    await self._handle_battle_request(battle, maybe_default_order=True)
-                else:
-                    self.logger.critical("Unexpected error message: %s", split_message)
-            elif split_message[1] == "turn":
-                battle.parse_message(split_message)
-                # DON'T call _handle_battle_request here — defer until
-                # |request| arrives with fresh available_moves data.
-                saw_turn = True
-            elif split_message[1] == "teampreview":
-                battle.parse_message(split_message)
-                await self._handle_battle_request(battle, from_teampreview_request=True)
-            elif split_message[1] == "bigerror":
-                self.logger.warning("Received 'bigerror' message: %s", split_message)
-            elif split_message[1] == "uhtml" and len(split_message) > 2 and split_message[2] == "otsrequest":
-                await self._handle_ots_request(battle.battle_tag)
-            else:
-                battle.parse_message(split_message)
-
-        # After processing the batch:
-        if saw_turn and saw_request:
-            # Request and turn in same batch — data is fresh, act now
-            await self._handle_battle_request(battle)
-            self._pending_turn_battles.discard(battle.battle_tag)
-        elif saw_turn:
-            # Turn without request — defer until request arrives
-            self._pending_turn_battles.add(battle.battle_tag)
-        elif saw_request and battle.battle_tag in self._pending_turn_battles:
-            # Request arrived for a deferred turn — act now with fresh data
-            self._pending_turn_battles.discard(battle.battle_tag)
-            await self._handle_battle_request(battle)
 
     def choose_move(self, battle: AbstractBattle):
         """Choose a move for the current turn."""

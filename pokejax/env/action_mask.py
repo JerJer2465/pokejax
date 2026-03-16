@@ -22,6 +22,8 @@ import jax.numpy as jnp
 from pokejax.types import (
     BattleState,
     VOL_PARTIALLY_TRAPPED, VOL_INGRAIN, VOL_ENCORE, VOL_CHOICELOCK,
+    VOL_RECHARGING,
+    TYPE_FLYING, TYPE_GHOST, TYPE_STEEL,
     MAX_TEAM_SIZE, MAX_MOVES,
 )
 
@@ -59,6 +61,10 @@ def get_move_mask(state: BattleState, side: int) -> jnp.ndarray:
     choice_mask = (slots == locked_slot)
     base_mask = jnp.where(choicelock, choice_mask & base_mask, base_mask)
 
+    # Recharging: no moves are legal (engine auto-skips the turn)
+    recharging = (vols & jnp.uint32(1 << VOL_RECHARGING)) != jnp.uint32(0)
+    base_mask = jnp.where(recharging, jnp.zeros(4, dtype=jnp.bool_), base_mask)
+
     # If no legal move exists → Struggle (force all moves legal so the policy can pick)
     any_legal = base_mask.any()
     return jnp.where(any_legal, base_mask, jnp.ones(4, dtype=jnp.bool_))
@@ -67,15 +73,43 @@ def get_move_mask(state: BattleState, side: int) -> jnp.ndarray:
 def is_trapped(state: BattleState, side: int) -> jnp.ndarray:
     """
     Returns True if the active Pokemon cannot switch out.
-    Checks: partial trap, ingrain, future trapping abilities (placeholder).
+    Checks: partial trap, ingrain, Arena Trap, Shadow Tag, Magnet Pull.
     """
+    from pokejax.mechanics.abilities import (
+        ARENA_TRAP_ID, SHADOW_TAG_ID, MAGNET_PULL_ID, LEVITATE_ID,
+    )
+
     idx = state.sides_active_idx[side]
     vols = state.sides_team_volatiles[side, idx]
 
     partially_trapped = (vols & jnp.uint32(1 << VOL_PARTIALLY_TRAPPED)) != jnp.uint32(0)
     ingrained         = (vols & jnp.uint32(1 << VOL_INGRAIN))            != jnp.uint32(0)
 
-    return partially_trapped | ingrained
+    # Opponent's ability-based trapping
+    opp = 1 - side
+    opp_idx = state.sides_active_idx[opp]
+    opp_ability = state.sides_team_ability_id[opp, opp_idx].astype(jnp.int32)
+
+    own_types = state.sides_team_types[side, idx]
+    own_t0 = own_types[0].astype(jnp.int32)
+    own_t1 = own_types[1].astype(jnp.int32)
+    own_ability = state.sides_team_ability_id[side, idx].astype(jnp.int32)
+
+    # Arena Trap: traps grounded opponents (not Flying, not Levitate)
+    is_flying = (own_t0 == jnp.int32(TYPE_FLYING)) | (own_t1 == jnp.int32(TYPE_FLYING))
+    has_levitate = (LEVITATE_ID >= 0) & (own_ability == jnp.int32(LEVITATE_ID))
+    is_grounded = ~is_flying & ~has_levitate
+    arena_trap = (ARENA_TRAP_ID >= 0) & (opp_ability == jnp.int32(ARENA_TRAP_ID)) & is_grounded
+
+    # Shadow Tag: traps all (except Ghost-types in Gen 4)
+    is_ghost = (own_t0 == jnp.int32(TYPE_GHOST)) | (own_t1 == jnp.int32(TYPE_GHOST))
+    shadow_tag = (SHADOW_TAG_ID >= 0) & (opp_ability == jnp.int32(SHADOW_TAG_ID)) & ~is_ghost
+
+    # Magnet Pull: traps Steel-types
+    is_steel = (own_t0 == jnp.int32(TYPE_STEEL)) | (own_t1 == jnp.int32(TYPE_STEEL))
+    magnet_pull = (MAGNET_PULL_ID >= 0) & (opp_ability == jnp.int32(MAGNET_PULL_ID)) & is_steel
+
+    return partially_trapped | ingrained | arena_trap | shadow_tag | magnet_pull
 
 
 def get_switch_mask(state: BattleState, side: int) -> jnp.ndarray:
@@ -92,7 +126,13 @@ def get_switch_mask(state: BattleState, side: int) -> jnp.ndarray:
 
     # Trapped: cannot switch
     trapped = is_trapped(state, side)
-    return jnp.where(trapped, jnp.zeros(6, dtype=jnp.bool_), base_switch)
+
+    # Recharging: cannot switch
+    vols = state.sides_team_volatiles[side, active]
+    recharging = (vols & jnp.uint32(1 << VOL_RECHARGING)) != jnp.uint32(0)
+
+    cant_switch = trapped | recharging
+    return jnp.where(cant_switch, jnp.zeros(6, dtype=jnp.bool_), base_switch)
 
 
 def get_action_mask(state: BattleState, side: int) -> jnp.ndarray:

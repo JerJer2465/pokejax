@@ -338,7 +338,7 @@ def make_battle_state(
     All teams start at slot 0 active, full HP, no status or volatiles.
     """
     def _stack(a, b):
-        return jnp.array(np.stack([a, b], axis=0))
+        return jnp.stack([jnp.asarray(a), jnp.asarray(b)], axis=0)
 
     # 6×4 move arrays
     def _z6_4_i16():

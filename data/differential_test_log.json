@@ -1,0 +1,148 @@
+{
+  "timestamp": "2026-03-16 13:35:32",
+  "num_battles": 100,
+  "turns_replayed": 6490,
+  "duration_s": 221.1,
+  "deterministic_checks": {
+    "action_mask": {
+      "legal": 12965,
+      "illegal": 15,
+      "rate": 0.998844
+    },
+    "hp_violations": 0,
+    "boost": {
+      "match": 84702,
+      "mismatch": 817,
+      "rate": 0.990447
+    },
+    "weather": {
+      "match": 6443,
+      "mismatch": 47
+    },
+    "side_conditions": {
+      "match": 2569,
+      "mismatch": 39
+    }
+  },
+  "rng_dependent_checks": {
+    "hp": {
+      "match": 7344,
+      "mismatch": 4873
+    },
+    "status": {
+      "match": 11705,
+      "mismatch": 512
+    },
+    "faint": {
+      "match": 11900,
+      "mismatch": 317
+    },
+    "pp": {
+      "match": 46100,
+      "mismatch": 2696
+    },
+    "item": {
+      "match": 12167,
+      "mismatch": 50
+    },
+    "winner": {
+      "match": 62,
+      "mismatch": 2
+    }
+  },
+  "game_completion": {
+    "ps_finished": 83,
+    "jax_finished": 65,
+    "early": 24,
+    "late": 19
+  },
+  "verdict": "PASS",
+  "failures": {
+    "action_mask": [
+      "B23 T13 P1: 'switch 4'",
+      "B23 T15 P1: 'switch 4'",
+      "B23 T16 P1: 'switch 4'",
+      "B24 T3 P2: 'switch 2'",
+      "B53 T56 P2: 'switch 5'",
+      "B61 T23 P1: 'switch 5'",
+      "B74 T2 P1: 'switch 3'",
+      "B74 T3 P1: 'switch 2'",
+      "B74 T25 P1: 'switch 2'",
+      "B82 T38 P1: 'switch 3'",
+      "B95 T4 P2: 'switch 3'",
+      "B95 T26 P2: 'switch 3'",
+      "B95 T27 P2: 'switch 2'",
+      "B96 T31 P2: 'switch 4'",
+      "B96 T46 P2: 'switch 5'"
+    ],
+    "hp_mismatches": [
+      "B0 T1 S0 slot0: PS=139 JAX=130 (delta=9)",
+      "B0 T1 S1 slot0: PS=249 JAX=228 (delta=21)",
+      "B0 T4 S0 slot5: PS=204 JAX=202 (delta=2)",
+      "B0 T5 S0 slot5: PS=221 JAX=119 (delta=102)",
+      "B0 T5 S1 slot2: PS=182 JAX=190 (delta=8)",
+      "B0 T7 S1 slot4: PS=221 JAX=220 (delta=1)",
+      "B0 T8 S1 slot2: PS=197 JAX=196 (delta=1)",
+      "B0 T10 S0 slot1: PS=236 JAX=298 (delta=62)",
+      "B0 T10 S1 slot4: PS=257 JAX=256 (delta=1)",
+      "B0 T12 S0 slot1: PS=254 JAX=253 (delta=1)",
+      "B0 T12 S1 slot0: PS=206 JAX=207 (delta=1)",
+      "B0 T13 S0 slot1: PS=206 JAX=212 (delta=6)",
+      "B0 T14 S0 slot1: PS=224 JAX=106 (delta=118)",
+      "B0 T16 S0 slot0: PS=139 JAX=115 (delta=24)",
+      "B0 T17 S0 slot0: PS=157 JAX=180 (delta=23)",
+      "B0 T19 S0 slot5: PS=240 JAX=244 (delta=4)",
+      "B0 T19 S1 slot4: PS=224 JAX=226 (delta=2)",
+      "B0 T20 S0 slot5: PS=199 JAX=201 (delta=2)",
+      "B0 T20 S1 slot4: PS=158 JAX=154 (delta=4)",
+      "B0 T24 S0 slot4: PS=263 JAX=278 (delta=15)",
+      "B0 T25 S0 slot1: PS=242 JAX=241 (delta=1)",
+      "B0 T25 S1 slot1: PS=225 JAX=201 (delta=24)",
+      "B0 T26 S0 slot1: PS=260 JAX=259 (delta=1)",
+      "B0 T26 S1 slot1: PS=94 JAX=70 (delta=24)",
+      "B0 T27 S1 slot3: PS=146 JAX=149 (delta=3)",
+      "B0 T29 S0 slot1: PS=296 JAX=295 (delta=1)",
+      "B0 T30 S0 slot0: PS=157 JAX=134 (delta=23)",
+      "B0 T30 S1 slot2: PS=245 JAX=242 (delta=3)",
+      "B0 T31 S0 slot0: PS=134 JAX=133 (delta=1)",
+      "B0 T33 S1 slot4: PS=176 JAX=175 (delta=1)"
+    ],
+    "status_mismatches": [
+      "B0 T5 S1 slot2: PS=slp JAX=",
+      "B0 T8 S1 slot2: PS=slp JAX=",
+      "B0 T12 S1 slot0: PS= JAX=par",
+      "B0 T16 S1 slot4: PS=par JAX=",
+      "B0 T28 S1 slot2: PS=slp JAX=",
+      "B0 T29 S1 slot2: PS=slp JAX=",
+      "B0 T30 S1 slot2: PS=slp JAX=",
+      "B0 T31 S1 slot2: PS=slp JAX=",
+      "B0 T38 S1 slot1: PS= JAX=par",
+      "B0 T39 S1 slot2: PS=slp JAX=",
+      "B0 T40 S1 slot2: PS=slp JAX=",
+      "B0 T45 S1 slot2: PS= JAX=par",
+      "B0 T48 S1 slot2: PS=slp JAX=",
+      "B0 T49 S1 slot2: PS=slp JAX=",
+      "B0 T56 S1 slot2: PS=slp JAX=",
+      "B0 T57 S1 slot2: PS=slp JAX=",
+      "B0 T60 S0 slot3: PS= JAX=par",
+      "B0 T61 S0 slot3: PS= JAX=par",
+      "B0 T68 S1 slot2: PS=slp JAX=",
+      "B1 T2 S1 slot0: PS= JAX=par",
+      "B1 T13 S0 slot5: PS= JAX=tox",
+      "B2 T8 S1 slot4: PS= JAX=tox",
+      "B2 T40 S1 slot1: PS=slp JAX=",
+      "B2 T41 S1 slot1: PS=slp JAX=",
+      "B3 T13 S0 slot3: PS=frz JAX=",
+      "B3 T14 S0 slot3: PS=frz JAX=",
+      "B3 T15 S0 slot3: PS=frz JAX=brn",
+      "B3 T39 S0 slot1: PS= JAX=psn",
+      "B4 T1 S0 slot0: PS= JAX=tox",
+      "B4 T27 S1 slot4: PS= JAX=frz"
+    ],
+    "winner_mismatches": [
+      "B72: PS=Bot2 JAX=0",
+      "B74: PS=Bot2 JAX=0"
+    ],
+    "errors": []
+  }
+}

@@ -33,14 +33,16 @@ def _is_type(state: BattleState, side: int, type_id: int) -> jnp.ndarray:
 def _is_grounded(state: BattleState, side: int) -> jnp.ndarray:
     """
     Returns True if the active Pokemon is grounded (affected by terrain/spikes).
-    Simplified: not Flying-type. Full implementation checks Levitate, Air Balloon,
-    Magnet Rise, Telekinesis, etc.
+    Checks Flying-type and Levitate ability.
     """
     from pokejax.types import TYPE_FLYING
+    from pokejax.mechanics.abilities import LEVITATE_ID
     idx = state.sides_active_idx[side]
     types = state.sides_team_types[side, idx]
     is_flying = (types[0] == jnp.int8(TYPE_FLYING)) | (types[1] == jnp.int8(TYPE_FLYING))
-    return ~is_flying
+    ability_id = state.sides_team_ability_id[side, idx].astype(jnp.int32)
+    has_levitate = (LEVITATE_ID >= 0) & (ability_id == jnp.int32(LEVITATE_ID))
+    return ~is_flying & ~has_levitate
 
 
 # ---------------------------------------------------------------------------

@@ -310,7 +310,15 @@ def try_set_status(state: BattleState, side: int, slot: int,
     # Safeguard
     safeguard = state.sides_side_conditions[side, SC_SAFEGUARD] > jnp.int8(0)
 
-    blocked = already_statused | type_blocked | safeguard
+    # Sleep Clause: only one opponent Pokemon asleep at a time
+    # (Rest is exempt — it sets sleep directly, not through try_set_status)
+    any_sleeping = jnp.any(
+        (state.sides_team_status[side] == jnp.int8(STATUS_SLP)) &
+        ~state.sides_team_fainted[side]
+    )
+    sleep_clause_blocks = (new_status == jnp.int8(STATUS_SLP)) & any_sleeping
+
+    blocked = already_statused | type_blocked | safeguard | sleep_clause_blocks
 
     # Set status
     init_turns = jnp.where(new_status == jnp.int8(STATUS_TOX), jnp.int8(1), jnp.int8(0))
@@ -381,7 +389,7 @@ def apply_volatile_residuals(state: BattleState, side: int) -> BattleState:
     # Partial Trap: 1/8 max HP per turn (Gen 5+); Gen 4: 1/16
     trapped = has_volatile(state, side, idx, VOL_PARTIALLY_TRAPPED)
     trap_turns = state.sides_team_volatile_data[side, idx, VOL_PARTIALLY_TRAPPED]
-    trap_dmg = fraction_of_max_hp(state, side, idx, 1, 8)  # Gen 5+
+    trap_dmg = fraction_of_max_hp(state, side, idx, 1, 16)  # Gen 4: 1/16
     trap_dmg = jnp.where(trapped & (trap_turns > jnp.int8(0)), trap_dmg, jnp.int32(0))
 
     # Decrement trap counter, remove if expired
@@ -519,7 +527,11 @@ def apply_entry_hazards(state: BattleState, side: int, tables) -> BattleState:
     # Stealth Rock hits everyone regardless.
     # ----------------------------------------------------------------
     is_flying   = (t0 == jnp.int32(TYPE_FLYING)) | (t1 == jnp.int32(TYPE_FLYING))
-    is_grounded = ~is_flying  # TODO: also check Levitate ability, Air Balloon item
+    # Levitate grants ground immunity (Air Balloon is Gen 5+ only)
+    from pokejax.mechanics.abilities import LEVITATE_ID
+    ability_id = state.sides_team_ability_id[side, idx].astype(jnp.int32)
+    has_levitate = (LEVITATE_ID >= 0) & (ability_id == jnp.int32(LEVITATE_ID))
+    is_grounded = ~is_flying & ~has_levitate
 
     # ----------------------------------------------------------------
     # Stealth Rock: Rock-type effectiveness × max_hp / 8

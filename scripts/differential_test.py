@@ -119,18 +119,20 @@ weather_map = {
     'hail': 4, 'snow': 4,
 }
 
-# PS side condition name -> (JAX SC index, is_layer_based)
+# PS side condition name -> (JAX SC index, value_source)
+# value_source: 'layers' = read sc_data['layers'], 'duration' = read sc_data['duration'],
+#               'presence' = just 1 if present (PS stores as layers:1, duration:0)
 sc_name_map = {
-    'spikes':       (0, True),   # SC_SPIKES: layer count 0-3
-    'toxicspikes':  (1, True),   # SC_TOXICSPIKES: layer count 0-2
-    'stealthrock':  (2, False),  # SC_STEALTHROCK: 0 or 1
-    'stickyweb':    (3, False),  # SC_STICKYWEB: 0 or 1
-    'reflect':      (4, False),  # SC_REFLECT: turns remaining
-    'lightscreen':  (5, False),  # SC_LIGHTSCREEN: turns remaining
-    'auroraveil':   (6, False),  # SC_AURORAVEIL: turns remaining
-    'tailwind':     (7, False),  # SC_TAILWIND: turns remaining
-    'safeguard':    (8, False),  # SC_SAFEGUARD: turns remaining
-    'mist':         (9, False),  # SC_MIST: turns remaining
+    'spikes':       (0, 'layers'),     # SC_SPIKES: layer count 0-3
+    'toxicspikes':  (1, 'layers'),     # SC_TOXICSPIKES: layer count 0-2
+    'stealthrock':  (2, 'presence'),   # SC_STEALTHROCK: 0 or 1
+    'stickyweb':    (3, 'presence'),   # SC_STICKYWEB: 0 or 1
+    'reflect':      (4, 'duration'),   # SC_REFLECT: turns remaining
+    'lightscreen':  (5, 'duration'),   # SC_LIGHTSCREEN: turns remaining
+    'auroraveil':   (6, 'duration'),   # SC_AURORAVEIL: turns remaining
+    'tailwind':     (7, 'duration'),   # SC_TAILWIND: turns remaining
+    'safeguard':    (8, 'duration'),   # SC_SAFEGUARD: turns remaining
+    'mist':         (9, 'duration'),   # SC_MIST: turns remaining
 }
 
 
@@ -201,11 +203,13 @@ def sync_state_from_ps(state, ps_state, ps_to_jax_maps, item_lookup=None):
             for sc_name, sc_data in ps_sc.items():
                 sc_key = normalize_id(sc_name)
                 if sc_key in sc_name_map:
-                    sc_idx, is_layer = sc_name_map[sc_key]
+                    sc_idx, val_src = sc_name_map[sc_key]
                     if isinstance(sc_data, dict):
-                        if is_layer:
+                        if val_src == 'layers':
                             new_side_conds[side_idx, sc_idx] = sc_data.get('layers', 1)
-                        else:
+                        elif val_src == 'presence':
+                            new_side_conds[side_idx, sc_idx] = 1
+                        else:  # 'duration'
                             new_side_conds[side_idx, sc_idx] = sc_data.get('duration', 1)
                             if new_side_conds[side_idx, sc_idx] == 0:
                                 new_side_conds[side_idx, sc_idx] = 1

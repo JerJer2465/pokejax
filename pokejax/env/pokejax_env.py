@@ -35,6 +35,9 @@ Rollout fusion with lax.scan:
 from dataclasses import dataclass
 from typing import Tuple
 
+import os
+from pathlib import Path
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -83,13 +86,18 @@ class PokeJAXEnv:
         self.n_actions   = N_ACTIONS
         self.params      = EnvParams(gen=gen)
 
-        # Load team pool
+        # Load team pool (auto-detect if not specified)
         if team_pool is not None:
             self.team_pool = team_pool
         elif team_pool_path is not None:
             self.team_pool = load_team_pool(team_pool_path)
         else:
-            self.team_pool = None
+            # Auto-detect: look for default team pool
+            default_path = str(Path(__file__).resolve().parent.parent.parent / 'data' / 'team_pool.npz')
+            if os.path.exists(default_path):
+                self.team_pool = load_team_pool(default_path)
+            else:
+                self.team_pool = None
 
         # Pre-compile JIT/vmap versions.
         def _step_pure(env_state, actions, key):
@@ -266,6 +274,57 @@ class PokeJAXEnv:
         dones   = jnp.broadcast_to(new_state.finished, (2,))
 
         return new_env_state, obs, rewards, dones, {}
+
+    def step_lean(
+        self,
+        env_state: EnvState,
+        actions: jnp.ndarray,   # int32[2]
+        key: jnp.ndarray,
+    ) -> Tuple[EnvState, jnp.ndarray, jnp.ndarray]:
+        """
+        Lean env step: execute turn + compute rewards, but skip obs building.
+
+        Use this in rollout loops where the caller builds obs separately.
+        Saves 2× build_observation calls per step (~50% of env step cost).
+
+        Returns: (new_env_state, rewards[2], dones[2])
+        """
+        state, reveal = env_state.battle, env_state.reveal
+        new_state, new_reveal = execute_turn(state, reveal, actions, self.tables, self.cfg)
+
+        new_state = self._handle_forced_switch(new_state, 0)
+        new_state = self._handle_forced_switch(new_state, 1)
+
+        new_env_state = EnvState(battle=new_state, reveal=new_reveal)
+
+        # Reward computation (same as step())
+        def hp_fraction(s: BattleState, side: int) -> jnp.ndarray:
+            total_hp = s.sides_team_hp[side].sum().astype(jnp.float32)
+            total_max = s.sides_team_max_hp[side].sum().astype(jnp.float32)
+            return jnp.where(total_max > 0, total_hp / total_max, jnp.float32(0.0))
+
+        p0_hp = hp_fraction(new_state, 0)
+        p1_hp = hp_fraction(new_state, 1)
+
+        win_reward = jnp.where(
+            new_state.finished,
+            jnp.where(new_state.winner == jnp.int8(0), jnp.float32(1.0),
+            jnp.where(new_state.winner == jnp.int8(1), jnp.float32(-1.0),
+                       jnp.float32(0.0))),
+            jnp.float32(0.0)
+        )
+
+        old_p0_hp = hp_fraction(state, 0)
+        old_p1_hp = hp_fraction(state, 1)
+        delta_p0 = (p0_hp - old_p0_hp) - (p1_hp - old_p1_hp)
+
+        r0 = win_reward + delta_p0 * 0.1
+        r1 = -win_reward - delta_p0 * 0.1
+
+        rewards = jnp.array([r0, r1])
+        dones   = jnp.broadcast_to(new_state.finished, (2,))
+
+        return new_env_state, rewards, dones
 
     def _handle_forced_switch(self, state: BattleState, side: int) -> BattleState:
         """

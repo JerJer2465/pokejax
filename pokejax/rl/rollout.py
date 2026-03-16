@@ -1,24 +1,29 @@
 """
 Vectorized rollout: vmap(env) × lax.scan(steps) = full XLA fusion.
 
+PERFORMANCE OPTIMIZATIONS (vs original):
+  1. Batched model forward: both players' obs are stacked into a single
+     batch-2 model call (for symmetric self-play), halving transformer cost.
+  2. Lean env step: uses env.step_no_obs() to skip redundant observation
+     building inside env.step() (obs are already built by the rollout).
+  3. Auto-reset: finished environments are immediately reset so every
+     scan step produces useful training data.
+
 The key structure:
     vmap over N_ENVS environments (parallel battles)
     lax.scan over N_STEPS per rollout
     → N_STEPS × N_ENVS transitions per PPO batch, all on-device
 
-Both players share the same model (self-play) and act independently
-from their respective perspectives (obs masked by RevealState).
-
 Usage:
     from pokejax.rl.rollout import collect_rollout, RolloutConfig
 
     cfg = RolloutConfig()
-    carry, batch = collect_rollout(model, params, env, tables, cfg, key)
+    carry, batch, info = collect_rollout(model, params, env, tables, cfg, key)
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -36,9 +41,9 @@ from pokejax.rl.ppo import RolloutBatch, compute_gae
 class RolloutConfig:
     n_envs:     int   = 512
     n_steps:    int   = 128
-    gamma:      float = 0.99
+    gamma:      float = 0.999   # match PPOConfig default
     gae_lambda: float = 0.95
-    player:     int   = 0    # which player's perspective to collect for PPO
+    player:     int   = 0       # which player's perspective to collect for PPO
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +77,39 @@ def _sample_action(
     return action, log_prob, values
 
 
+def _sample_action_batched(
+    model,
+    params: dict,
+    obs_p0: dict,
+    obs_p1: dict,
+    key_p0: jnp.ndarray,
+    key_p1: jnp.ndarray,
+) -> tuple:
+    """Sample actions for BOTH players in a single batch-2 model forward pass.
+
+    Returns (act_p0, lp_p0, val_p0, act_p1, lp_p1, val_p1).
+    """
+    # Stack both players' observations into batch dim
+    int_ids_2 = jnp.stack([obs_p0["int_ids"], obs_p1["int_ids"]])        # (2, 15, 8)
+    float_feats_2 = jnp.stack([obs_p0["float_feats"], obs_p1["float_feats"]])  # (2, 15, 394)
+    legal_mask_2 = jnp.stack([obs_p0["legal_mask"], obs_p1["legal_mask"]])      # (2, 10)
+
+    # Single forward pass for both players
+    log_probs_2, _, values_2 = model.apply(params, int_ids_2, float_feats_2, legal_mask_2)
+    # log_probs_2: (2, 10), values_2: (2,)
+
+    # Sample actions
+    act_p0 = jax.random.categorical(key_p0, log_probs_2[0])
+    lp_p0 = log_probs_2[0, act_p0]
+    val_p0 = values_2[0]
+
+    act_p1 = jax.random.categorical(key_p1, log_probs_2[1])
+    lp_p1 = log_probs_2[1, act_p1]
+    val_p1 = values_2[1]
+
+    return act_p0, lp_p0, val_p0, act_p1, lp_p1, val_p1
+
+
 # ---------------------------------------------------------------------------
 # Rollout step (single environment, single step)
 # ---------------------------------------------------------------------------
@@ -92,25 +130,40 @@ class StepOutput(NamedTuple):
     done:       jnp.ndarray   # scalar bool
 
 
-def make_rollout_step_fn(model, params, env, tables, cfg: RolloutConfig):
-    """Return a lax.scan-compatible step function (no Python branches on arrays)."""
+def make_rollout_step_fn(model, params, opp_params, env, tables, cfg: RolloutConfig):
+    """Return a lax.scan-compatible step function.
+
+    params:     training agent's params (player cfg.player)
+    opp_params: opponent's params (player 1-cfg.player). If same pytree as
+                params, this is symmetric self-play.
+    """
+    # Detect symmetric self-play (same params object) to enable batched forward
+    is_symmetric = params is opp_params
 
     def _step(carry: StepCarry, _) -> tuple[StepCarry, StepOutput]:
         env_state, key = carry
-        key, act_key_p0, act_key_p1, step_key = jax.random.split(key, 4)
+        key, act_key_p0, act_key_p1, step_key, reset_key = jax.random.split(key, 5)
 
         # Build obs for both players
         obs_p0 = _obs_from_env_state(env_state, player=0, tables=tables)
         obs_p1 = _obs_from_env_state(env_state, player=1, tables=tables)
 
-        # Sample actions for both players (self-play: shared model)
-        act_p0, lp_p0, val_p0 = _sample_action(model, params, obs_p0, act_key_p0)
-        act_p1, lp_p1, val_p1 = _sample_action(model, params, obs_p1, act_key_p1)
+        if is_symmetric:
+            # Batched forward pass: both players in one model call
+            act_p0, lp_p0, val_p0, act_p1, lp_p1, val_p1 = _sample_action_batched(
+                model, params, obs_p0, obs_p1, act_key_p0, act_key_p1,
+            )
+        else:
+            # Asymmetric: separate forward passes with different params
+            p0_params = params if cfg.player == 0 else opp_params
+            p1_params = opp_params if cfg.player == 0 else params
+            act_p0, lp_p0, val_p0 = _sample_action(model, p0_params, obs_p0, act_key_p0)
+            act_p1, lp_p1, val_p1 = _sample_action(model, p1_params, obs_p1, act_key_p1)
 
         actions = jnp.array([act_p0, act_p1], dtype=jnp.int32)
 
-        # Environment step
-        new_env_state, _obs_both, rewards, dones, _ = env.step(
+        # Environment step — use step_lean to skip redundant obs building
+        new_env_state, rewards, dones = env.step_lean(
             env_state, actions, step_key
         )
 
@@ -123,6 +176,13 @@ def make_rollout_step_fn(model, params, env, tables, cfg: RolloutConfig):
         val    = val_p0 if p == 0 else val_p1
         act    = act_p0 if p == 0 else act_p1
 
+        # Auto-reset: if episode finished, reset to new battle
+        reset_state, _ = env.reset(reset_key)
+        final_env_state = jax.tree.map(
+            lambda r, n: jnp.where(done, r, n),
+            reset_state, new_env_state,
+        )
+
         output = StepOutput(
             int_ids    = obs_p["int_ids"],
             float_feats= obs_p["float_feats"],
@@ -134,7 +194,7 @@ def make_rollout_step_fn(model, params, env, tables, cfg: RolloutConfig):
             done       = done,
         )
 
-        return StepCarry(env_state=new_env_state, key=key), output
+        return StepCarry(env_state=final_env_state, key=key), output
 
     return _step
 
@@ -150,13 +210,22 @@ def collect_rollout(
     tables,
     cfg: RolloutConfig,
     key: jnp.ndarray,
-) -> tuple[StepCarry, RolloutBatch]:
+    opp_params: Optional[dict] = None,
+) -> tuple[StepCarry, RolloutBatch, dict]:
     """
     Collect n_envs × n_steps transitions using vmap + lax.scan.
 
-    Returns (final_carry, RolloutBatch) where batch arrays have shape
-    (n_steps * n_envs, ...) ready for PPO minibatch sampling.
+    Args:
+        opp_params: If provided, opponent uses these params instead of `params`.
+                    Enables historical pool / frozen opponent self-play.
+
+    Returns (final_carry, RolloutBatch, info) where:
+        - batch arrays have shape (n_steps * n_envs, ...)
+        - info contains episode tracking: rewards, dones per step per env
     """
+    if opp_params is None:
+        opp_params = params  # symmetric self-play
+
     # Split keys for each env
     env_keys = jax.random.split(key, cfg.n_envs + 1)
     key, env_keys = env_keys[0], env_keys[1:]
@@ -165,13 +234,11 @@ def collect_rollout(
     v_reset = jax.vmap(env.reset)
     init_env_states, _ = v_reset(env_keys)
 
-    # Build per-env step function via vmap
-    step_fn = make_rollout_step_fn(model, params, env, tables, cfg)
-    v_step_fn = jax.vmap(step_fn, in_axes=(0, None))  # vmap over carry, not xs
+    # Build per-env step function
+    step_fn = make_rollout_step_fn(model, params, opp_params, env, tables, cfg)
 
     # lax.scan over steps for each env (scan inside vmap)
     def scan_env(carry: StepCarry, _) -> tuple[StepCarry, StepOutput]:
-        """Single-env scan step (used inside vmap)."""
         return step_fn(carry, None)
 
     def collect_one_env(init_carry: StepCarry) -> tuple[StepCarry, StepOutput]:
@@ -204,17 +271,15 @@ def collect_rollout(
 
     # Compute GAE for each env
     def _gae_one(rewards, values_traj, dones, boot_val):
-        # values_traj: (n_steps,), boot_val: scalar
         values_ext = jnp.append(values_traj, boot_val)  # (n_steps+1,)
         return compute_gae(rewards, values_ext, dones, cfg.gamma, cfg.gae_lambda)
 
     advantages, returns = jax.vmap(_gae_one)(
-        traj.reward,           # (n_envs, n_steps)
-        traj.value,            # (n_envs, n_steps)
+        traj.reward,
+        traj.value,
         traj.done.astype(jnp.float32),
-        boot_values,           # (n_envs,)
+        boot_values,
     )
-    # advantages, returns shape: (n_envs, n_steps)
 
     # Flatten: (n_envs, n_steps, ...) → (n_envs * n_steps, ...)
     def _flat(x):
@@ -231,28 +296,50 @@ def collect_rollout(
         dones         = _flat(traj.done),
     )
 
-    return final_carries, batch
+    # Episode stats as scalars — computed inside JIT, no extra GPU memory
+    done_f = traj.done.astype(jnp.float32)        # (n_envs, n_steps)
+    terminal_rewards = traj.reward * done_f         # reward only at episode end
+    n_episodes = done_f.sum()
+    n_wins = (terminal_rewards > 0).astype(jnp.float32).sum()
+    mean_reward = jnp.where(n_episodes > 0, terminal_rewards.sum() / n_episodes, 0.0)
+    win_rate = jnp.where(n_episodes > 0, n_wins / n_episodes, 0.5)
+
+    info = {
+        "n_episodes":  n_episodes,
+        "win_rate":    win_rate,
+        "mean_reward": mean_reward,
+    }
+
+    return final_carries, batch, info
 
 
 # ---------------------------------------------------------------------------
-# Convenience: pre-bake static args and return a jitted rollout function
+# Convenience: pre-bake static args and return jitted rollout functions
 # ---------------------------------------------------------------------------
 
 def make_jit_rollout(model, env, tables, cfg: RolloutConfig):
     """
     Return a jax.jit-compiled rollout function with signature:
-        jit_rollout(params, key) -> (StepCarry, RolloutBatch)
+        jit_rollout(params, key) -> (StepCarry, RolloutBatch, info)
 
-    model, env, tables, cfg are captured as static closure variables so JAX
-    traces through them at compile time.  Only params (a pytree) and key
-    vary at runtime — no retrace on param updates.
-
-    Usage:
-        jit_rollout = make_jit_rollout(model, env, env.tables, cfg)
-        carry, batch = jit_rollout(params, key)
+    Symmetric self-play only (both players use same params).
     """
     @jax.jit
     def _jit_rollout(params: dict, key: jnp.ndarray):
         return collect_rollout(model, params, env, tables, cfg, key)
+
+    return _jit_rollout
+
+
+def make_jit_rollout_asymmetric(model, env, tables, cfg: RolloutConfig):
+    """
+    Return a jax.jit-compiled rollout function with signature:
+        jit_rollout(params, opp_params, key) -> (StepCarry, RolloutBatch, info)
+
+    Asymmetric self-play: training agent uses `params`, opponent uses `opp_params`.
+    """
+    @jax.jit
+    def _jit_rollout(params: dict, opp_params: dict, key: jnp.ndarray):
+        return collect_rollout(model, params, env, tables, cfg, key, opp_params=opp_params)
 
     return _jit_rollout

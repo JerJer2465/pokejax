@@ -4,8 +4,8 @@ Behavioral Cloning (BC) for PokeJAX.
 Collects (obs, expert_action) pairs from heuristic vs random battles,
 then trains the PokeTransformer via supervised cross-entropy loss.
 
-This module runs on CPU/GPU but does NOT use jax.jit for the data collection
-loop (the heuristic is Python-level). The training loop IS jit-compiled.
+Data collection uses JIT-compiled heuristic + random opponent for GPU speed.
+The training loop is also JIT-compiled.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import optax
 from pokejax.rl.obs_builder import build_obs
 from pokejax.rl.model import PokeTransformer
 from pokejax.env.pokejax_env import PokeJAXEnv, EnvState
-from pokejax.env.heuristic import smart_heuristic_action, random_action, _state_to_numpy
+from pokejax.rl.heuristic import heuristic_action, random_action
 from pokejax.data.tables import Tables
 
 
@@ -64,13 +64,12 @@ def collect_bc_data(
     """
     Collect BC training data by running heuristic (teacher) vs random (opponent).
 
+    Uses JIT-compiled heuristic and random opponent for GPU acceleration.
     teacher_side: which side the heuristic plays (0 or 1).
-    The opponent plays random legal moves.
 
     Returns BCBatch with n_transitions samples.
     """
     tables = env.tables
-    rng = np.random.RandomState(seed)
     key = jax.random.PRNGKey(seed)
 
     all_int_ids = []
@@ -82,7 +81,7 @@ def collect_bc_data(
     games = 0
     opp_side = 1 - teacher_side
 
-    # Pre-JIT the step and obs functions for speed
+    # Pre-JIT all functions for GPU speed
     @jax.jit
     def jit_step(env_state, actions, step_key):
         return env.step(env_state, actions, step_key)
@@ -91,17 +90,30 @@ def collect_bc_data(
     def jit_obs(battle, reveal):
         return build_obs(battle, reveal, teacher_side, tables)
 
+    @jax.jit
+    def jit_heuristic(battle, rng_key):
+        return heuristic_action(battle, teacher_side, tables, rng_key)
+
+    @jax.jit
+    def jit_random(battle, rng_key):
+        return random_action(battle, opp_side, rng_key)
+
     # Warm up JIT with a dummy run
     if verbose:
-        print("  JIT compiling step + obs (first time only)...")
+        print("  JIT compiling step + obs + heuristic (first time only)...")
     key, warmup_key = jax.random.split(key)
     warmup_state, _ = env.reset(warmup_key)
     warmup_obs = jit_obs(warmup_state.battle, warmup_state.reveal)
+    key, hk = jax.random.split(key)
+    warmup_teacher = jit_heuristic(warmup_state.battle, hk)
+    key, rk = jax.random.split(key)
+    warmup_random = jit_random(warmup_state.battle, rk)
     warmup_actions = jnp.array([0, 0], dtype=jnp.int32)
     key, warmup_step_key = jax.random.split(key)
     _ = jit_step(warmup_state, warmup_actions, warmup_step_key)
     # Force compilation to complete
     jax.block_until_ready(warmup_obs["int_ids"])
+    jax.block_until_ready(warmup_teacher)
     if verbose:
         print("  JIT compiled. Collecting data...")
 
@@ -120,20 +132,19 @@ def collect_bc_data(
             # Build observation for teacher (JIT-compiled)
             obs = jit_obs(state, reveal)
 
-            # Bulk convert state to numpy once per turn
-            np_state = _state_to_numpy(state)
+            # Teacher picks action (JIT heuristic on GPU)
+            key, heur_key = jax.random.split(key)
+            teacher_action = jit_heuristic(state, heur_key)
 
-            # Teacher picks action (CPU heuristic, uses cached numpy)
-            teacher_action = smart_heuristic_action(state, teacher_side, tables, _np_cache=np_state)
-
-            # Random opponent picks action
-            opp_action = random_action(state, opp_side)
+            # Random opponent picks action (JIT on GPU)
+            key, rand_key = jax.random.split(key)
+            opp_action = jit_random(state, rand_key)
 
             # Record (obs, action)
             all_int_ids.append(np.array(obs["int_ids"]))
             all_float_feats.append(np.array(obs["float_feats"]))
             all_legal_mask.append(np.array(obs["legal_mask"]))
-            all_actions.append(teacher_action)
+            all_actions.append(int(teacher_action))
             collected += 1
 
             # Step environment (JIT-compiled)
@@ -312,6 +323,10 @@ def eval_vs_random(
     def jit_obs(battle, reveal):
         return build_obs(battle, reveal, 0, tables)
 
+    @jax.jit
+    def jit_random(battle, rng_key):
+        return random_action(battle, 1, rng_key)
+
     for g in range(n_games):
         key, reset_key = jax.random.split(key)
         env_state, _ = env.reset(reset_key)
@@ -324,8 +339,9 @@ def eval_vs_random(
             obs = jit_obs(state, reveal)
             model_action = int(get_action(params, obs["int_ids"], obs["float_feats"], obs["legal_mask"]))
 
-            # Random picks for side 1
-            opp_action = random_action(state, 1)
+            # Random picks for side 1 (JIT)
+            key, rand_key = jax.random.split(key)
+            opp_action = int(jit_random(state, rand_key))
 
             actions = jnp.array([model_action, opp_action], dtype=jnp.int32)
             key, step_key = jax.random.split(key)
@@ -379,6 +395,10 @@ def eval_vs_heuristic(
     def jit_obs(battle, reveal):
         return build_obs(battle, reveal, 0, tables)
 
+    @jax.jit
+    def jit_heuristic(battle, rng_key):
+        return heuristic_action(battle, 1, tables, rng_key)
+
     for g in range(n_games):
         key, reset_key = jax.random.split(key)
         env_state, _ = env.reset(reset_key)
@@ -391,8 +411,9 @@ def eval_vs_heuristic(
             obs = jit_obs(state, reveal)
             model_action = int(get_action(params, obs["int_ids"], obs["float_feats"], obs["legal_mask"]))
 
-            # Heuristic picks for side 1
-            opp_action = smart_heuristic_action(state, 1, tables)
+            # Heuristic picks for side 1 (JIT)
+            key, heur_key = jax.random.split(key)
+            opp_action = int(jit_heuristic(state, heur_key))
 
             actions = jnp.array([model_action, opp_action], dtype=jnp.int32)
             key, step_key = jax.random.split(key)

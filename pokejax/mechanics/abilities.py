@@ -34,10 +34,19 @@ from pokejax.mechanics import events as ev
 # ---------------------------------------------------------------------------
 # Module-level ability ID constants (set by populate_ability_tables)
 # ---------------------------------------------------------------------------
-GUTS_ID         = -1
-ADAPTABILITY_ID = -1
-WONDER_GUARD_ID = -1
-MOLD_BREAKER_ID = -1
+GUTS_ID           = -1
+ADAPTABILITY_ID   = -1
+WONDER_GUARD_ID   = -1
+MOLD_BREAKER_ID   = -1
+LEVITATE_ID       = -1
+NO_GUARD_ID       = -1
+COMPOUND_EYES_ID  = -1
+HUSTLE_ID         = -1
+SAND_VEIL_ID      = -1
+SNOW_CLOAK_ID     = -1
+ARENA_TRAP_ID     = -1
+SHADOW_TAG_ID     = -1
+MAGNET_PULL_ID    = -1
 
 
 # ---------------------------------------------------------------------------
@@ -601,14 +610,29 @@ def populate_ability_tables(ability_name_to_id: dict, tables=None) -> None:
         tables: optional Tables namedtuple (stored as ev._TABLES_REF for move/type data)
     """
     global GUTS_ID, ADAPTABILITY_ID, WONDER_GUARD_ID, MOLD_BREAKER_ID
+    global LEVITATE_ID, NO_GUARD_ID, COMPOUND_EYES_ID, HUSTLE_ID
+    global SAND_VEIL_ID, SNOW_CLOAK_ID
+    global ARENA_TRAP_ID, SHADOW_TAG_ID, MAGNET_PULL_ID
 
     if tables is not None:
         ev._TABLES_REF = tables
 
-    GUTS_ID         = ability_name_to_id.get("Guts", -1)
-    ADAPTABILITY_ID = ability_name_to_id.get("Adaptability", -1)
-    WONDER_GUARD_ID = ability_name_to_id.get("Wonder Guard", -1)
-    MOLD_BREAKER_ID = ability_name_to_id.get("Mold Breaker", -1)
+    GUTS_ID           = ability_name_to_id.get("Guts", -1)
+    ADAPTABILITY_ID   = ability_name_to_id.get("Adaptability", -1)
+    WONDER_GUARD_ID   = ability_name_to_id.get("Wonder Guard", -1)
+    MOLD_BREAKER_ID   = ability_name_to_id.get("Mold Breaker", -1)
+    LEVITATE_ID       = ability_name_to_id.get("Levitate", -1)
+    NO_GUARD_ID       = ability_name_to_id.get("No Guard", -1)
+    COMPOUND_EYES_ID  = ability_name_to_id.get("Compound Eyes", -1)
+    # Showdown uses "Compoundeyes" in some contexts
+    if COMPOUND_EYES_ID < 0:
+        COMPOUND_EYES_ID = ability_name_to_id.get("Compoundeyes", -1)
+    HUSTLE_ID         = ability_name_to_id.get("Hustle", -1)
+    SAND_VEIL_ID      = ability_name_to_id.get("Sand Veil", -1)
+    SNOW_CLOAK_ID     = ability_name_to_id.get("Snow Cloak", -1)
+    ARENA_TRAP_ID     = ability_name_to_id.get("Arena Trap", -1)
+    SHADOW_TAG_ID     = ability_name_to_id.get("Shadow Tag", -1)
+    MAGNET_PULL_ID    = ability_name_to_id.get("Magnet Pull", -1)
 
     # --- Install state-mutating handlers into the small handler lists ---
     # SwitchIn

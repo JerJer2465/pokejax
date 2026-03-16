@@ -25,15 +25,16 @@ import optax
 
 @dataclass
 class PPOConfig:
-    # PPO
-    lr:              float = 3e-4
+    # PPO — tuned for Pokemon battles (medium-length episodes, complex action space)
+    # References: ps-ppo (Nebraskinator), Karten et al. 2025, 37 PPO details
+    lr:              float = 1e-4    # conservative for 5.67M param transformer
     clip_eps:        float = 0.2
-    gamma:           float = 0.99
+    gamma:           float = 0.999   # high discount: early moves matter for win/loss
     gae_lambda:      float = 0.95
     vf_coef:         float = 0.5
-    ent_coef:        float = 0.01
+    ent_coef:        float = 0.02    # higher entropy for exploration in complex action space
     max_grad_norm:   float = 0.5
-    n_epochs:        int   = 4
+    n_epochs:        int   = 3       # 3 epochs (ps-ppo); slightly less aggressive
     minibatch_size:  int   = 4096
 
     # C51
@@ -206,13 +207,19 @@ def ppo_loss(
         - cfg.ent_coef * entropy
     )
 
+    # --- Diagnostics ---
+    approx_kl = ((ratio - 1.0) - jnp.log(ratio)).mean()
+    clip_fraction = (jnp.abs(ratio - 1.0) > cfg.clip_eps).astype(jnp.float32).mean()
+
     metrics = {
-        "loss/total":   total_loss,
-        "loss/policy":  policy_loss,
-        "loss/value":   value_loss,
-        "loss/entropy": entropy,
-        "ratio/mean":   ratio.mean(),
-        "ratio/max":    ratio.max(),
+        "loss/total":       total_loss,
+        "loss/policy":      policy_loss,
+        "loss/value":       value_loss,
+        "loss/entropy":     entropy,
+        "ratio/mean":       ratio.mean(),
+        "ratio/max":        ratio.max(),
+        "diagnostics/approx_kl":     approx_kl,
+        "diagnostics/clip_fraction": clip_fraction,
     }
     return total_loss, metrics
 
