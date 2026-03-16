@@ -21,12 +21,14 @@ Usage:
 
 import argparse
 import asyncio
+import random
 import sys
 
 sys.stdout = open(sys.stdout.fileno(), 'w', buffering=1, closefd=False)
 
 
 async def main():
+    _tag = random.randint(1000, 9999)
     parser = argparse.ArgumentParser(description="Play pokejax model on Pokemon Showdown")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/bc_final.pkl")
     parser.add_argument("--gen", type=int, default=4)
@@ -62,7 +64,7 @@ async def main():
         gen=args.gen,
         temperature=args.temperature,
         verbose=args.verbose,
-        account_configuration=AccountConfiguration("PokejaxBot", None),
+        account_configuration=AccountConfiguration(f"PokejaxBot{_tag}", None),
         server_configuration=LocalhostServerConfiguration,
         battle_format=args.format,
     )
@@ -70,7 +72,7 @@ async def main():
     # Create opponent
     if args.vs == "random":
         opponent = RandomPlayer(
-            account_configuration=AccountConfiguration("RandomBot", None),
+            account_configuration=AccountConfiguration(f"RandomBot{_tag}", None),
             server_configuration=LocalhostServerConfiguration,
             battle_format=args.format,
         )
@@ -80,14 +82,14 @@ async def main():
             print("MaxBasePowerPlayer not available in this poke-env version")
             return
         opponent = MaxBasePowerPlayer(
-            account_configuration=AccountConfiguration("MaxPowerBot", None),
+            account_configuration=AccountConfiguration(f"MaxPowerBot{_tag}", None),
             server_configuration=LocalhostServerConfiguration,
             battle_format=args.format,
         )
         opp_name = "MaxBasePowerPlayer"
     else:
         opponent = SimpleHeuristicsPlayer(
-            account_configuration=AccountConfiguration("HeuristicBot", None),
+            account_configuration=AccountConfiguration(f"HeuristicBot{_tag}", None),
             server_configuration=LocalhostServerConfiguration,
             battle_format=args.format,
         )
