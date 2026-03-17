@@ -50,7 +50,12 @@ from pathlib import Path
 
 sys.stdout = open(sys.stdout.fileno(), "w", buffering=1, closefd=False)
 
-# Clear proxy env vars
+# Force CPU backend on Windows (CUDA only available in WSL)
+if sys.platform == "win32":
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
+# Clear proxy env vars so websockets connects directly
+# (Clash TUN + DIRECT rules handle routing at the network level)
 for k in list(os.environ):
     if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
         del os.environ[k]
@@ -125,7 +130,7 @@ async def main():
     log.info("MCTS config: sims=%d, c_puct=%.2f, opp_temp=%.2f, "
              "depth=%d, batch=%d, batched=%s",
              args.simulations, args.c_puct, args.opp_temperature,
-             args.max_depth, args.batch_size, not args.no_batched)
+             args.max_depth, args.batch_size, args.batched)
 
     from pokejax.rl.model import PokeTransformer
     from pokejax.data.tables import load_tables
@@ -158,35 +163,22 @@ async def main():
     log.info("MCTS kernels compiled in %.1fs", time.time() - t_compile)
 
     # ── Connect to PS ──
-    # Monkey-patch websockets to disable proxy detection if needed
-    try:
-        import websockets
-        import websockets.asyncio.client as _wsc
-        _orig_connect = _wsc.connect
-
-        class _no_proxy_connect(_orig_connect):
-            def __init__(self, *a, **kw):
-                kw.setdefault("proxy", None)
-                super().__init__(*a, **kw)
-
-        _wsc.connect = _no_proxy_connect
-        websockets.connect = _no_proxy_connect
-
-        import poke_env.ps_client.ps_client as _ps_mod
-        _ps_mod.ws.connect = _no_proxy_connect
-    except Exception as e:
-        log.warning("Could not patch websockets proxy: %s", e)
-
     from poke_env import ShowdownServerConfiguration, AccountConfiguration
 
     # Determine server config
+    PS_AUTH_URL = "https://play.pokemonshowdown.com/action.php?"
+
     if args.local_proxy:
         from poke_env import ServerConfiguration
-        server_config = ServerConfiguration("ws://localhost:8088/showdown/websocket")
-        log.info("Connecting via local proxy: ws://localhost:8088")
+        server_config = ServerConfiguration(
+            "localhost:8088", PS_AUTH_URL,
+        )
+        log.info("Connecting via local proxy: localhost:8088")
     elif args.server_url:
         from poke_env import ServerConfiguration
-        server_config = ServerConfiguration(args.server_url)
+        server_config = ServerConfiguration(
+            args.server_url, PS_AUTH_URL,
+        )
         log.info("Connecting to: %s", args.server_url)
     else:
         server_config = ShowdownServerConfiguration
