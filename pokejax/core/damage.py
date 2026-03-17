@@ -172,11 +172,12 @@ def apply_weather_modifier(damage: jnp.ndarray, move_type: jnp.ndarray,
 
 
 def apply_crit_modifier(damage: jnp.ndarray, is_crit: jnp.ndarray,
-                        crit_multiplier: float = 2.0) -> jnp.ndarray:
+                        crit_multiplier=2.0) -> jnp.ndarray:
     """Apply crit damage bonus.  Pass cfg.crit_damage_multiplier for gen accuracy.
-    Gen 4-5: 2.0×  |  Gen 6+: 1.5× (Showdown getDamage / modifyDamage chain).
+    Gen 4-5: 2.0×  |  Gen 6+: 1.5× | Sniper: 3.0×
+    Accepts float or jnp scalar.
     """
-    crit_mult = jnp.float32(crit_multiplier)
+    crit_mult = jnp.asarray(crit_multiplier, dtype=jnp.float32)
     scaled = jnp.floor(damage.astype(jnp.float32) * crit_mult).astype(jnp.int32)
     return jnp.where(is_crit, scaled, damage)
 
@@ -272,9 +273,6 @@ def get_crit_stage(move_crit_ratio: jnp.ndarray,
                    attacker_focus_energy: jnp.ndarray,
                    attacker_ability_id: jnp.ndarray,
                    attacker_item_id: jnp.ndarray,
-                   # Ability/item IDs that boost crit
-                   ABILITY_SUPER_LUCK: int = 0,   # placeholder
-                   ITEM_SCOPE_LENS: int = 0,       # placeholder
                    ) -> jnp.ndarray:
     """
     Compute net crit stage (0-4).
@@ -285,11 +283,28 @@ def get_crit_stage(move_crit_ratio: jnp.ndarray,
     Stage 3: +3 (rare)                                (1/3 in Gen 4)
     Stage 4+: always crit
     """
+    from pokejax.mechanics.abilities import SUPER_LUCK_ID
+    from pokejax.mechanics.items import SCOPE_LENS_ID
+
     stage = move_crit_ratio.astype(jnp.int32)
     # Focus Energy: +2 in Gen 3+
     stage = jnp.where(attacker_focus_energy, stage + 2, stage)
-    # Scope Lens / Sniper ability etc: +1 (we'll fill IDs from tables later)
-    # stage = jnp.where(attacker_item_id == ITEM_SCOPE_LENS, stage + 1, stage)
+
+    # Super Luck: +1 crit stage
+    ab_id = attacker_ability_id.astype(jnp.int32)
+    has_super_luck = (SUPER_LUCK_ID >= 0) & (ab_id == jnp.int32(SUPER_LUCK_ID))
+    stage = jnp.where(has_super_luck, stage + 1, stage)
+
+    # Scope Lens: +1 crit stage
+    item_id = attacker_item_id.astype(jnp.int32)
+    has_scope_lens = (SCOPE_LENS_ID >= 0) & (item_id == jnp.int32(SCOPE_LENS_ID))
+    stage = jnp.where(has_scope_lens, stage + 1, stage)
+
+    # Razor Claw: +1 crit stage (separate item)
+    from pokejax.mechanics.items import RAZOR_CLAW_ID
+    has_razor_claw = (RAZOR_CLAW_ID >= 0) & (item_id == jnp.int32(RAZOR_CLAW_ID))
+    stage = jnp.where(has_razor_claw, stage + 1, stage)
+
     return jnp.clip(stage, 0, 4).astype(jnp.int32)
 
 
@@ -338,6 +353,11 @@ def compute_damage(
         is_crit:      bool
         effectiveness: float32 type multiplier
     """
+    from pokejax.mechanics.abilities import (
+        BATTLE_ARMOR_ID, SHELL_ARMOR_ID, SNIPER_ID,
+        THICK_FAT_ID, FILTER_ID, SOLID_ROCK_ID, UNAWARE_ID,
+    )
+
     move_data = tables.moves[move_id.astype(jnp.int32)]
 
     # Static move attributes
@@ -392,7 +412,28 @@ def compute_damage(
     def_boost = jnp.where(is_physical, def_boosts[BOOST_DEF], def_boosts[BOOST_SPD])
     def_mult  = tables.get_boost_multiplier(def_boost)
 
+    # Unaware (defender): ignore attacker's positive stat boosts
+    def_ability_id = state.sides_team_ability_id[def_side, def_idx].astype(jnp.int32)
+    has_unaware_def = (UNAWARE_ID >= 0) & (def_ability_id == jnp.int32(UNAWARE_ID))
+    # If defender has Unaware, use 1.0 for attacker's boosts (ignore positive only)
+    atk_mult = jnp.where(has_unaware_def & (atk_boost > jnp.int8(0)),
+                          jnp.float32(1.0), atk_mult)
+
+    # Unaware (attacker): ignore defender's positive defense boosts
+    atk_ability_id = state.sides_team_ability_id[atk_side, atk_idx].astype(jnp.int32)
+    has_unaware_atk = (UNAWARE_ID >= 0) & (atk_ability_id == jnp.int32(UNAWARE_ID))
+    def_mult = jnp.where(has_unaware_atk & (def_boost > jnp.int8(0)),
+                          jnp.float32(1.0), def_mult)
+
     attack  = jnp.floor(raw_atk * atk_mult * atk_relay).astype(jnp.int32)
+
+    # Thick Fat (defender): halve attacker's effective ATK/SPA for Fire/Ice moves
+    from pokejax.types import TYPE_ICE
+    has_thick_fat = (THICK_FAT_ID >= 0) & (def_ability_id == jnp.int32(THICK_FAT_ID))
+    is_fire_or_ice = (move_type == jnp.int32(TYPE_FIRE)) | (move_type == jnp.int32(TYPE_ICE))
+    attack = jnp.where(has_thick_fat & is_fire_or_ice,
+                        attack // 2, attack)
+
     defense = jnp.maximum(jnp.int32(1),
                           jnp.floor(raw_def * def_mult * def_relay).astype(jnp.int32))
 
@@ -404,7 +445,25 @@ def compute_damage(
     # Crit roll
     focus_energy = (state.sides_team_volatiles[atk_side, atk_idx]
                     & jnp.uint32(1 << 21)) != jnp.uint32(0)  # VOL_FOCUSENERGY = 21
-    key, is_crit = roll_crit(key, crit_ratio + jnp.int32(0), focus_energy)
+    crit_stage = get_crit_stage(
+        crit_ratio, focus_energy,
+        state.sides_team_ability_id[atk_side, atk_idx],
+        state.sides_team_item_id[atk_side, atk_idx],
+    )
+    key, is_crit = roll_crit(key, crit_stage, focus_energy)
+
+    # Battle Armor / Shell Armor: defender prevents crits
+    has_battle_armor = (
+        ((BATTLE_ARMOR_ID >= 0) & (def_ability_id == jnp.int32(BATTLE_ARMOR_ID))) |
+        ((SHELL_ARMOR_ID >= 0) & (def_ability_id == jnp.int32(SHELL_ARMOR_ID)))
+    )
+    is_crit = is_crit & ~has_battle_armor
+
+    # Sniper: 3× crit multiplier in Gen 4 (instead of 2×)
+    has_sniper = (SNIPER_ID >= 0) & (atk_ability_id == jnp.int32(SNIPER_ID))
+    effective_crit_mult = jnp.where(
+        has_sniper & is_crit, jnp.float32(3.0), jnp.float32(crit_multiplier)
+    )
 
     # Crits: use max(original, boosted) for attack, min(original, boosted) for defense
     raw_atk_int = jnp.floor(raw_atk).astype(jnp.int32)
@@ -423,8 +482,8 @@ def compute_damage(
     # 2. Weather
     dmg = apply_weather_modifier(dmg, jnp.int32(move_type), state.field.weather)
 
-    # 3. Crit (gen-specific multiplier: 2.0 in Gen 4-5, 1.5 in Gen 6+)
-    dmg = apply_crit_modifier(dmg, is_crit, crit_multiplier=crit_multiplier)
+    # 3. Crit (gen-specific multiplier: 2.0 in Gen 4-5, 3.0 with Sniper)
+    dmg = apply_crit_modifier(dmg, is_crit, crit_multiplier=effective_crit_mult)
 
     # 4. Random roll
     key, roll_key = rng_utils.split(key)
@@ -442,6 +501,16 @@ def compute_damage(
         def_types[1].astype(jnp.int32),
     )
     dmg = apply_type_modifier(dmg, effectiveness)
+
+    # 6b. Filter / Solid Rock: 0.75× damage on super-effective hits
+    has_filter = (
+        ((FILTER_ID >= 0) & (def_ability_id == jnp.int32(FILTER_ID))) |
+        ((SOLID_ROCK_ID >= 0) & (def_ability_id == jnp.int32(SOLID_ROCK_ID)))
+    )
+    is_se = effectiveness > jnp.float32(1.0)
+    dmg = jnp.where(has_filter & is_se,
+                     jnp.floor(dmg.astype(jnp.float32) * jnp.float32(0.75)).astype(jnp.int32),
+                     dmg)
 
     # 7. Burn
     dmg = apply_burn_modifier(dmg, category, atk_status, guts)

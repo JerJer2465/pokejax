@@ -19,7 +19,7 @@ import jax.numpy as jnp
 
 from pokejax.types import (
     BattleState,
-    VOL_CHARGING, CATEGORY_STATUS,
+    VOL_CHARGING, VOL_SUBSTITUTE, CATEGORY_STATUS,
     TYPE_NONE, STATUS_FRZ, STATUS_NONE,
     WEATHER_SAND, WEATHER_HAIL,
     CATEGORY_PHYSICAL,
@@ -131,7 +131,7 @@ def step5_accuracy(tables, state: BattleState,
     """
     from pokejax.mechanics.abilities import (
         NO_GUARD_ID, COMPOUND_EYES_ID, HUSTLE_ID,
-        SAND_VEIL_ID, SNOW_CLOAK_ID,
+        SAND_VEIL_ID, SNOW_CLOAK_ID, TANGLED_FEET_ID,
     )
 
     accuracy = tables.moves[move_id.astype(jnp.int32), MF_ACCURACY].astype(jnp.int32)
@@ -180,6 +180,13 @@ def step5_accuracy(tables, state: BattleState,
     snow_cloak = (SNOW_CLOAK_ID >= 0) & (def_ability == jnp.int32(SNOW_CLOAK_ID)) & (state.field.weather == WEATHER_HAIL)
     acc_mult = jnp.where(snow_cloak, acc_mult * 0.8, acc_mult)
 
+    # Tangled Feet: 0.5x accuracy when confused (defender)
+    from pokejax.types import VOL_CONFUSED
+    def_confused = (state.sides_team_volatiles[def_side, def_idx]
+                    & jnp.uint32(1 << VOL_CONFUSED)) != jnp.uint32(0)
+    tangled_feet = (TANGLED_FEET_ID >= 0) & (def_ability == jnp.int32(TANGLED_FEET_ID)) & def_confused
+    acc_mult = jnp.where(tangled_feet, acc_mult * 0.5, acc_mult)
+
     effective_acc = jnp.floor(accuracy.astype(jnp.float32) * acc_mult).astype(jnp.int32)
     effective_acc = jnp.clip(effective_acc, 1, 100)
 
@@ -214,6 +221,12 @@ def step8_move_hit_loop(tables, state: BattleState,
     # Skip all if cancelled
     key, dmg_key = rng_utils.split(key)
 
+    # ---- Substitute check ----
+    # Check if defender has a Substitute up
+    def_has_sub = (state.sides_team_volatiles[def_side, def_idx]
+                   & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
+    sub_hp = state.sides_team_volatile_data[def_side, def_idx, VOL_SUBSTITUTE].astype(jnp.int32)
+
     new_key, dmg, is_crit, eff = compute_damage(
         state, tables, atk_side, def_side, move_id, dmg_key,
         atk_relay=atk_relay, def_relay=def_relay,
@@ -225,12 +238,37 @@ def step8_move_hit_loop(tables, state: BattleState,
     dmg = jnp.where(cancelled | (effectiveness == jnp.float32(0.0)),
                      jnp.int32(0), dmg)
 
+    # ---- Substitute damage absorption ----
+    # If defender has Substitute, damage goes to the sub, not the real Pokemon.
+    # If the sub breaks, excess damage is NOT passed through (Showdown Gen 4 behavior).
+    new_sub_hp = jnp.maximum(jnp.int32(0), sub_hp - dmg)
+    sub_broke = def_has_sub & (new_sub_hp <= jnp.int32(0)) & (dmg > jnp.int32(0))
+    # Update sub HP (clear to 0 if broken)
+    new_sub_data = jnp.where(def_has_sub & ~cancelled,
+                              new_sub_hp.astype(jnp.int8),
+                              state.sides_team_volatile_data[def_side, def_idx, VOL_SUBSTITUTE])
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[
+            def_side, def_idx, VOL_SUBSTITUTE
+        ].set(new_sub_data)
+    )
+    # Clear substitute volatile if broken
+    sub_clear_mask = ~jnp.uint32(1 << VOL_SUBSTITUTE)
+    new_vols = jnp.where(sub_broke,
+                          state.sides_team_volatiles[def_side, def_idx] & sub_clear_mask,
+                          state.sides_team_volatiles[def_side, def_idx])
+    state = state._replace(
+        sides_team_volatiles=state.sides_team_volatiles.at[def_side, def_idx].set(new_vols)
+    )
+    # Zero out real damage if sub absorbed it
+    real_dmg = jnp.where(def_has_sub & ~cancelled, jnp.int32(0), dmg)
+
     # Capture pre-damage HP for Focus Sash check
     pre_def_hp  = state.sides_team_hp[def_side, def_idx].astype(jnp.int32)
     pre_def_max = state.sides_team_max_hp[def_side, def_idx].astype(jnp.int32)
 
-    # Apply damage to defender
-    state = apply_damage(state, def_side, def_idx, dmg)
+    # Apply damage to defender (0 if sub absorbed it)
+    state = apply_damage(state, def_side, def_idx, real_dmg)
 
     # Focus Sash: survive lethal hit at full HP (consume item)
     from pokejax.mechanics.items import FOCUS_SASH_ID
@@ -248,6 +286,17 @@ def step8_move_hit_loop(tables, state: BattleState,
     )
     state = state._replace(sides_team_hp=sash_hp_arr, sides_team_item_id=sash_item_arr)
 
+    # Sturdy: survive lethal hit at full HP (ability, not consumed)
+    from pokejax.mechanics.abilities import STURDY_ID
+    def_ability_st = state.sides_team_ability_id[def_side, def_idx].astype(jnp.int32)
+    has_sturdy = (STURDY_ID >= 0) & (def_ability_st == jnp.int32(STURDY_ID))
+    would_faint_now = (state.sides_team_hp[def_side, def_idx] <= jnp.int16(0))
+    sturdy_saves = has_sturdy & was_full & would_faint_now & ~cancelled
+    sturdy_hp_arr = state.sides_team_hp.at[def_side, def_idx].set(
+        jnp.where(sturdy_saves, jnp.int16(1), state.sides_team_hp[def_side, def_idx])
+    )
+    state = state._replace(sides_team_hp=sturdy_hp_arr)
+
     # Drain (e.g., Drain Punch, Giga Drain)
     drain_num = tables.moves[move_id.astype(jnp.int32), MF_DRAIN_NUM].astype(jnp.int32)
     drain_den = tables.moves[move_id.astype(jnp.int32), MF_DRAIN_DEN].astype(jnp.int32)
@@ -260,9 +309,13 @@ def step8_move_hit_loop(tables, state: BattleState,
     state = apply_heal(state, atk_side, atk_idx, drain_heal.astype(jnp.int16))
 
     # Recoil (e.g., Brave Bird, Flare Blitz)
+    # Rock Head: prevents recoil damage
+    from pokejax.mechanics.abilities import ROCK_HEAD_ID
+    atk_ability_rh = state.sides_team_ability_id[atk_side, atk_idx].astype(jnp.int32)
+    has_rock_head = (ROCK_HEAD_ID >= 0) & (atk_ability_rh == jnp.int32(ROCK_HEAD_ID))
     recoil_num = tables.moves[move_id.astype(jnp.int32), MF_RECOIL_NUM].astype(jnp.int32)
     recoil_den = tables.moves[move_id.astype(jnp.int32), MF_RECOIL_DEN].astype(jnp.int32)
-    has_recoil = (recoil_num > jnp.int32(0)) & (recoil_den > jnp.int32(0))
+    has_recoil = (recoil_num > jnp.int32(0)) & (recoil_den > jnp.int32(0)) & ~has_rock_head
     recoil_dmg = jnp.where(
         has_recoil,
         jnp.maximum(jnp.int32(1), dmg * recoil_num // recoil_den),
@@ -284,12 +337,21 @@ def step8_move_hit_loop(tables, state: BattleState,
     state = apply_heal(state, atk_side, atk_idx, heal_amt.astype(jnp.int16))
 
     # Secondary effect: status (e.g. Flamethrower 10% burn)
+    # Substitute blocks all secondary effects on the defender (Showdown behavior).
     sec_chance = tables.moves[move_id.astype(jnp.int32), MF_SEC_CHANCE].astype(jnp.int32)
     sec_status  = tables.moves[move_id.astype(jnp.int32), MF_SEC_STATUS].astype(jnp.int8)
     has_secondary = (sec_chance > jnp.int32(0)) & (sec_status > jnp.int8(0))
 
+    # Serene Grace: double secondary effect chance
+    from pokejax.mechanics.abilities import SERENE_GRACE_ID
+    atk_ability_sg = state.sides_team_ability_id[atk_side, atk_idx].astype(jnp.int32)
+    has_serene_grace = (SERENE_GRACE_ID >= 0) & (atk_ability_sg == jnp.int32(SERENE_GRACE_ID))
+    effective_sec_chance = jnp.where(has_serene_grace,
+                                      jnp.minimum(jnp.int32(100), sec_chance * 2),
+                                      sec_chance)
+
     key, sec_key = rng_utils.split(key)
-    sec_hits = has_secondary & rng_utils.rand_bool_pct(sec_key, sec_chance) & ~cancelled
+    sec_hits = has_secondary & rng_utils.rand_bool_pct(sec_key, effective_sec_chance) & ~cancelled & ~def_has_sub
 
     # Apply secondary status if it triggers and target has no status already
     cur_status = state.sides_team_status[def_side, def_idx]
@@ -298,15 +360,59 @@ def step8_move_hit_loop(tables, state: BattleState,
     new_status_arr = state.sides_team_status.at[def_side, def_idx].set(new_status)
     state = state._replace(sides_team_status=new_status_arr)
 
+    # Synchronize: reflect BRN/PSN/PAR back to attacker
+    from pokejax.mechanics.abilities import SYNCHRONIZE_ID
+    from pokejax.types import STATUS_BRN, STATUS_PSN, STATUS_TOX, STATUS_PAR
+    def_ability_sync = state.sides_team_ability_id[def_side, def_idx].astype(jnp.int32)
+    has_synchronize = (SYNCHRONIZE_ID >= 0) & (def_ability_sync == jnp.int32(SYNCHRONIZE_ID))
+    status_applied = sec_hits & no_status
+    # Synchronize only reflects BRN, PSN, PAR (not TOX, SLP, FRZ)
+    sync_status = sec_status
+    can_sync = (sync_status == jnp.int8(STATUS_BRN)) | (sync_status == jnp.int8(STATUS_PSN)) | (sync_status == jnp.int8(STATUS_PAR))
+    atk_no_status = state.sides_team_status[atk_side, atk_idx] == jnp.int8(0)
+    do_sync = has_synchronize & status_applied & can_sync & atk_no_status & ~cancelled
+    atk_new_status = jnp.where(do_sync, sync_status, state.sides_team_status[atk_side, atk_idx])
+    state = state._replace(
+        sides_team_status=state.sides_team_status.at[atk_side, atk_idx].set(atk_new_status)
+    )
+
     # Secondary effect: stat change on foe (e.g. Psychic -10% SPD, Crunch -20% DEF)
     sec_boost_stat = tables.moves[move_id.astype(jnp.int32), MF_SEC_BOOST_STAT].astype(jnp.int32)
     sec_boost_amt  = tables.moves[move_id.astype(jnp.int32), MF_SEC_BOOST_AMT].astype(jnp.int32)
     has_sec_boost  = (sec_chance > jnp.int32(0)) & (sec_boost_amt != jnp.int32(0))
 
     key, sec_b_key = rng_utils.split(key)
-    sec_b_hits = has_sec_boost & rng_utils.rand_bool_pct(sec_b_key, sec_chance) & ~cancelled
+    sec_b_hits = has_sec_boost & rng_utils.rand_bool_pct(sec_b_key, effective_sec_chance) & ~cancelled & ~def_has_sub
+
+    # Ability interactions for foe-inflicted secondary stat changes
+    from pokejax.mechanics.abilities import (
+        CLEAR_BODY_ID, WHITE_SMOKE_ID, HYPER_CUTTER_ID, KEEN_EYE_ID, SIMPLE_ID,
+    )
+    from pokejax.types import BOOST_ATK, BOOST_ACC
+    def_ability = state.sides_team_ability_id[def_side, def_idx].astype(jnp.int32)
+
+    # Simple: double the stat change
+    has_simple = (SIMPLE_ID >= 0) & (def_ability == jnp.int32(SIMPLE_ID))
+    sec_boost_amt = jnp.where(has_simple, sec_boost_amt * 2, sec_boost_amt)
 
     s_clamped = jnp.clip(sec_boost_stat, 0, 6)
+
+    # Clear Body / White Smoke: block all negative foe stat drops
+    has_clear_body = (CLEAR_BODY_ID >= 0) & (def_ability == jnp.int32(CLEAR_BODY_ID))
+    has_white_smoke = (WHITE_SMOKE_ID >= 0) & (def_ability == jnp.int32(WHITE_SMOKE_ID))
+    is_drop = sec_boost_amt < 0
+    blocked_clear = is_drop & (has_clear_body | has_white_smoke)
+
+    # Hyper Cutter: block ATK drops from foes
+    has_hyper_cutter = (HYPER_CUTTER_ID >= 0) & (def_ability == jnp.int32(HYPER_CUTTER_ID))
+    blocked_hc = is_drop & has_hyper_cutter & (s_clamped == jnp.int32(BOOST_ATK))
+
+    # Keen Eye: block accuracy drops from foes
+    has_keen_eye = (KEEN_EYE_ID >= 0) & (def_ability == jnp.int32(KEEN_EYE_ID))
+    blocked_ke = is_drop & has_keen_eye & (s_clamped == jnp.int32(BOOST_ACC))
+
+    sec_b_hits = sec_b_hits & ~(blocked_clear | blocked_hc | blocked_ke)
+
     cur_boost  = state.sides_team_boosts[def_side, def_idx, s_clamped]
     new_boost  = jnp.clip(cur_boost.astype(jnp.int32) + sec_boost_amt, -6, 6).astype(jnp.int8)
     chosen_b   = jnp.where(sec_b_hits, new_boost, cur_boost)
@@ -416,6 +522,20 @@ def execute_move_hit(tables, state: BattleState,
     effectiveness, type_cancelled = step3_type_immunity(
         tables, state, def_side, def_idx, move_id, cancelled
     )
+    # Scrappy: Normal/Fighting moves hit Ghost types (bypass immunity)
+    from pokejax.mechanics.abilities import SCRAPPY_ID
+    from pokejax.types import TYPE_NORMAL, TYPE_FIGHTING, TYPE_GHOST
+    has_scrappy = (SCRAPPY_ID >= 0) & (atk_ability_id == jnp.int32(SCRAPPY_ID))
+    is_normal_or_fighting = (move_type_i32 == jnp.int32(TYPE_NORMAL)) | (move_type_i32 == jnp.int32(TYPE_FIGHTING))
+    def_types_sc = state.sides_team_types[def_side, def_idx]
+    is_ghost_type = (def_types_sc[0] == jnp.int8(TYPE_GHOST)) | (def_types_sc[1] == jnp.int8(TYPE_GHOST))
+    scrappy_bypass = has_scrappy & is_normal_or_fighting & is_ghost_type
+    # If Scrappy bypasses, recalculate effectiveness ignoring Ghost type
+    # For Ghost/X, Normal is 0× Ghost but hits X; we force minimum 1.0 effectiveness
+    effectiveness = jnp.where(scrappy_bypass & (effectiveness == jnp.float32(0.0)),
+                               jnp.float32(1.0), effectiveness)
+    type_cancelled = jnp.where(scrappy_bypass, cancelled, type_cancelled)
+
     cancelled = jnp.where(bypass_type_immunity, cancelled, type_cancelled)
     effectiveness = jnp.where(bypass_type_immunity, jnp.float32(1.0), effectiveness)
 
@@ -429,6 +549,16 @@ def execute_move_hit(tables, state: BattleState,
     is_status_move = (move_category == jnp.int8(2))
     wg_blocks = has_wonder_guard & ~has_mold_breaker & ~is_status_move & (effectiveness <= jnp.float32(1.0))
     cancelled = cancelled | wg_blocks
+
+    # Step 4b: Substitute blocks status moves targeting the defender.
+    # In Showdown, most status moves fail against a Substitute (except sound-based).
+    def_has_sub = (state.sides_team_volatiles[def_side, def_idx]
+                   & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
+    is_status_targeting_foe = (
+        is_status_move
+        & ~bypass_type_immunity  # not self/field/side-targeting
+    )
+    cancelled = cancelled | (is_status_targeting_foe & def_has_sub)
 
     # Step 5: Accuracy
     cancelled, key = step5_accuracy(
@@ -444,10 +574,15 @@ def execute_move_hit(tables, state: BattleState,
     is_multihit = multi_max > jnp.int32(1)
 
     # Roll number of hits
+    # Skill Link: always max hits (5) on multi-hit moves
+    from pokejax.mechanics.abilities import SKILL_LINK_ID
+    has_skill_link = (SKILL_LINK_ID >= 0) & (atk_ability_id == jnp.int32(SKILL_LINK_ID))
     key, hit_key = rng_utils.split(key)
     n_hits = jnp.where(
         is_multihit,
-        rng_utils.multi_hit_roll(hit_key, 2, 5).astype(jnp.int32),
+        jnp.where(has_skill_link,
+                   jnp.int32(5),
+                   rng_utils.multi_hit_roll(hit_key, 2, 5).astype(jnp.int32)),
         jnp.int32(1)
     )
 

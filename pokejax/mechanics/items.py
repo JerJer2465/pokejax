@@ -30,6 +30,8 @@ CHOICE_BAND_ID  = -1
 CHOICE_SPECS_ID = -1
 CHOICE_SCARF_ID = -1
 FOCUS_SASH_ID   = -1
+SCOPE_LENS_ID   = -1
+RAZOR_CLAW_ID   = -1
 
 
 # ---------------------------------------------------------------------------
@@ -64,20 +66,34 @@ def _sitrus_berry_residual_state(state, key, side_i32, slot_i32):
     hp     = state.sides_team_hp[side_i32, slot_i32].astype(jnp.int32)
     max_hp = state.sides_team_max_hp[side_i32, slot_i32].astype(jnp.int32)
     low    = (hp * jnp.int32(2)) < max_hp
+    alive  = hp > jnp.int32(0)
+    triggers = low & alive
     heal   = jnp.maximum(jnp.int32(1), max_hp // 4)
     new_hp = jnp.minimum(max_hp, hp + heal).astype(jnp.int16)
     new_hp_arr = state.sides_team_hp.at[side_i32, slot_i32].set(
-        jnp.where(low, new_hp, state.sides_team_hp[side_i32, slot_i32])
+        jnp.where(triggers, new_hp, state.sides_team_hp[side_i32, slot_i32])
     )
-    return state._replace(sides_team_hp=new_hp_arr), key
+    # Consume the berry after use
+    new_item_arr = state.sides_team_item_id.at[side_i32, slot_i32].set(
+        jnp.where(triggers, jnp.int16(0), state.sides_team_item_id[side_i32, slot_i32])
+    )
+    state = state._replace(sides_team_hp=new_hp_arr, sides_team_item_id=new_item_arr)
+    return state, key
 
 
 def _lum_berry_residual_state(state, key, side_i32, slot_i32):
     status = state.sides_team_status[side_i32, slot_i32]
     has_status = status != jnp.int8(STATUS_NONE)
-    new_status = jnp.where(has_status, jnp.int8(STATUS_NONE), status)
+    alive = state.sides_team_hp[side_i32, slot_i32] > jnp.int16(0)
+    triggers = has_status & alive
+    new_status = jnp.where(triggers, jnp.int8(STATUS_NONE), status)
     new_status_arr = state.sides_team_status.at[side_i32, slot_i32].set(new_status)
-    return state._replace(sides_team_status=new_status_arr), key
+    # Consume the berry after use
+    new_item_arr = state.sides_team_item_id.at[side_i32, slot_i32].set(
+        jnp.where(triggers, jnp.int16(0), state.sides_team_item_id[side_i32, slot_i32])
+    )
+    state = state._replace(sides_team_status=new_status_arr, sides_team_item_id=new_item_arr)
+    return state, key
 
 
 def _life_orb_residual_state(state, key, side_i32, slot_i32):
@@ -86,8 +102,11 @@ def _life_orb_residual_state(state, key, side_i32, slot_i32):
     recoil = jnp.maximum(jnp.int32(1), max_hp // 10)
     new_hp = jnp.maximum(jnp.int32(0), hp - recoil).astype(jnp.int16)
     alive  = hp > jnp.int32(0)
+    # Only apply recoil if the Pokemon used a damaging move this turn
+    moved_this_turn = state.sides_team_move_this_turn[side_i32, slot_i32]
+    should_recoil = alive & moved_this_turn
     new_hp_arr = state.sides_team_hp.at[side_i32, slot_i32].set(
-        jnp.where(alive, new_hp, state.sides_team_hp[side_i32, slot_i32])
+        jnp.where(should_recoil, new_hp, state.sides_team_hp[side_i32, slot_i32])
     )
     return state._replace(sides_team_hp=new_hp_arr), key
 
@@ -208,7 +227,8 @@ def populate_item_tables(item_name_to_id: dict, tables=None) -> None:
 
     Must be called BEFORE any jax.jit compilation of run_event_* functions.
     """
-    global _TABLES, LIFE_ORB_ID, CHOICE_BAND_ID, CHOICE_SPECS_ID, CHOICE_SCARF_ID, FOCUS_SASH_ID
+    global _TABLES, LIFE_ORB_ID, CHOICE_BAND_ID, CHOICE_SPECS_ID, CHOICE_SCARF_ID
+    global FOCUS_SASH_ID, SCOPE_LENS_ID, RAZOR_CLAW_ID
 
     if tables is not None:
         _TABLES = tables
@@ -218,6 +238,11 @@ def populate_item_tables(item_name_to_id: dict, tables=None) -> None:
     CHOICE_SPECS_ID = item_name_to_id.get("Choice Specs", -1)
     CHOICE_SCARF_ID = item_name_to_id.get("Choice Scarf", -1)
     FOCUS_SASH_ID   = item_name_to_id.get("Focus Sash", -1)
+    SCOPE_LENS_ID   = item_name_to_id.get("Scope Lens", -1)
+    if SCOPE_LENS_ID < 0:
+        # Also check Razor Claw (same +1 crit stage effect)
+        SCOPE_LENS_ID = item_name_to_id.get("Razor Claw", -1)
+    RAZOR_CLAW_ID   = item_name_to_id.get("Razor Claw", -1)
 
     # --- Install state-mutating residual handlers ---
     ev._ITEM_RESIDUAL_HANDLERS[ev.EFF_LEFTOVERS]         = _leftovers_residual_state

@@ -134,14 +134,22 @@ def apply_sleep_residual(state: BattleState, side: int,
                           key: jnp.ndarray) -> tuple[BattleState, jnp.ndarray]:
     """
     Sleep: decrement sleep turn counter.  Wake up when counter reaches 0.
+    Early Bird: decrement by 2 instead of 1 (effectively halving sleep duration).
     Returns (new_state, new_key).
     """
+    from pokejax.mechanics.abilities import EARLY_BIRD_ID
+
     idx = _active_slot(state, side)
     is_asleep = state.sides_team_status[side, idx] == jnp.int8(STATUS_SLP)
 
+    # Early Bird: decrement by 2 instead of 1
+    ability_id = state.sides_team_ability_id[side, idx].astype(jnp.int32)
+    has_early_bird = (EARLY_BIRD_ID >= 0) & (ability_id == jnp.int32(EARLY_BIRD_ID))
+    decrement = jnp.where(has_early_bird, jnp.int8(2), jnp.int8(1))
+
     # Decrement sleep counter
     sleep_counter = state.sides_team_sleep_turns[side, idx]
-    new_counter = jnp.maximum(jnp.int8(0), sleep_counter - jnp.int8(1))
+    new_counter = jnp.maximum(jnp.int8(0), sleep_counter - decrement)
     woke_up = is_asleep & (new_counter == jnp.int8(0))
 
     # Clear status if woke up
@@ -295,6 +303,10 @@ def try_set_status(state: BattleState, side: int, slot: int,
     type0 = types[0].astype(jnp.int32)
     type1 = types[1].astype(jnp.int32)
 
+    # Substitute blocks status application
+    has_sub = (state.sides_team_volatiles[side, idx]
+               & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
+
     # Type immunities
     fire_type  = (type0 == TYPE_FIRE)  | (type1 == TYPE_FIRE)
     steel_type = (type0 == TYPE_STEEL) | (type1 == TYPE_STEEL)
@@ -318,7 +330,7 @@ def try_set_status(state: BattleState, side: int, slot: int,
     )
     sleep_clause_blocks = (new_status == jnp.int8(STATUS_SLP)) & any_sleeping
 
-    blocked = already_statused | type_blocked | safeguard | sleep_clause_blocks
+    blocked = already_statused | type_blocked | safeguard | sleep_clause_blocks | has_sub
 
     # Set status
     init_turns = jnp.where(new_status == jnp.int8(STATUS_TOX), jnp.int8(1), jnp.int8(0))

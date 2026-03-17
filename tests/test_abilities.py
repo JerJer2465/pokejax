@@ -457,7 +457,7 @@ class TestSwitchInState:
         state = _make_state(tables, cfg, p1_ability=_ABILITY_IDS["Drizzle"])
         state2 = run_event_switch_in(state, 0, state.sides_active_idx[0])
         assert int(state2.field.weather) == WEATHER_RAIN
-        assert int(state2.field.weather_turns) == 5
+        assert int(state2.field.weather_turns) == 127  # Gen 4: permanent weather
 
     def test_drought_sets_sun(self, tables, cfg):
         state = _make_state(tables, cfg, p1_ability=_ABILITY_IDS["Drought"])

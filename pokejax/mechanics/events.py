@@ -54,6 +54,7 @@ _TABLES_REF = None   # full Tables namedtuple
 # ModifyAtk conditions
 ABCOND_ATK_NONE     = jnp.int8(0)
 ABCOND_ATK_GUTS     = jnp.int8(1)   # if statused → ×1.5
+ABCOND_ATK_SUN      = jnp.int8(2)   # Flower Gift: if sun → ×1.5
 
 # ModifySpa conditions
 ABCOND_SPA_NONE        = jnp.int8(0)
@@ -80,6 +81,10 @@ ABCOND_SPEED_RAIN       = jnp.int8(1)   # Swift Swim: rain → ×2 Speed
 ABCOND_SPEED_SUN        = jnp.int8(2)   # Chlorophyll: sun → ×2 Speed
 ABCOND_SPEED_SAND       = jnp.int8(3)   # Sand Rush: sand → ×2 Speed (Gen 5, but some mods)
 ABCOND_SPEED_UNBURDEN   = jnp.int8(4)   # Unburden: lost item → ×2 Speed
+
+# Ability ModifyDamage conditions
+ABCOND_DMG_NONE         = jnp.int8(0)
+ABCOND_DMG_TINTED_LENS  = jnp.int8(1)   # if not-very-effective → ×2
 
 # Item ModifyDamage conditions
 ITEMCOND_DMG_NONE        = jnp.int8(0)
@@ -113,6 +118,7 @@ _ITEM_BP_MULT     = jnp.ones(_MAX_ITEMS,       dtype=jnp.float32)
 
 # ---- ModifyDamage ----
 _AB_DMG_MULT      = jnp.ones(_MAX_ABILITIES,  dtype=jnp.float32)
+_AB_DMG_COND      = jnp.zeros(_MAX_ABILITIES, dtype=jnp.int8)
 _ITEM_DMG_MULT    = jnp.ones(_MAX_ITEMS,       dtype=jnp.float32)
 _ITEM_DMG_COND    = jnp.zeros(_MAX_ITEMS,      dtype=jnp.int8)
 
@@ -300,10 +306,18 @@ def run_event_modify_atk(relay: jnp.ndarray, state: BattleState,
     relay = relay * _AB_ATK_MULT[aid]
 
     # 1b. Conditional: Guts (cond=1 → ×1.5 when statused)
-    from pokejax.types import STATUS_NONE
+    from pokejax.types import STATUS_NONE, WEATHER_SUN
     is_statused = state.sides_team_status[atk_side, atk_idx] != jnp.int8(STATUS_NONE)
+    atk_cond = _AB_ATK_COND[aid]
     relay = relay * jnp.where(
-        (_AB_ATK_COND[aid] == ABCOND_ATK_GUTS) & is_statused,
+        (atk_cond == ABCOND_ATK_GUTS) & is_statused,
+        jnp.float32(1.5), jnp.float32(1.0)
+    )
+
+    # 1c. Conditional: Flower Gift (cond=2 → ×1.5 in sun)
+    in_sun = state.field.weather == jnp.int8(WEATHER_SUN)
+    relay = relay * jnp.where(
+        (atk_cond == ABCOND_ATK_SUN) & in_sun,
         jnp.float32(1.5), jnp.float32(1.0)
     )
 
@@ -427,9 +441,24 @@ def run_event_modify_damage(relay: jnp.ndarray, state: BattleState,
     """
     from pokejax.core.damage import MF_TYPE, MF_CATEGORY
 
-    # Ability constant modifier
+    # Ability constant modifier (currently unused after moving Sniper/Tinted Lens)
     aid = _safe_ability(state.sides_team_ability_id[atk_side, atk_idx])
     relay = relay * _AB_DMG_MULT[aid]
+
+    # Ability conditional modifier: Tinted Lens (NVE → ×2)
+    ab_dmg_cond = _AB_DMG_COND[aid]
+    if _TABLES_REF is not None:
+        from pokejax.core.damage import type_effectiveness as _te, MF_TYPE as _MF_TYPE
+        _mid = move_id.astype(jnp.int32)
+        _mt = _TABLES_REF.moves[_mid, _MF_TYPE].astype(jnp.int32)
+        _def_idx_i32 = def_idx.astype(jnp.int32)
+        _dt = state.sides_team_types[def_side, _def_idx_i32]
+        _eff = _te(_TABLES_REF, _mt, _dt[0].astype(jnp.int32), _dt[1].astype(jnp.int32))
+        is_nve = _eff < jnp.float32(1.0)
+        relay = relay * jnp.where(
+            (ab_dmg_cond == ABCOND_DMG_TINTED_LENS) & is_nve,
+            jnp.float32(2.0), jnp.float32(1.0)
+        )
 
     # Item constant multiplier (Life Orb = 1.3, others = 1.0)
     iid = state.sides_team_item_id[atk_side, atk_idx]
