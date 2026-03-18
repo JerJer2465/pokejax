@@ -27,8 +27,7 @@ from pokejax.rl.model import PokeTransformer, MODEL_CONFIG
 from pokejax.rl.ppo import PPOConfig, TrainState, create_train_state, ppo_step, make_jit_ppo_epochs
 from pokejax.rl.rollout import (
     RolloutConfig, collect_rollout, make_jit_rollout,
-    make_jit_rollout_asymmetric, make_jit_rollout_vs_heuristic,
-    RolloutBatch,
+    make_jit_rollout_asymmetric, RolloutBatch,
 )
 
 
@@ -59,8 +58,7 @@ class TrainConfig:
     # Opponent pool config
     pool_size:         int   = 20     # max historical checkpoints in pool
     pool_save_interval: int  = 50     # save to pool every N updates
-    pool_latest_ratio:  float = 0.70  # probability of symmetric self-play
-    heuristic_ratio:   float = 0.10   # probability of playing vs heuristic (anchoring)
+    pool_latest_ratio:  float = 0.75  # probability of symmetric self-play (rest = pool)
 
     # LR warmup
     lr_warmup_steps: int = 1000      # linear warmup steps before cosine decay
@@ -410,9 +408,8 @@ def train(
     jit_rollout = make_jit_rollout(model, env, tables, cfg.rollout)
     jit_epochs = make_jit_ppo_epochs(model, optimizer, cfg.ppo)
 
-    # Lazy-compiled rollouts for opponent diversity (compiled on first use)
+    # Lazy-compiled asymmetric rollout for pool opponents (compiled on first use)
     jit_rollout_asymmetric = None
-    jit_rollout_vs_heuristic = None
 
     # Opponent pool for historical self-play diversity
     opponent_pool = OpponentPool(max_size=cfg.pool_size)
@@ -435,8 +432,7 @@ def train(
     print(f"  Entropy coeff: {cfg.ppo.ent_coef}, Clip ε: {cfg.ppo.clip_eps}")
     print(f"  Epochs: {cfg.ppo.n_epochs}, Minibatch: {cfg.ppo.minibatch_size}")
     print(f"  Opponent mix: {cfg.pool_latest_ratio:.0%} self-play, "
-          f"{cfg.heuristic_ratio:.0%} heuristic, "
-          f"{1 - cfg.pool_latest_ratio - cfg.heuristic_ratio:.0%} pool")
+          f"{1 - cfg.pool_latest_ratio:.0%} pool")
     print(f"  TensorBoard: {cfg.tensorboard_dir}/{run_name}")
     if resume_checkpoint is not None:
         print(f"  Resumed from checkpoint: update_idx={update_idx}, "
@@ -453,17 +449,7 @@ def train(
         roll = py_random.random()
         opp_type = "self"
 
-        if roll < cfg.heuristic_ratio:
-            # Heuristic anchoring
-            opp_type = "heuristic"
-            if jit_rollout_vs_heuristic is None:
-                print("  [JIT] Compiling heuristic rollout...")
-                jit_rollout_vs_heuristic = make_jit_rollout_vs_heuristic(
-                    model, env, tables, cfg.rollout
-                )
-            _, batch, info = jit_rollout_vs_heuristic(train_state.params, rollout_key)
-
-        elif roll < cfg.heuristic_ratio + (1 - cfg.pool_latest_ratio - cfg.heuristic_ratio) and len(opponent_pool) > 0:
+        if roll > cfg.pool_latest_ratio and len(opponent_pool) > 0:
             # Historical opponent from pool
             opp_type = "pool"
             if jit_rollout_asymmetric is None:
@@ -475,7 +461,6 @@ def train(
             _, batch, info = jit_rollout_asymmetric(
                 train_state.params, opp_params, rollout_key
             )
-
         else:
             # Symmetric self-play (latest vs latest)
             _, batch, info = jit_rollout(train_state.params, rollout_key)
