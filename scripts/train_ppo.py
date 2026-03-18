@@ -62,7 +62,7 @@ def main():
     parser.add_argument("--clip-eps",    type=float, default=0.2)
     parser.add_argument("--ent-coef",    type=float, default=0.02)
     parser.add_argument("--vf-coef",     type=float, default=1.0)
-    parser.add_argument("--n-epochs",    type=int,   default=3)
+    parser.add_argument("--n-epochs",    type=int,   default=2)
     parser.add_argument("--minibatch-size", type=int, default=8192)
     parser.add_argument("--lr-warmup",   type=int,   default=1000,
                         help="Linear LR warmup steps")

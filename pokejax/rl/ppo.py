@@ -36,7 +36,7 @@ class PPOConfig:
     ent_coef_end:    float = 0.005   # raised floor: prevents premature convergence
     ent_coef_decay_steps: int = 15000  # optimizer steps over which to anneal entropy
     max_grad_norm:   float = 0.5
-    n_epochs:        int   = 3       # 3 epochs: extract more learning per rollout (KL/clip still safe)
+    n_epochs:        int   = 2       # 2 epochs: balances learning vs SPS throughput
     minibatch_size:  int   = 8192    # larger minibatch: better GPU utilization, fewer steps
 
     # C51
