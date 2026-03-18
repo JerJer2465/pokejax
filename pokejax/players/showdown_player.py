@@ -423,24 +423,40 @@ class ObsBridge:
             moff = _OFF_MOVES + m_idx * 45
             buf[moff:moff + 45] = move_feats[m_idx]
 
-        # Sleep turns (rough estimate)
+        # Sleep turns — match training obs_builder: clip(sleep_turns, 0, 3)
+        # Training engine starts sleep_turns at 0, poke-env at 0 or 1.
+        # Use 0 as default for non-sleeping to match training exactly.
         if status_code == 4:  # SLP
-            sleep_t = min(getattr(pokemon, 'sleep_turns', 1) or 1, 3)
+            raw_sleep = getattr(pokemon, 'sleep_turns', 0)
+            if raw_sleep is None:
+                raw_sleep = 0
+            sleep_t = max(0, min(raw_sleep, 3))
             buf[_OFF_SLEEP_BIN + sleep_t] = 1.0
         else:
-            buf[_OFF_SLEEP_BIN] = 1.0
+            buf[_OFF_SLEEP_BIN] = 1.0  # bin 0 = not sleeping
 
-        # Rest turns bin
-        buf[_OFF_REST_BIN] = 1.0  # default: 0 rest turns
+        # Rest turns bin — match training: uses sleep_turns for rest too
+        # Training encodes rest_bin from sleep_turns when status==SLP
+        if status_code == 4:  # SLP
+            raw_sleep = getattr(pokemon, 'sleep_turns', 0)
+            if raw_sleep is None:
+                raw_sleep = 0
+            rest_t = max(0, min(raw_sleep, 2))
+            buf[_OFF_REST_BIN + rest_t] = 1.0
+        else:
+            buf[_OFF_REST_BIN] = 1.0  # bin 0 = not resting
 
-        # Substitute HP fraction
+        # Substitute HP fraction — match training: actual sub HP / (max_hp/4)
+        # poke-env doesn't track sub HP; use 1.0 (full sub) as best estimate
+        # since most subs are at full HP when first observed.
+        # Training: sub_data_raw / max(1, floor(max_hp/4))
         has_sub = False
         for eff, _ in effects.items():
             vol_name = _EFFECT_TO_VOLATILE.get(eff)
             if vol_name == "substitute":
                 has_sub = True
-                # poke-env doesn't track sub HP; assume 25% of max HP remaining
-                buf[_OFF_SUB_FRAC] = 0.25
+                # Use 1.0 (full substitute) — closer to training avg than 0.25
+                buf[_OFF_SUB_FRAC] = 1.0
                 break
 
         # Force trapped (partially trapped by moves like Wrap, Fire Spin, etc.)
@@ -452,20 +468,20 @@ class ObsBridge:
 
         # Move disabled flags (4 dims)
         if is_own and is_active and available_moves is not None:
-            # Check which move slots are disabled
-            all_moves = list(pokemon.moves.values()) if pokemon.moves else []
             for i, m in enumerate(moves_ordered[:4]):
                 if m is not None and hasattr(m, 'is_disabled') and m.is_disabled:
                     buf[_OFF_MOV_DIS + i] = 1.0
 
-        # Confusion bin (4 dims)
+        # Confusion bin (4 dims) — match training: one_hot(clip(conf_data, 0, 3))
+        conf_found = False
         for eff, turns in effects.items():
             vol_name = _EFFECT_TO_VOLATILE.get(eff)
             if vol_name == "confusion":
-                conf_t = max(0, min(turns if isinstance(turns, int) else 1, 3))
+                conf_t = max(0, min(turns if isinstance(turns, int) else 0, 3))
                 buf[_OFF_CONF_BIN + conf_t] = 1.0
+                conf_found = True
                 break
-        else:
+        if not conf_found:
             buf[_OFF_CONF_BIN] = 1.0  # no confusion = bin 0
 
         # Taunt, encore, yawn flags
@@ -491,13 +507,14 @@ class ObsBridge:
                 break
         buf[_OFF_PERISH_BIN + perish_count] = 1.0
 
-        # Protect count (normalized)
-        # poke-env doesn't track protect count; default 0
+        # Protect count — match training: min(prot_data, 4) / 4
+        # poke-env doesn't track successive protect count; default 0
         buf[_OFF_PROTECT] = 0.0
 
         # Locked move (choice item lock or outrage/petal dance)
+        # Match training: checks VOL_LOCKEDMOVE | VOL_CHOICELOCK bits
+        # PS-side approximation: locked if only 1 move available but mon knows more
         if is_own and is_active:
-            # If only 1 move is available and we have more moves, likely locked
             if available_moves is not None and len(available_moves) == 1 and len(pokemon.moves) > 1:
                 buf[_OFF_LOCKED_MOV] = 1.0
 
@@ -582,18 +599,46 @@ class ObsBridge:
         buf[_FOFF_FAINTED] = own_fainted / 6.0
         buf[_FOFF_FAINTED + 1] = opp_fainted / 6.0
 
-        # Toxic counts (rough estimate)
+        # Toxic counts — match training: one_hot(bin(status_turns), 5)
+        # Training bins: 0=none, 1=count1, 2=count2, 3=count3-4, 4=count5+
         active = battle.active_pokemon
         if active and active.status == Status.TOX:
-            tox_count = min(getattr(active, 'status_counter', 1) or 1, 5)
-            idx = min(tox_count, 4)
+            tox_count = getattr(active, 'status_counter', 0)
+            if tox_count is None:
+                tox_count = 0
+            tox_count = max(0, min(tox_count, 5))
+            if tox_count <= 0:
+                idx = 0
+            elif tox_count == 1:
+                idx = 1
+            elif tox_count == 2:
+                idx = 2
+            elif tox_count <= 4:
+                idx = 3
+            else:
+                idx = 4
             buf[_FOFF_TOXIC_OWN + idx] = 1.0
         else:
             buf[_FOFF_TOXIC_OWN] = 1.0
 
         opp_active = battle.opponent_active_pokemon
         if opp_active and opp_active.status == Status.TOX:
-            buf[_FOFF_TOXIC_OPP + 1] = 1.0  # rough estimate
+            # For opponent, poke-env may track status_counter
+            opp_tox = getattr(opp_active, 'status_counter', 0)
+            if opp_tox is None:
+                opp_tox = 0
+            opp_tox = max(0, min(opp_tox, 5))
+            if opp_tox <= 0:
+                idx = 0
+            elif opp_tox == 1:
+                idx = 1
+            elif opp_tox == 2:
+                idx = 2
+            elif opp_tox <= 4:
+                idx = 3
+            else:
+                idx = 4
+            buf[_FOFF_TOXIC_OPP + idx] = 1.0
         else:
             buf[_FOFF_TOXIC_OPP] = 1.0
 
@@ -659,22 +704,21 @@ class ObsBridge:
         opp_active = battle.opponent_active_pokemon
 
         # Resolve move list for the active Pokemon.
-        # Edge cases (Hidden Power variants, etc.) can cause mismatches between
-        # the active Pokemon's known moves and available_moves. We resolve the
-        # move list independently — real_active is ALWAYS battle.active_pokemon
-        # to stay consistent with the legal mask.
+        # IMPORTANT: poke-env's active_pokemon and available_moves can be out
+        # of sync after a switch — active_pokemon is the NEW Pokemon but
+        # available_moves still contains the PREVIOUS Pokemon's moves.
+        # We ALWAYS use available_moves as the authoritative move list since
+        # those are the actual legal moves for this turn.
         real_active = own_active
         own_move_list = []
         if available_moves:
             avail_names = set(m.id for m in available_moves)
 
             def _moves_match(pokemon):
-                """Check if ALL available moves are in this Pokemon's known moves.
-                Handles Hidden Power variants (e.g., 'hiddenpowerice' vs 'hiddenpower')."""
+                """Check if ALL available moves are in this Pokemon's known moves."""
                 if not pokemon or not pokemon.moves:
                     return False
                 p_names = set(m.id for m in pokemon.moves.values())
-                # Also add normalized variants for Hidden Power matching
                 p_names_hp = set()
                 for n in p_names:
                     p_names_hp.add(n)
@@ -686,44 +730,13 @@ class ObsBridge:
                         return False
                 return True
 
-            # First check if battle.active_pokemon's moves match
             if _moves_match(own_active):
+                # Normal case: active Pokemon's moves match available_moves
                 own_move_list = list(own_active.moves.values())[:4]
             else:
-                # Move mismatch — find the pokemon whose moves match available_moves
-                # for move list ordering, but do NOT change real_active (must stay
-                # consistent with legal mask to avoid switching to active pokemon).
-                move_source = None
-                best_match = None
-                best_overlap = 0
-                for p in own_team:
-                    if p is not None and p.moves and not p.fainted:
-                        if _moves_match(p):
-                            move_source = p
-                            own_move_list = list(p.moves.values())[:4]
-                            break
-                        p_names = set(m.id for m in p.moves.values())
-                        overlap = len(avail_names & p_names)
-                        if overlap > best_overlap:
-                            best_overlap = overlap
-                            best_match = p
-
-                if not own_move_list:
-                    if best_match is not None:
-                        move_source = best_match
-                        own_move_list = list(best_match.moves.values())[:4]
-                    elif own_active and own_active.moves:
-                        own_move_list = list(own_active.moves.values())[:4]
-                    else:
-                        # Last resort: use available_moves directly as the move list
-                        own_move_list = list(available_moves)[:4]
-
-                # If we found a different move source, log it but keep real_active
-                # as battle.active_pokemon for observation/mask consistency
-                if move_source is not None and move_source is not own_active:
-                    print(f"  [WARN] Move mismatch: poke-env active="
-                          f"{own_active.species if own_active else None}, "
-                          f"moves match={move_source.species}")
+                # Desync: available_moves don't belong to active_pokemon.
+                # Use available_moves directly — these ARE the legal moves.
+                own_move_list = list(available_moves)[:4]
         elif own_active and own_active.moves:
             own_move_list = list(own_active.moves.values())[:4]
 
@@ -925,10 +938,21 @@ class PokejaxPlayer(Player):
         if self.verbose:
             legal = np.where(obs["legal_mask"])[0]
             trap_str = " [TRAPPED]" if trapped else ""
-            print(f"  Turn {battle.turn}: value={float(value):.3f}{trap_str}")
+            own_team = self.obs_bridge._last_own_team
+            own_move_list = self.obs_bridge._last_own_move_list
+            active_name = battle.active_pokemon.species if battle.active_pokemon else "?"
+            opp_name = battle.opponent_active_pokemon.species if battle.opponent_active_pokemon else "?"
+            print(f"  Turn {battle.turn}: {active_name} vs {opp_name} | "
+                  f"value={float(value):.3f}{trap_str}")
             for a in sorted(legal, key=lambda x: -probs[x]):
                 marker = " <--" if a == action else ""
-                print(f"    action {a}: {probs[a]*100:.1f}%{marker}")
+                if a < 4:
+                    mname = own_move_list[a].id if a < len(own_move_list) and own_move_list[a] else "?"
+                    print(f"    move {a} ({mname}): {probs[a]*100:.1f}%{marker}")
+                else:
+                    slot = a - 4
+                    pname = own_team[slot].species if slot < len(own_team) and own_team[slot] else "?"
+                    print(f"    switch {slot} ({pname}): {probs[a]*100:.1f}%{marker}")
 
         # Map action to poke-env order using stable slot mappings
         own_team = self.obs_bridge._last_own_team
