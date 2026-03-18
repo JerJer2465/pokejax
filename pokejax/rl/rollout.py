@@ -343,3 +343,121 @@ def make_jit_rollout_asymmetric(model, env, tables, cfg: RolloutConfig):
         return collect_rollout(model, params, env, tables, cfg, key, opp_params=opp_params)
 
     return _jit_rollout
+
+
+def make_jit_rollout_vs_heuristic(model, env, tables, cfg: RolloutConfig):
+    """
+    Return a jax.jit-compiled rollout function with signature:
+        jit_rollout(params, key) -> (StepCarry, RolloutBatch, info)
+
+    Training agent (player 0) uses neural network, opponent (player 1)
+    uses heuristic. Provides anchoring against a fixed baseline to
+    prevent forgetting basic competence during self-play.
+    """
+    from pokejax.rl.heuristic import heuristic_action
+
+    @jax.jit
+    def _jit_rollout(params: dict, key: jnp.ndarray):
+
+        def _heuristic_step(carry: StepCarry, _):
+            env_state, rng = carry
+            rng, act_key_p0, act_key_p1, step_key, reset_key = jax.random.split(rng, 5)
+
+            obs_p0 = _obs_from_env_state(env_state, player=0, tables=tables)
+
+            # Player 0: neural network
+            act_p0, lp_p0, val_p0 = _sample_action(model, params, obs_p0, act_key_p0)
+
+            # Player 1: heuristic
+            act_p1 = heuristic_action(env_state.battle, 1, tables, act_key_p1)
+
+            actions = jnp.array([act_p0, act_p1], dtype=jnp.int32)
+            new_env_state, rewards, dones = env.step_lean(env_state, actions, step_key)
+
+            reward = rewards[0]
+            done = dones[0]
+
+            reset_state, _ = env.reset(reset_key)
+            final_env_state = jax.tree.map(
+                lambda r, n: jnp.where(done, r, n),
+                reset_state, new_env_state,
+            )
+
+            output = StepOutput(
+                int_ids=obs_p0["int_ids"],
+                float_feats=obs_p0["float_feats"],
+                legal_mask=obs_p0["legal_mask"],
+                action=act_p0.astype(jnp.int32),
+                log_prob=lp_p0,
+                value=val_p0,
+                reward=reward,
+                done=done,
+            )
+            return StepCarry(env_state=final_env_state, key=rng), output
+
+        env_keys = jax.random.split(key, cfg.n_envs + 1)
+        key, env_keys = env_keys[0], env_keys[1:]
+
+        v_reset = jax.vmap(env.reset)
+        init_env_states, _ = v_reset(env_keys)
+
+        init_keys_per_env = jax.random.split(key, cfg.n_envs)
+        init_carries = jax.vmap(lambda s, k: StepCarry(env_state=s, key=k))(
+            init_env_states, init_keys_per_env
+        )
+
+        def collect_one_env(init_carry):
+            return jax.lax.scan(_heuristic_step, init_carry, None, length=cfg.n_steps)
+
+        final_carries, traj = jax.vmap(collect_one_env)(init_carries)
+
+        def _boot_value(carry):
+            obs = _obs_from_env_state(carry.env_state, 0, tables)
+            _, _, val = model.apply(
+                params,
+                obs["int_ids"][None],
+                obs["float_feats"][None],
+                obs["legal_mask"][None],
+            )
+            return val[0]
+
+        boot_values = jax.vmap(_boot_value)(final_carries)
+
+        def _gae_one(rewards, values_traj, dones, boot_val):
+            values_ext = jnp.append(values_traj, boot_val)
+            return compute_gae(rewards, values_ext, dones, cfg.gamma, cfg.gae_lambda)
+
+        advantages, returns = jax.vmap(_gae_one)(
+            traj.reward, traj.value,
+            traj.done.astype(jnp.float32), boot_values,
+        )
+
+        def _flat(x):
+            return x.reshape(-1, *x.shape[2:])
+
+        batch = RolloutBatch(
+            int_ids=_flat(traj.int_ids),
+            float_feats=_flat(traj.float_feats),
+            legal_mask=_flat(traj.legal_mask),
+            actions=_flat(traj.action),
+            log_probs_old=_flat(traj.log_prob),
+            advantages=advantages.reshape(-1),
+            returns=returns.reshape(-1),
+            dones=_flat(traj.done),
+        )
+
+        done_f = traj.done.astype(jnp.float32)
+        terminal_rewards = traj.reward * done_f
+        n_episodes = done_f.sum()
+        n_wins = (terminal_rewards > 0).astype(jnp.float32).sum()
+        mean_reward = jnp.where(n_episodes > 0, terminal_rewards.sum() / n_episodes, 0.0)
+        win_rate = jnp.where(n_episodes > 0, n_wins / n_episodes, 0.5)
+
+        info = {
+            "n_episodes": n_episodes,
+            "win_rate": win_rate,
+            "mean_reward": mean_reward,
+        }
+        return final_carries, batch, info
+
+    return _jit_rollout

@@ -76,8 +76,10 @@ def main():
     # Opponent pool
     parser.add_argument("--pool-size",   type=int,   default=20)
     parser.add_argument("--pool-save-interval", type=int, default=50)
-    parser.add_argument("--pool-latest-ratio",  type=float, default=0.75,
-                        help="Probability of self-play vs pool opponent")
+    parser.add_argument("--pool-latest-ratio",  type=float, default=0.70,
+                        help="Probability of symmetric self-play")
+    parser.add_argument("--heuristic-ratio",  type=float, default=0.10,
+                        help="Probability of playing vs heuristic (anchoring)")
 
     # Eval
     parser.add_argument("--eval-interval", type=int, default=50,
@@ -146,6 +148,7 @@ def main():
         pool_size=args.pool_size,
         pool_save_interval=args.pool_save_interval,
         pool_latest_ratio=args.pool_latest_ratio,
+        heuristic_ratio=args.heuristic_ratio,
         lr_warmup_steps=args.lr_warmup,
         lr_min=args.lr_min,
         ps_eval=not args.no_ps_eval,
