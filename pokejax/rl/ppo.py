@@ -27,7 +27,7 @@ import optax
 class PPOConfig:
     # PPO — tuned for Pokemon battles (medium-length episodes, complex action space)
     # References: ps-ppo (Nebraskinator), Karten et al. 2025, 37 PPO details
-    lr:              float = 2e-4    # reduced for larger ~3.5M param model
+    lr:              float = 3e-4    # tuned for ~2.2M param model
     clip_eps:        float = 0.2
     gamma:           float = 0.999   # high discount: early moves matter for win/loss
     gae_lambda:      float = 0.95

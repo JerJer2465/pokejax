@@ -2,9 +2,9 @@
 Flax port of PokeTransformer — Actor-Critic Transformer for Pokemon battles.
 
 Architecture:
-  - Pre-LN Transformer: d_model=256, n_heads=8, n_layers=4, d_ff=768
-  - TokenProjection: (embed_dim=384 + float_dim=394) → d_model via 2-layer MLP+LN
-  - Embedding dims: species=96, move=48×5=240 (4 moves+last), ability=24, item=24 → 384
+  - Pre-LN Transformer: d_model=192, n_heads=6, n_layers=3, d_ff=384
+  - TokenProjection: (embed_dim=256 + float_dim=394) → d_model via 2-layer MLP+LN
+  - Embedding dims: species=64, move=32×5=160 (4 moves+last), ability=16, item=16 → 256
   - Positional embeddings: 15 learned slots
   - Actor token=13, Critic token=14 with -inf bias on [13,14] and [14,13]
   - C51 distributional value head: 51 atoms, v_min=-1.5, v_max=1.5
@@ -28,22 +28,22 @@ import flax.linen as nn
 from pokejax.rl.obs_builder import FLOAT_DIM_PER_POKEMON, N_TOKENS, N_ACTIONS
 
 # ---------------------------------------------------------------------------
-# Hyperparameters — scaled up for more capacity (~3.5M params)
+# Hyperparameters — fits RTX 3080 16GB at 512 envs (~1.6M params)
 # ---------------------------------------------------------------------------
 
-D_MODEL          = 256
-N_HEADS          = 8
-N_LAYERS         = 4
-D_FF             = 768
+D_MODEL          = 192
+N_HEADS          = 6
+N_LAYERS         = 3
+D_FF             = 384
 DROPOUT          = 0.0          # disabled during JIT rollout; set per-call if needed
 
-# Embedding dims — scaled up proportionally
-SPECIES_EMBED_DIM  = 96
-MOVE_EMBED_DIM     = 48     # per move (4 moves + 1 last_used)
-ABILITY_EMBED_DIM  = 24
-ITEM_EMBED_DIM     = 24
+# Embedding dims
+SPECIES_EMBED_DIM  = 64
+MOVE_EMBED_DIM     = 32     # per move (4 moves + 1 last_used)
+ABILITY_EMBED_DIM  = 16
+ITEM_EMBED_DIM     = 16
 EMBED_DIM          = SPECIES_EMBED_DIM + 4 * MOVE_EMBED_DIM + ABILITY_EMBED_DIM + ITEM_EMBED_DIM + MOVE_EMBED_DIM
-# = 96 + 192 + 24 + 24 + 48 = 384
+# = 64 + 128 + 16 + 16 + 32 = 256
 
 # C51 parameters
 N_ATOMS  = 51
@@ -161,7 +161,7 @@ class PokeTransformer(nn.Module):
         B = int_ids.shape[0]
 
         # --- Embeddings ---
-        species = nn.Embed(N_SPECIES, SPECIES_EMBED_DIM)(int_ids[..., 0])  # (B, 15, 96)
+        species = nn.Embed(N_SPECIES, SPECIES_EMBED_DIM)(int_ids[..., 0])  # (B, 15, 64)
         m0 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 1])
         m1 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 2])
         m2 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 3])
