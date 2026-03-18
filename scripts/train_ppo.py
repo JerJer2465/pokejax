@@ -66,6 +66,12 @@ def main():
     parser.add_argument("--minibatch-size", type=int, default=8192)
     parser.add_argument("--lr-warmup",   type=int,   default=1000,
                         help="Linear LR warmup steps")
+    parser.add_argument("--lr-min",      type=float, default=1e-5,
+                        help="Minimum LR floor for cosine decay")
+    parser.add_argument("--ent-coef-end", type=float, default=0.001,
+                        help="Final entropy coef after annealing")
+    parser.add_argument("--ent-coef-decay-steps", type=int, default=15000,
+                        help="Optimizer steps to anneal entropy coef")
 
     # Opponent pool
     parser.add_argument("--pool-size",   type=int,   default=20)
@@ -78,6 +84,14 @@ def main():
                         help="Eval every N PPO updates")
     parser.add_argument("--eval-games",  type=int,   default=64,
                         help="Number of eval games per opponent type")
+
+    # PS server eval
+    parser.add_argument("--no-ps-eval", action="store_true",
+                        help="Disable eval on local PS server")
+    parser.add_argument("--ps-eval-interval", type=int, default=100,
+                        help="PS eval every N PPO updates")
+    parser.add_argument("--ps-eval-games", type=int, default=20,
+                        help="Games per PS eval round")
 
     # Checkpoints
     parser.add_argument("--bc-init",     type=str,   default=None,
@@ -110,6 +124,8 @@ def main():
             gae_lambda=args.gae_lambda,
             vf_coef=args.vf_coef,
             ent_coef=args.ent_coef,
+            ent_coef_end=args.ent_coef_end,
+            ent_coef_decay_steps=args.ent_coef_decay_steps,
             n_epochs=args.n_epochs,
             minibatch_size=args.minibatch_size,
         ),
@@ -131,24 +147,43 @@ def main():
         pool_save_interval=args.pool_save_interval,
         pool_latest_ratio=args.pool_latest_ratio,
         lr_warmup_steps=args.lr_warmup,
+        lr_min=args.lr_min,
+        ps_eval=not args.no_ps_eval,
+        ps_eval_interval=args.ps_eval_interval,
+        ps_eval_games=args.ps_eval_games,
     )
 
     # Load initial params from BC or PPO checkpoint
     init_params = None
-    if args.bc_init and os.path.exists(args.bc_init):
+    resume_checkpoint = None
+
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        print(f"Loading PPO checkpoint: {args.checkpoint}")
+        with open(args.checkpoint, "rb") as f:
+            ckpt = pickle.load(f)
+        if "opt_state" in ckpt:
+            # Full resume with optimizer state
+            resume_checkpoint = ckpt
+            print(f"  Full resume: update_idx={ckpt['update_idx']}, "
+                  f"timesteps={ckpt['timesteps']:,}, "
+                  f"opt_step={int(ckpt['train_step'])}")
+        else:
+            # Legacy checkpoint (params only)
+            init_params = ckpt["params"]
+            print("  PPO params loaded (legacy ckpt, fresh optimizer)")
+    elif args.bc_init and os.path.exists(args.bc_init):
         print(f"Loading BC checkpoint: {args.bc_init}")
         with open(args.bc_init, "rb") as f:
             init_params = pickle.load(f)["params"]
         print("  BC params loaded (fresh optimizer state)")
-    elif args.checkpoint and os.path.exists(args.checkpoint):
-        print(f"Loading PPO checkpoint: {args.checkpoint}")
-        with open(args.checkpoint, "rb") as f:
-            init_params = pickle.load(f)["params"]
-        print("  PPO params loaded")
 
     key = jax.random.PRNGKey(args.seed)
     print("Starting PPO self-play training...")
-    final_state = train(env, env.tables, cfg, key, init_params=init_params)
+    final_state = train(
+        env, env.tables, cfg, key,
+        init_params=init_params,
+        resume_checkpoint=resume_checkpoint,
+    )
     print("Training complete.")
 
 

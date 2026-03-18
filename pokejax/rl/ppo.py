@@ -32,7 +32,9 @@ class PPOConfig:
     gamma:           float = 0.999   # high discount: early moves matter for win/loss
     gae_lambda:      float = 0.95
     vf_coef:         float = 0.5
-    ent_coef:        float = 0.02    # higher entropy for exploration in complex action space
+    ent_coef:        float = 0.02    # starting entropy for exploration in complex action space
+    ent_coef_end:    float = 0.001   # final entropy coef after annealing
+    ent_coef_decay_steps: int = 15000  # optimizer steps over which to anneal entropy
     max_grad_norm:   float = 0.5
     n_epochs:        int   = 2       # 2 epochs: fewer gradient steps = faster + less overfitting
     minibatch_size:  int   = 8192    # larger minibatch: better GPU utilization, fewer steps
@@ -165,6 +167,7 @@ def ppo_loss(
     model,
     batch: RolloutBatch,
     cfg: PPOConfig,
+    step: jnp.ndarray = None,
 ) -> tuple[jnp.ndarray, dict]:
     """Compute PPO loss and return (total_loss, metrics_dict)."""
     log_probs_new, value_probs, values = model.apply(
@@ -193,14 +196,20 @@ def ppo_loss(
         cfg.n_atoms, cfg.v_min, cfg.v_max,
     )
 
-    # --- Entropy bonus ---
+    # --- Entropy bonus (with linear annealing) ---
     entropy = -(jnp.exp(log_probs_new) * log_probs_new).sum(-1).mean()
+
+    if step is not None and cfg.ent_coef_decay_steps > 0:
+        frac = jnp.clip(step / cfg.ent_coef_decay_steps, 0.0, 1.0)
+        ent_coef = cfg.ent_coef * (1.0 - frac) + cfg.ent_coef_end * frac
+    else:
+        ent_coef = cfg.ent_coef
 
     # --- Total ---
     total_loss = (
         policy_loss
         + cfg.vf_coef * value_loss
-        - cfg.ent_coef * entropy
+        - ent_coef * entropy
     )
 
     # --- Diagnostics ---
@@ -216,6 +225,7 @@ def ppo_loss(
         "ratio/max":        ratio.max(),
         "diagnostics/approx_kl":     approx_kl,
         "diagnostics/clip_fraction": clip_fraction,
+        "diagnostics/ent_coef":      ent_coef,
     }
     return total_loss, metrics
 
@@ -232,7 +242,7 @@ def ppo_step(
     optimizer,
 ) -> tuple[TrainState, dict]:
     """Apply one gradient step. JIT-able."""
-    loss_fn = lambda p: ppo_loss(p, model, batch, cfg)
+    loss_fn = lambda p: ppo_loss(p, model, batch, cfg, step=train_state.step)
     (total_loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(
         train_state.params
     )

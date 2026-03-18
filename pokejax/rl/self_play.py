@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 import os
 import pickle
+import subprocess
 import time
 import random as py_random
 
@@ -48,6 +49,11 @@ class TrainConfig:
     eval_interval:   int   = 50      # PPO updates between eval rounds
     eval_games:      int   = 64      # number of eval games (vs heuristic + vs random)
 
+    # PS server eval (requires local Showdown server running)
+    ps_eval:          bool  = True    # enable eval on local PS server
+    ps_eval_interval: int   = 100    # PPO updates between PS eval rounds
+    ps_eval_games:    int   = 20     # games per PS eval round
+
     # Opponent pool config
     pool_size:         int   = 20     # max historical checkpoints in pool
     pool_save_interval: int  = 50     # save to pool every N updates
@@ -55,6 +61,7 @@ class TrainConfig:
 
     # LR warmup
     lr_warmup_steps: int = 1000      # linear warmup steps before cosine decay
+    lr_min:          float = 1e-5    # minimum LR floor (cosine decay alpha)
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +238,57 @@ def eval_vs_opponents(model, params, env, tables, n_games: int = 64) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# PS server eval (runs play_local_heuristic.py as subprocess)
+# ---------------------------------------------------------------------------
+
+def _run_ps_eval(checkpoint_path: str, n_games: int, writer, global_step: int):
+    """Run eval on local Pokemon Showdown server via subprocess.
+
+    Requires a local PS server running (node pokemon-showdown start --no-security).
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    script = os.path.join(repo_root, "scripts", "play_local_heuristic.py")
+    if not os.path.exists(script):
+        print("  PS eval script not found, skipping")
+        return None
+
+    results = {}
+    for vs in ["heuristic", "random"]:
+        try:
+            proc = subprocess.run(
+                [
+                    "python3", script,
+                    "--checkpoint", checkpoint_path,
+                    "--games", str(n_games),
+                    "--vs", vs,
+                    "--output-dir", "/tmp/ps_eval",
+                ],
+                capture_output=True, text=True, timeout=600,
+            )
+            if proc.returncode != 0:
+                print(f"  PS eval vs {vs} failed: {proc.stderr[:200]}")
+                continue
+
+            import json
+            summary_path = "/tmp/ps_eval/local_summary.json"
+            if os.path.exists(summary_path):
+                with open(summary_path) as f:
+                    summary = json.load(f)
+                wr = summary.get("win_rate", 0.0)
+                results[f"ps_eval/win_rate_vs_{vs}"] = wr
+                writer.add_scalar(f"ps_eval/win_rate_vs_{vs}", wr, global_step)
+                print(f"  PS eval vs {vs}: {wr:.0%} "
+                      f"({summary['wins']}W/{summary['losses']}L/"
+                      f"{summary.get('ties', 0)}T)")
+        except subprocess.TimeoutExpired:
+            print(f"  PS eval vs {vs} timed out")
+        except Exception as e:
+            print(f"  PS eval vs {vs} error: {e}")
+
+    return results if results else None
+
+
+# ---------------------------------------------------------------------------
 # Model + optimizer creation
 # ---------------------------------------------------------------------------
 
@@ -264,6 +322,7 @@ def create_model_and_state(
     cosine_fn = optax.cosine_decay_schedule(
         init_value=cfg.ppo.lr,
         decay_steps=max(cfg.total_timesteps - cfg.lr_warmup_steps, 1),
+        alpha=cfg.lr_min / max(cfg.ppo.lr, 1e-10),
     )
     lr_schedule = optax.join_schedules(
         schedules=[warmup_fn, cosine_fn],
@@ -293,14 +352,16 @@ def train(
     cfg: TrainConfig,
     key: jnp.ndarray,
     init_params: Optional[dict] = None,
+    resume_checkpoint: Optional[dict] = None,
 ) -> TrainState:
     """Main PPO self-play training loop with full logging.
 
-    env:         PokeJAXEnv instance
-    tables:      Tables object
-    cfg:         TrainConfig
-    key:         JAX PRNGKey
-    init_params: Optional pre-trained params (from BC) to warm-start
+    env:              PokeJAXEnv instance
+    tables:           Tables object
+    cfg:              TrainConfig
+    key:              JAX PRNGKey
+    init_params:      Optional pre-trained params (from BC) to warm-start
+    resume_checkpoint: Optional full checkpoint dict for resuming training
     """
     # TensorBoard
     from tensorboardX import SummaryWriter
@@ -329,9 +390,18 @@ def train(
 
     # Initialize model + optimizer
     key, init_key = jax.random.split(key)
+    resume_params = resume_checkpoint["params"] if resume_checkpoint else init_params
     model, optimizer, train_state, lr_schedule = create_model_and_state(
-        cfg, init_key, init_params
+        cfg, init_key, resume_params
     )
+
+    # Restore full training state on resume
+    if resume_checkpoint is not None:
+        train_state = TrainState(
+            params=resume_checkpoint["params"],
+            opt_state=resume_checkpoint["opt_state"],
+            step=resume_checkpoint["train_step"],
+        )
 
     # JIT compile rollout + PPO
     # Symmetric self-play only — asymmetric doubles XLA memory and OOMs on 10GB.
@@ -341,11 +411,11 @@ def train(
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
-    timesteps_collected = 0
-    update_idx = 0
+    timesteps_collected = resume_checkpoint["timesteps"] if resume_checkpoint else 0
+    update_idx = resume_checkpoint["update_idx"] if resume_checkpoint else 0
     metrics = {}
     t_start = time.time()
-    best_win_rate = 0.0
+    best_win_rate = resume_checkpoint.get("best_win_rate", 0.0) if resume_checkpoint else 0.0
 
     transitions_per_rollout = cfg.rollout.n_envs * cfg.rollout.n_steps
 
@@ -358,7 +428,11 @@ def train(
     print(f"  Epochs: {cfg.ppo.n_epochs}, Minibatch: {cfg.ppo.minibatch_size}")
     print(f"  Self-play: symmetric (latest vs latest)")
     print(f"  TensorBoard: {cfg.tensorboard_dir}/{run_name}")
-    if init_params is not None:
+    if resume_checkpoint is not None:
+        print(f"  Resumed from checkpoint: update_idx={update_idx}, "
+              f"timesteps={timesteps_collected:,}, best_wr={best_win_rate:.2%}, "
+              f"opt_step={int(train_state.step)}")
+    elif init_params is not None:
         print(f"  Warm-started from pre-trained params")
     print()
 
@@ -392,6 +466,7 @@ def train(
             writer.add_scalar("diagnostics/ratio_max",     vals["m/ratio/max"],     global_step)
             lr_val = float(lr_schedule(train_state.step))
             writer.add_scalar("charts/learning_rate", lr_val, global_step)
+            writer.add_scalar("charts/ent_coef", vals["m/diagnostics/ent_coef"], global_step)
             writer.add_scalar("charts/SPS", sps, global_step)
             writer.add_scalar("charts/selfplay_win_rate",    vals["i/win_rate"],    global_step)
             writer.add_scalar("charts/episodes_per_rollout", vals["i/n_episodes"],  global_step)
@@ -427,8 +502,11 @@ def train(
                 best_win_rate = wr_h
                 ckpt = {
                     "params": train_state.params,
-                    "step": update_idx,
+                    "opt_state": train_state.opt_state,
+                    "train_step": train_state.step,
+                    "update_idx": update_idx,
                     "timesteps": timesteps_collected,
+                    "best_win_rate": best_win_rate,
                     "eval_win_rate_heuristic": wr_h,
                 }
                 path = os.path.join(cfg.checkpoint_dir, "ppo_best.pkl")
@@ -440,8 +518,11 @@ def train(
         if update_idx % cfg.checkpoint_interval == 0:
             ckpt = {
                 "params": train_state.params,
-                "step": update_idx,
+                "opt_state": train_state.opt_state,
+                "train_step": train_state.step,
+                "update_idx": update_idx,
                 "timesteps": timesteps_collected,
+                "best_win_rate": best_win_rate,
             }
             path = os.path.join(cfg.checkpoint_dir, f"ppo_{update_idx:06d}.pkl")
             with open(path, "wb") as f:
@@ -451,11 +532,21 @@ def train(
                 pickle.dump(ckpt, f)
             print(f"  Checkpoint saved: {path}")
 
+        # --- PS server eval ---
+        if cfg.ps_eval and update_idx % cfg.ps_eval_interval == 0:
+            latest_ckpt = os.path.join(cfg.checkpoint_dir, "ppo_latest.pkl")
+            if os.path.exists(latest_ckpt):
+                print(f"  PS server eval ({cfg.ps_eval_games} games each)...")
+                _run_ps_eval(latest_ckpt, cfg.ps_eval_games, writer, timesteps_collected)
+
     # Final checkpoint
     ckpt = {
         "params": train_state.params,
-        "step": update_idx,
+        "opt_state": train_state.opt_state,
+        "train_step": train_state.step,
+        "update_idx": update_idx,
         "timesteps": timesteps_collected,
+        "best_win_rate": best_win_rate,
     }
     path = os.path.join(cfg.checkpoint_dir, "ppo_final.pkl")
     with open(path, "wb") as f:
