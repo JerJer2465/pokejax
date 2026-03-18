@@ -230,6 +230,7 @@ class MctsPlayer(Player):
         """Map a pokejax action (0-9) to a poke-env BattleOrder."""
         available_moves = battle.available_moves
         available_switches = battle.available_switches
+        active_pokemon = battle.active_pokemon
 
         # Ensure obs_bridge has the latest team/move mapping
         self.obs_bridge.build_obs(battle)
@@ -248,7 +249,11 @@ class MctsPlayer(Player):
             slot = action - 4
             if slot < len(own_team) and own_team[slot] is not None:
                 target = own_team[slot]
-                if target in available_switches:
+                # Safety: never switch to the active pokemon
+                if target is active_pokemon:
+                    print(f"  [BUG] Expectimax chose switch to active "
+                          f"{active_pokemon.species} (slot {slot}), falling back")
+                elif target in available_switches:
                     return self.create_order(target)
             if available_switches:
                 return self.create_order(available_switches[0])

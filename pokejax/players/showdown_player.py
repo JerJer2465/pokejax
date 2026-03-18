@@ -658,10 +658,11 @@ class ObsBridge:
         own_active = battle.active_pokemon
         opp_active = battle.opponent_active_pokemon
 
-        # Safety net: verify battle.active_pokemon matches available_moves.
-        # The _handle_battle_message override fixes the main request/turn ordering
-        # issue, but edge cases (Hidden Power variants, etc.) can still cause
-        # mismatches between the active Pokemon's known moves and available_moves.
+        # Resolve move list for the active Pokemon.
+        # Edge cases (Hidden Power variants, etc.) can cause mismatches between
+        # the active Pokemon's known moves and available_moves. We resolve the
+        # move list independently — real_active is ALWAYS battle.active_pokemon
+        # to stay consistent with the legal mask.
         real_active = own_active
         own_move_list = []
         if available_moves:
@@ -685,21 +686,22 @@ class ObsBridge:
                         return False
                 return True
 
-            # First check if battle.active_pokemon is correct
+            # First check if battle.active_pokemon's moves match
             if _moves_match(own_active):
                 own_move_list = list(own_active.moves.values())[:4]
             else:
-                # Mismatch — find the real active Pokemon from the team
-                # Use strict matching: ALL available moves must be in the Pokemon's moveset
+                # Move mismatch — find the pokemon whose moves match available_moves
+                # for move list ordering, but do NOT change real_active (must stay
+                # consistent with legal mask to avoid switching to active pokemon).
+                move_source = None
                 best_match = None
                 best_overlap = 0
                 for p in own_team:
                     if p is not None and p.moves and not p.fainted:
                         if _moves_match(p):
-                            real_active = p
+                            move_source = p
                             own_move_list = list(p.moves.values())[:4]
                             break
-                        # Track best partial match as fallback
                         p_names = set(m.id for m in p.moves.values())
                         overlap = len(avail_names & p_names)
                         if overlap > best_overlap:
@@ -708,13 +710,20 @@ class ObsBridge:
 
                 if not own_move_list:
                     if best_match is not None:
-                        real_active = best_match
+                        move_source = best_match
                         own_move_list = list(best_match.moves.values())[:4]
                     elif own_active and own_active.moves:
                         own_move_list = list(own_active.moves.values())[:4]
                     else:
                         # Last resort: use available_moves directly as the move list
                         own_move_list = list(available_moves)[:4]
+
+                # If we found a different move source, log it but keep real_active
+                # as battle.active_pokemon for observation/mask consistency
+                if move_source is not None and move_source is not own_active:
+                    print(f"  [WARN] Move mismatch: poke-env active="
+                          f"{own_active.species if own_active else None}, "
+                          f"moves match={move_source.species}")
         elif own_active and own_active.moves:
             own_move_list = list(own_active.moves.values())[:4]
 
@@ -775,6 +784,16 @@ class ObsBridge:
             p = own_team[slot]
             if p is not None and id(p) in available_switch_ids:
                 legal_mask[4 + slot] = 1.0
+
+        # Safety: ensure the active pokemon's slot is NEVER legal for switching,
+        # even if poke-env's available_switches is stale or inconsistent.
+        active_pokemon = battle.active_pokemon
+        for slot in range(6):
+            p = own_team[slot]
+            if p is not None and p is active_pokemon and legal_mask[4 + slot] > 0:
+                print(f"  [BUG] legal_mask included active pokemon "
+                      f"{active_pokemon.species} at slot {slot} — removing")
+                legal_mask[4 + slot] = 0.0
 
         if legal_mask.sum() == 0:
             legal_mask[0] = 1.0  # fallback
@@ -914,6 +933,7 @@ class PokejaxPlayer(Player):
         # Map action to poke-env order using stable slot mappings
         own_team = self.obs_bridge._last_own_team
         own_move_list = self.obs_bridge._last_own_move_list
+        active_pokemon = battle.active_pokemon
 
         if action < 4:
             # Move action: action i = move slot i from pokemon.moves dict order
@@ -932,8 +952,13 @@ class PokejaxPlayer(Player):
             slot = action - 4
             if slot < len(own_team) and own_team[slot] is not None:
                 target_pokemon = own_team[slot]
-                # Verify this Pokemon is actually switchable
-                if target_pokemon in available_switches:
+                # Safety: never switch to the active pokemon
+                if target_pokemon is active_pokemon:
+                    if self.verbose:
+                        print(f"  [BUG] Model chose switch to active "
+                              f"{active_pokemon.species} (slot {slot}), "
+                              f"falling back")
+                elif target_pokemon in available_switches:
                     return self.create_order(target_pokemon)
             # Fallback: try to find any legal switch
             if available_switches:

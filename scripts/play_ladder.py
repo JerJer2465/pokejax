@@ -23,7 +23,36 @@ for k in list(os.environ):
     if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
         del os.environ[k]
 
+# Monkey-patch websockets.connect to increase open_timeout.
+# Clash TUN's fake-ip DNS can take 10+ seconds to resolve psim.us,
+# exceeding the default 10s open_timeout and causing handshake timeouts.
+import websockets
+import websockets.asyncio.client as _wsc
+_orig_connect = _wsc.connect
+class _patched_connect(_orig_connect):
+    def __init__(self, *a, **kw):
+        kw.setdefault("open_timeout", 30)
+        super().__init__(*a, **kw)
+_wsc.connect = _patched_connect
+websockets.connect = _patched_connect
+
 from poke_env import ShowdownServerConfiguration, AccountConfiguration
+
+# Patch poke-env's already-imported ws reference too
+import poke_env.ps_client.ps_client as _ps_mod
+_ps_mod.ws.connect = _patched_connect
+
+# Monkey-patch poke-env to handle proxy-locked login.
+# When PS detects a proxy IP, it returns "‽username" instead of " username"
+# in the updateuser message, which prevents poke-env from setting logged_in.
+_orig_handle = _ps_mod.PSClient._handle_message
+
+async def _patched_handle(self, message):
+    if "|updateuser|" in message:
+        message = message.replace("|updateuser|\u203d", "|updateuser| ")
+    return await _orig_handle(self, message)
+
+_ps_mod.PSClient._handle_message = _patched_handle
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
