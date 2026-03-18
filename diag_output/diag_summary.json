@@ -1,0 +1,28 @@
+{
+  "checkpoint": "checkpoints/ppo_best.pkl",
+  "games": 5,
+  "wins": 1,
+  "losses": 4,
+  "win_rate": 0.2,
+  "total_turns": 207,
+  "anomalies": 13,
+  "species_id_zero_count": 0,
+  "value_mean": -0.34032912732322435,
+  "value_std": 0.46600104956786054,
+  "entropy_mean": 0.3066402708100804,
+  "near_uniform_frac": 0.004830917874396135,
+  "confidence_mean": 0.8205338693471347,
+  "action_types": {
+    "move": 133,
+    "switch": 62,
+    "fallback": 24
+  },
+  "fallback_rate": 0.11594202898550725,
+  "game_results": [
+    "LOSS",
+    "LOSS",
+    "WIN",
+    "LOSS",
+    "LOSS"
+  ]
+}
