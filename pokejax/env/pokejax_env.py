@@ -262,13 +262,20 @@ class PokeJAXEnv:
             jnp.float32(0.0)
         )
 
-        # Shaping: HP advantage delta
+        # Shaping: HP advantage delta + faint bonus
         old_p0_hp = hp_fraction(state, 0)
         old_p1_hp = hp_fraction(state, 1)
         delta_p0 = (p0_hp - old_p0_hp) - (p1_hp - old_p1_hp)
 
-        r0 = win_reward + delta_p0 * 0.1
-        r1 = -win_reward - delta_p0 * 0.1
+        # Faint-based shaping: clear discrete signal for KOs
+        old_p0_fainted = state.sides_team_fainted[0].sum().astype(jnp.float32)
+        old_p1_fainted = state.sides_team_fainted[1].sum().astype(jnp.float32)
+        new_p0_fainted = new_state.sides_team_fainted[0].sum().astype(jnp.float32)
+        new_p1_fainted = new_state.sides_team_fainted[1].sum().astype(jnp.float32)
+        faint_delta = (new_p1_fainted - old_p1_fainted) - (new_p0_fainted - old_p0_fainted)
+
+        r0 = win_reward + delta_p0 * 0.05 + faint_delta * 0.15
+        r1 = -win_reward - delta_p0 * 0.05 - faint_delta * 0.15
 
         rewards = jnp.array([r0, r1])
         dones   = jnp.broadcast_to(new_state.finished, (2,))
@@ -318,8 +325,15 @@ class PokeJAXEnv:
         old_p1_hp = hp_fraction(state, 1)
         delta_p0 = (p0_hp - old_p0_hp) - (p1_hp - old_p1_hp)
 
-        r0 = win_reward + delta_p0 * 0.1
-        r1 = -win_reward - delta_p0 * 0.1
+        # Faint-based shaping: clear discrete signal for KOs
+        old_p0_fainted = state.sides_team_fainted[0].sum().astype(jnp.float32)
+        old_p1_fainted = state.sides_team_fainted[1].sum().astype(jnp.float32)
+        new_p0_fainted = new_state.sides_team_fainted[0].sum().astype(jnp.float32)
+        new_p1_fainted = new_state.sides_team_fainted[1].sum().astype(jnp.float32)
+        faint_delta = (new_p1_fainted - old_p1_fainted) - (new_p0_fainted - old_p0_fainted)
+
+        r0 = win_reward + delta_p0 * 0.05 + faint_delta * 0.15
+        r1 = -win_reward - delta_p0 * 0.05 - faint_delta * 0.15
 
         rewards = jnp.array([r0, r1])
         dones   = jnp.broadcast_to(new_state.finished, (2,))
