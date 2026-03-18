@@ -1,10 +1,10 @@
 """
 Flax port of PokeTransformer — Actor-Critic Transformer for Pokemon battles.
 
-Matches PokemonShowdownClaude architecture exactly:
-  - Pre-LN Transformer: d_model=256, n_heads=8, n_layers=6, d_ff=1024
-  - TokenProjection: (embed_dim=512 + float_dim=394) → d_model via 2-layer MLP+LN
-  - Embedding dims: species=128, move=64×5=320 (4 moves+last), ability=32, item=32 → 512
+Architecture:
+  - Pre-LN Transformer: d_model=256, n_heads=8, n_layers=4, d_ff=768
+  - TokenProjection: (embed_dim=384 + float_dim=394) → d_model via 2-layer MLP+LN
+  - Embedding dims: species=96, move=48×5=240 (4 moves+last), ability=24, item=24 → 384
   - Positional embeddings: 15 learned slots
   - Actor token=13, Critic token=14 with -inf bias on [13,14] and [14,13]
   - C51 distributional value head: 51 atoms, v_min=-1.5, v_max=1.5
@@ -28,22 +28,22 @@ import flax.linen as nn
 from pokejax.rl.obs_builder import FLOAT_DIM_PER_POKEMON, N_TOKENS, N_ACTIONS
 
 # ---------------------------------------------------------------------------
-# Hyperparameters (match PokemonShowdownClaude MODEL_CONFIG)
+# Hyperparameters — scaled up for more capacity (~3.5M params)
 # ---------------------------------------------------------------------------
 
-D_MODEL          = 192
-N_HEADS          = 6
-N_LAYERS         = 3
-D_FF             = 384
+D_MODEL          = 256
+N_HEADS          = 8
+N_LAYERS         = 4
+D_FF             = 768
 DROPOUT          = 0.0          # disabled during JIT rollout; set per-call if needed
 
-# Embedding dims — smaller to match slimmer model
-SPECIES_EMBED_DIM  = 64
-MOVE_EMBED_DIM     = 32     # per move (4 moves + 1 last_used)
-ABILITY_EMBED_DIM  = 16
-ITEM_EMBED_DIM     = 16
+# Embedding dims — scaled up proportionally
+SPECIES_EMBED_DIM  = 96
+MOVE_EMBED_DIM     = 48     # per move (4 moves + 1 last_used)
+ABILITY_EMBED_DIM  = 24
+ITEM_EMBED_DIM     = 24
 EMBED_DIM          = SPECIES_EMBED_DIM + 4 * MOVE_EMBED_DIM + ABILITY_EMBED_DIM + ITEM_EMBED_DIM + MOVE_EMBED_DIM
-# = 64 + 128 + 16 + 16 + 32 = 256
+# = 96 + 192 + 24 + 24 + 48 = 384
 
 # C51 parameters
 N_ATOMS  = 51
@@ -161,7 +161,7 @@ class PokeTransformer(nn.Module):
         B = int_ids.shape[0]
 
         # --- Embeddings ---
-        species = nn.Embed(N_SPECIES, SPECIES_EMBED_DIM)(int_ids[..., 0])  # (B, 15, 128)
+        species = nn.Embed(N_SPECIES, SPECIES_EMBED_DIM)(int_ids[..., 0])  # (B, 15, 96)
         m0 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 1])
         m1 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 2])
         m2 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 3])
@@ -172,12 +172,12 @@ class PokeTransformer(nn.Module):
 
         embed_out = jnp.concatenate(
             [species, m0, m1, m2, m3, ability, item, last_m], axis=-1
-        )  # (B, 15, 512)
+        )  # (B, 15, EMBED_DIM)
 
         # --- Token projection: (embed_dim + float_dim) → d_model ---
-        token_in = jnp.concatenate([embed_out, float_feats], axis=-1)  # (B, 15, 906)
+        token_in = jnp.concatenate([embed_out, float_feats], axis=-1)  # (B, 15, EMBED_DIM+394)
         BT = B * N_TOKENS
-        tok_flat = token_in.reshape(BT, -1)                            # (B*15, 906)
+        tok_flat = token_in.reshape(BT, -1)                            # (B*15, EMBED_DIM+394)
 
         # 2-layer MLP with LayerNorm (matches PokemonShowdownClaude TokenProjection)
         tok_flat = nn.Dense(self.d_model * 2)(tok_flat)
