@@ -457,7 +457,7 @@ class TestSwitchInState:
         state = _make_state(tables, cfg, p1_ability=_ABILITY_IDS["Drizzle"])
         state2 = run_event_switch_in(state, 0, state.sides_active_idx[0])
         assert int(state2.field.weather) == WEATHER_RAIN
-        assert int(state2.field.weather_turns) == 5
+        assert int(state2.field.weather_turns) == 127  # Gen 4: permanent weather
 
     def test_drought_sets_sun(self, tables, cfg):
         state = _make_state(tables, cfg, p1_ability=_ABILITY_IDS["Drought"])
@@ -529,7 +529,8 @@ class TestResidualState:
     def test_speed_boost_adds_one_spe(self, tables, cfg):
         state = _make_state(tables, cfg, p1_ability=_ABILITY_IDS["Speed Boost"])
         idx = state.sides_active_idx[0]
-        state2 = run_event_residual_state(state, 0, idx)
+        key = jax.random.PRNGKey(0)
+        state2, _ = run_event_residual_state(state, key, 0, idx)
         spe_boost = int(state2.sides_team_boosts[0, 0, BOOST_SPE])
         assert spe_boost == 1
 
@@ -538,7 +539,8 @@ class TestResidualState:
         boosts = state.sides_team_boosts.at[0, 0, BOOST_SPE].set(jnp.int8(6))
         state = state._replace(sides_team_boosts=boosts)
         idx = state.sides_active_idx[0]
-        state2 = run_event_residual_state(state, 0, idx)
+        key = jax.random.PRNGKey(0)
+        state2, _ = run_event_residual_state(state, key, 0, idx)
         spe_boost = int(state2.sides_team_boosts[0, 0, BOOST_SPE])
         assert spe_boost == 6  # capped
 
@@ -549,7 +551,8 @@ class TestResidualState:
         new_hp = state.sides_team_hp.at[0, 0].set(jnp.int16(start_hp))
         state = state._replace(sides_team_hp=new_hp)
         idx = state.sides_active_idx[0]
-        state2 = run_event_residual_state(state, 0, idx)
+        key = jax.random.PRNGKey(0)
+        state2, _ = run_event_residual_state(state, key, 0, idx)
         expected = min(max_hp, start_hp + max(1, max_hp // 16))
         assert int(state2.sides_team_hp[0, 0]) == expected
 
@@ -557,7 +560,8 @@ class TestResidualState:
         state = _make_state(tables, cfg, p1_item=_ITEM_IDS["Leftovers"])
         # HP already full
         idx = state.sides_active_idx[0]
-        state2 = run_event_residual_state(state, 0, idx)
+        key = jax.random.PRNGKey(0)
+        state2, _ = run_event_residual_state(state, key, 0, idx)
         assert int(state2.sides_team_hp[0, 0]) == 300  # capped at max
 
     def test_black_sludge_heals_poison_type(self, tables, cfg):
@@ -568,14 +572,16 @@ class TestResidualState:
         new_hp = state.sides_team_hp.at[0, 0].set(jnp.int16(start_hp))
         state = state._replace(sides_team_hp=new_hp)
         idx = state.sides_active_idx[0]
-        state2 = run_event_residual_state(state, 0, idx)
+        key = jax.random.PRNGKey(0)
+        state2, _ = run_event_residual_state(state, key, 0, idx)
         assert int(state2.sides_team_hp[0, 0]) > start_hp  # healed
 
     def test_no_item_no_residual(self, tables, cfg):
         state = _make_state(tables, cfg, p1_item=0)
         hp_before = int(state.sides_team_hp[0, 0])
         idx = state.sides_active_idx[0]
-        state2 = run_event_residual_state(state, 0, idx)
+        key = jax.random.PRNGKey(0)
+        state2, _ = run_event_residual_state(state, key, 0, idx)
         assert int(state2.sides_team_hp[0, 0]) == hp_before
 
 

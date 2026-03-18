@@ -31,19 +31,19 @@ from pokejax.rl.obs_builder import FLOAT_DIM_PER_POKEMON, N_TOKENS, N_ACTIONS
 # Hyperparameters (match PokemonShowdownClaude MODEL_CONFIG)
 # ---------------------------------------------------------------------------
 
-D_MODEL          = 256
-N_HEADS          = 8
-N_LAYERS         = 6
-D_FF             = 1024
+D_MODEL          = 192
+N_HEADS          = 6
+N_LAYERS         = 3
+D_FF             = 384
 DROPOUT          = 0.0          # disabled during JIT rollout; set per-call if needed
 
-# Embedding dims
-SPECIES_EMBED_DIM  = 128
-MOVE_EMBED_DIM     = 64    # per move (4 moves + 1 last_used)
-ABILITY_EMBED_DIM  = 32
-ITEM_EMBED_DIM     = 32
+# Embedding dims — smaller to match slimmer model
+SPECIES_EMBED_DIM  = 64
+MOVE_EMBED_DIM     = 32     # per move (4 moves + 1 last_used)
+ABILITY_EMBED_DIM  = 16
+ITEM_EMBED_DIM     = 16
 EMBED_DIM          = SPECIES_EMBED_DIM + 4 * MOVE_EMBED_DIM + ABILITY_EMBED_DIM + ITEM_EMBED_DIM + MOVE_EMBED_DIM
-# = 128 + 256 + 32 + 32 + 64 = 512
+# = 64 + 128 + 16 + 16 + 32 = 256
 
 # C51 parameters
 N_ATOMS  = 51

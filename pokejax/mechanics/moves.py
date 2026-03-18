@@ -24,7 +24,7 @@ from pokejax.types import (
     STATUS_NONE, STATUS_SLP,
     VOL_SUBSTITUTE, VOL_SEEDED, VOL_PARTIALLY_TRAPPED, VOL_YAWN, VOL_DESTINYBOND,
     VOL_DISABLE, VOL_PERISH,
-    BOOST_ATK,
+    BOOST_ATK, BOOST_ACC,
 )
 from pokejax.data.move_effects_data import (
     ME_NONE, ME_SELF_BOOST, ME_FOE_LOWER, ME_HAZARD, ME_SCREEN,
@@ -60,14 +60,52 @@ def _apply_stat_boost(
     stat_idx: jnp.ndarray,
     amount: jnp.ndarray,
     do_apply: jnp.ndarray,
+    is_foe: bool = False,
 ) -> BattleState:
     """
     Add `amount` to state.sides_team_boosts[side, slot, stat_idx], clamped to [-6,+6].
     No-op when do_apply is False or stat_idx == NONE_STAT.
-    Dynamic indexing via JAX scatter; safe under JIT.
+
+    Ability interactions:
+      - Simple: doubles the stat change amount.
+      - Clear Body / White Smoke: blocks all negative foe-inflicted stat changes.
+      - Hyper Cutter: blocks foe-inflicted ATK drops.
+      - Keen Eye: blocks foe-inflicted accuracy drops.
+
+    `is_foe` (compile-time bool): True when the stat change is inflicted by the
+    opponent (ME_FOE_LOWER, secondary effects). False for self-boosts.
     """
+    from pokejax.mechanics.abilities import (
+        CLEAR_BODY_ID, WHITE_SMOKE_ID, HYPER_CUTTER_ID, KEEN_EYE_ID, SIMPLE_ID,
+    )
+
     active = do_apply & (stat_idx != _NONE_STAT_I32)
     s_clamped = jnp.clip(stat_idx, 0, 6)
+
+    # Get target's ability
+    ability_id = state.sides_team_ability_id[side, slot].astype(jnp.int32)
+
+    # Simple: double all stat changes (both self and foe-inflicted)
+    has_simple = (SIMPLE_ID >= 0) & (ability_id == jnp.int32(SIMPLE_ID))
+    amount = jnp.where(has_simple, amount * 2, amount)
+
+    if is_foe:
+        # Clear Body / White Smoke: block all negative stat changes from foes
+        has_clear_body = (CLEAR_BODY_ID >= 0) & (ability_id == jnp.int32(CLEAR_BODY_ID))
+        has_white_smoke = (WHITE_SMOKE_ID >= 0) & (ability_id == jnp.int32(WHITE_SMOKE_ID))
+        foe_drop = amount < 0
+        blocked_by_clear = foe_drop & (has_clear_body | has_white_smoke)
+
+        # Hyper Cutter: block ATK drops from foes
+        has_hyper_cutter = (HYPER_CUTTER_ID >= 0) & (ability_id == jnp.int32(HYPER_CUTTER_ID))
+        blocked_by_hc = foe_drop & has_hyper_cutter & (s_clamped == jnp.int32(BOOST_ATK))
+
+        # Keen Eye: block accuracy drops from foes
+        has_keen_eye = (KEEN_EYE_ID >= 0) & (ability_id == jnp.int32(KEEN_EYE_ID))
+        blocked_by_ke = foe_drop & has_keen_eye & (s_clamped == jnp.int32(BOOST_ACC))
+
+        active = active & ~(blocked_by_clear | blocked_by_hc | blocked_by_ke)
+
     cur = state.sides_team_boosts[side, slot, s_clamped]
     new_val = jnp.clip(cur.astype(jnp.int32) + amount, -6, 6).astype(jnp.int8)
     chosen = jnp.where(active, new_val, cur)
@@ -83,11 +121,12 @@ def _apply_three_stat_boosts(
     stat2: jnp.ndarray, amt2: jnp.ndarray,
     stat3: jnp.ndarray, amt3: jnp.ndarray,
     do_apply: jnp.ndarray,
+    is_foe: bool = False,
 ) -> BattleState:
     """Apply up to three stat boosts (self or foe) conditionally."""
-    state = _apply_stat_boost(state, side, slot, stat1, amt1, do_apply)
-    state = _apply_stat_boost(state, side, slot, stat2, amt2, do_apply)
-    state = _apply_stat_boost(state, side, slot, stat3, amt3, do_apply)
+    state = _apply_stat_boost(state, side, slot, stat1, amt1, do_apply, is_foe)
+    state = _apply_stat_boost(state, side, slot, stat2, amt2, do_apply, is_foe)
+    state = _apply_stat_boost(state, side, slot, stat3, amt3, do_apply, is_foe)
     return state
 
 
@@ -188,6 +227,7 @@ def execute_move_effects(
         state, def_side, def_idx,
         stat1, amt1, stat2, amt2, stat3, amt3,
         is_foe_lower,
+        is_foe=True,
     )
 
     # ------------------------------------------------------------------
@@ -257,8 +297,11 @@ def execute_move_effects(
     # ------------------------------------------------------------------
     # ME_VOLATILE_FOE: set a volatile bit on the defender
     # stat1 = vol_bit index
+    # Substitute blocks volatile effects on the defender (Leech Seed, etc.)
     # ------------------------------------------------------------------
-    is_vol_foe = should_apply & (effect_type == jnp.int32(ME_VOLATILE_FOE))
+    def_has_sub = (state.sides_team_volatiles[def_side, def_idx]
+                   & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
+    is_vol_foe = should_apply & (effect_type == jnp.int32(ME_VOLATILE_FOE)) & ~def_has_sub
     state = _apply_volatile_bit(state, def_side, def_idx, stat1, is_vol_foe)
 
     # ------------------------------------------------------------------
@@ -279,6 +322,16 @@ def execute_move_effects(
     # Set substitute volatile bit
     state = _apply_volatile_bit(state, atk_side, atk_idx,
                                  jnp.int32(VOL_SUBSTITUTE), can_sub)
+    # Store substitute HP in volatile_data (sub HP = 25% of max HP, clamped to int8)
+    # We store raw HP clamped to [1, 127] since int8 max is 127.
+    sub_hp_val = jnp.where(can_sub,
+                            jnp.clip(sub_cost, 1, 127).astype(jnp.int8),
+                            state.sides_team_volatile_data[atk_side, atk_idx, VOL_SUBSTITUTE])
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[
+            atk_side, atk_idx, VOL_SUBSTITUTE
+        ].set(sub_hp_val)
+    )
 
     # ------------------------------------------------------------------
     # ME_RAPID_SPIN: remove hazards from own side

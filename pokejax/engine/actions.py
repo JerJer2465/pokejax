@@ -153,7 +153,12 @@ def execute_move_action(
     can_move = can_move & conf_can_move
 
     # Deduct PP (always, even if frozen/paralyzed that turn)
-    state = deduct_pp(state, atk_side, atk_idx, move_slot_i)
+    # Pressure: if the defender has Pressure, deduct 2 PP instead of 1
+    from pokejax.mechanics.abilities import PRESSURE_ID
+    def_ability = state.sides_team_ability_id[def_side, def_idx].astype(jnp.int32)
+    has_pressure = (PRESSURE_ID >= 0) & (def_ability == jnp.int32(PRESSURE_ID))
+    pp_cost = jnp.where(has_pressure, jnp.int8(2), jnp.int8(1))
+    state = deduct_pp(state, atk_side, atk_idx, move_slot_i, pp_cost)
 
     # ------------------------------------------------------------------
     # Two-turn move handling (Fly, Dig, Dive, Bounce, etc.)

@@ -43,11 +43,11 @@ def init(env):
 class TestEnvBasic:
     def test_reset_produces_valid_state(self, env, init):
         state, obs, _ = init
-        assert not bool(state.finished)
-        assert int(state.turn) == 0
+        assert not bool(state.battle.finished)
+        assert int(state.battle.turn) == 0
         assert obs.shape == (env.obs_dim,)
         # All HP should be positive
-        assert bool((state.sides_team_hp > 0).all())
+        assert bool((state.battle.sides_team_hp > 0).all())
 
     def test_step_returns_correct_shapes(self, env, init):
         state, _, key = init
@@ -81,12 +81,14 @@ class TestForcedSwitch:
     def test_forced_switch_after_faint(self, env, init):
         """When active Pokemon has 0 HP, forced switch should activate."""
         state, _, key = init
+        battle = state.battle
         # Manually set P0's active Pokemon HP to 0 and mark fainted
-        state = state._replace(
-            sides_team_hp=state.sides_team_hp.at[0, 0].set(jnp.int16(0)),
-            sides_team_fainted=state.sides_team_fainted.at[0, 0].set(True),
-            sides_pokemon_left=state.sides_pokemon_left.at[0].set(jnp.int8(5)),
+        battle = battle._replace(
+            sides_team_hp=battle.sides_team_hp.at[0, 0].set(jnp.int16(0)),
+            sides_team_fainted=battle.sides_team_fainted.at[0, 0].set(True),
+            sides_pokemon_left=battle.sides_pokemon_left.at[0].set(jnp.int8(5)),
         )
+        state = state._replace(battle=battle)
         # Step should trigger forced switch for P0
         actions = jnp.array([0, 0], dtype=jnp.int32)
         s2, _, _, _, _ = env.step(state, actions, key)
@@ -107,7 +109,7 @@ class TestRandomRollout:
         jit_step = jax.jit(lambda s, a, k: env.step(s, a, k))
 
         for t in range(50):
-            if bool(state.finished):
+            if bool(state.battle.finished):
                 break
 
             masks = env.get_action_masks(state)
@@ -127,8 +129,8 @@ class TestRandomRollout:
             assert not bool(jnp.isnan(rewards).any()), f"NaN in rewards at turn {t}"
 
             # HP should be in [0, max_hp]
-            hp = state.sides_team_hp
-            max_hp = state.sides_team_max_hp
+            hp = state.battle.sides_team_hp
+            max_hp = state.battle.sides_team_max_hp
             assert bool((hp >= 0).all()), f"Negative HP at turn {t}"
             assert bool((hp <= max_hp).all()), f"HP exceeds max at turn {t}"
 
@@ -141,7 +143,7 @@ class TestRandomRollout:
         finished = False
 
         for t in range(300):
-            if bool(state.finished):
+            if bool(state.battle.finished):
                 finished = True
                 break
 
@@ -155,7 +157,7 @@ class TestRandomRollout:
             state, _, _, _, _ = jit_step(state, actions, key)
 
         # Should have ended (placeholder teams have low-ish HP)
-        assert finished or int(state.turn) >= 300
+        assert finished or int(state.battle.turn) >= 300
 
     def test_winner_is_valid(self, env):
         """When game finishes, winner should be 0 or 1."""
@@ -164,7 +166,7 @@ class TestRandomRollout:
         jit_step = jax.jit(lambda s, a, k: env.step(s, a, k))
 
         for t in range(300):
-            if bool(state.finished):
+            if bool(state.battle.finished):
                 break
             masks = env.get_action_masks(state)
             key, k0, k1 = jax.random.split(key, 3)
@@ -174,8 +176,8 @@ class TestRandomRollout:
             a1 = jax.random.categorical(k1, logits1).astype(jnp.int32)
             state, _, _, _, _ = jit_step(state, jnp.array([a0, a1]), key)
 
-        if bool(state.finished):
-            w = int(state.winner)
+        if bool(state.battle.finished):
+            w = int(state.battle.winner)
             assert w in (0, 1), f"Invalid winner: {w}"
 
 
@@ -190,10 +192,11 @@ class TestAutoreset:
         state, _ = env.reset(key)
 
         # Force game to be finished
-        state = state._replace(
+        battle = state.battle._replace(
             finished=jnp.bool_(True),
             winner=jnp.int8(0),
         )
+        state = state._replace(battle=battle)
 
         actions = jnp.array([0, 0], dtype=jnp.int32)
         new_state, obs, rewards, dones, _ = env.step_autoreset(state, actions, key)

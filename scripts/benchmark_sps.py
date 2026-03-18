@@ -27,7 +27,7 @@ _n_steps = int(_sys.argv[2]) if len(_sys.argv) > 2 else 128
 print(f"Config: n_envs={_n_envs}, n_steps={_n_steps}")
 
 cfg = TrainConfig(
-    ppo=PPOConfig(minibatch_size=min(4096, _n_envs * _n_steps)),
+    ppo=PPOConfig(),  # use defaults (n_epochs=2, minibatch_size=8192)
     rollout=RolloutConfig(n_envs=_n_envs, n_steps=_n_steps),
 )
 
@@ -113,7 +113,7 @@ print(f"\n{'='*60}")
 print(f"BENCHMARK RESULTS ({N_BENCH} iterations)")
 print(f"{'='*60}")
 print(f"  Rollout (env+inference):  {avg_rollout:.3f}s  (min={min(rollout_times):.3f}, max={max(rollout_times):.3f})")
-print(f"  PPO epochs (3 epochs):    {avg_ppo:.3f}s  (min={min(ppo_times):.3f}, max={max(ppo_times):.3f})")
+print(f"  PPO epochs ({cfg.ppo.n_epochs} epochs):    {avg_ppo:.3f}s  (min={min(ppo_times):.3f}, max={max(ppo_times):.3f})")
 print(f"  Combined (full update):   {avg_combined:.3f}s  (min={min(combined_times):.3f}, max={max(combined_times):.3f})")
 print(f"")
 print(f"  Transitions/update:  {transitions_per_update:,}")

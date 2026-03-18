@@ -47,6 +47,29 @@ SNOW_CLOAK_ID     = -1
 ARENA_TRAP_ID     = -1
 SHADOW_TAG_ID     = -1
 MAGNET_PULL_ID    = -1
+BATTLE_ARMOR_ID   = -1
+SHELL_ARMOR_ID    = -1
+SNIPER_ID         = -1
+SERENE_GRACE_ID   = -1
+ROCK_HEAD_ID      = -1
+STURDY_ID         = -1
+SKILL_LINK_ID     = -1
+SCRAPPY_ID        = -1
+SUPER_LUCK_ID     = -1
+THICK_FAT_ID      = -1
+CLEAR_BODY_ID     = -1
+WHITE_SMOKE_ID    = -1
+HYPER_CUTTER_ID   = -1
+KEEN_EYE_ID       = -1
+SIMPLE_ID         = -1
+UNAWARE_ID        = -1
+SYNCHRONIZE_ID    = -1
+EARLY_BIRD_ID     = -1
+FILTER_ID         = -1
+SOLID_ROCK_ID     = -1
+STEADFAST_ID      = -1
+TANGLED_FEET_ID   = -1
+PRESSURE_ID       = -1
 
 
 # ---------------------------------------------------------------------------
@@ -90,19 +113,20 @@ def _intimidate_switch_in(state, side_i32, slot_i32):
 
 
 def _drizzle_switch_in(state, side_i32, slot_i32):
-    return _set_weather(state, WEATHER_RAIN, 5)
+    # Gen 4: weather from abilities is permanent (use 127 = int8 max)
+    return _set_weather(state, WEATHER_RAIN, 127)
 
 
 def _drought_switch_in(state, side_i32, slot_i32):
-    return _set_weather(state, WEATHER_SUN, 5)
+    return _set_weather(state, WEATHER_SUN, 127)
 
 
 def _sand_stream_switch_in(state, side_i32, slot_i32):
-    return _set_weather(state, WEATHER_SAND, 8)
+    return _set_weather(state, WEATHER_SAND, 127)
 
 
 def _snow_warning_switch_in(state, side_i32, slot_i32):
-    return _set_weather(state, WEATHER_HAIL, 8)
+    return _set_weather(state, WEATHER_HAIL, 127)
 
 
 def _download_switch_in(state, side_i32, slot_i32):
@@ -469,7 +493,7 @@ ABILITY_HANDLERS = {
     "Huge Power":    {"modify_atk_mult": 2.0},
     "Pure Power":    {"modify_atk_mult": 2.0},
     "Hustle":        {"modify_atk_mult": 1.5},
-    "Flower Gift":   {"modify_atk_mult": 1.5},  # sun → ×1.5 Atk (also SpD relay below)
+    "Flower Gift":   {"modify_atk_cond": ev.ABCOND_ATK_SUN},  # sun → ×1.5 Atk (also SpD relay)
 
     # ---- ModifyAtk (conditional) ----
     "Guts":          {"modify_atk_cond": ev.ABCOND_ATK_GUTS},
@@ -495,14 +519,12 @@ ABILITY_HANDLERS = {
     "Overgrow":      {"bp_cond": ev.ABCOND_BP_STARTER, "bp_type": TYPE_GRASS},
     "Swarm":         {"bp_cond": ev.ABCOND_BP_STARTER, "bp_type": TYPE_BUG},
 
-    # ---- ModifyDamage (constant) ----
-    "Sniper":        {"modify_dmg_mult": 1.5},  # simplified: always ×1.5 on crits
-    "Tinted Lens":   {"modify_dmg_mult": 2.0},  # not-very-effective → ×2 (simplified as constant)
+    # ---- ModifyDamage (conditional) ----
+    # Sniper: ×1.5 crit multiplier — handled via SNIPER_ID in compute_damage
+    # Tinted Lens: ×2 on NVE — handled via ability damage condition
+    "Tinted Lens":   {"modify_dmg_cond": ev.ABCOND_DMG_TINTED_LENS},
 
-    # ---- Thick Fat (src modifier: reduces foe's fire/ice atk/spa) ----
-    # Thick Fat: halve Fire/Ice damage. Implemented as src_atk + src_spa relay
-    # For simplicity, use tryhit_immune-like approach — but damage halving is better
-    # done via a ModifyDamage condition. We'll use a src multiplier of 0.5 for now.
+    # ---- Thick Fat: handled via THICK_FAT_ID in compute_damage ----
 
     # ==== Speed modifiers (Tier 1 relay) ====
     "Swift Swim":    {"speed_cond": ev.ABCOND_SPEED_RAIN},
@@ -532,7 +554,7 @@ ABILITY_HANDLERS = {
 
     # ==== Contact punishment (Tier 2 state-mutating) ====
     "Rough Skin":    {"contact_eff": ev.EFF_ROUGH_SKIN},
-    "Iron Barbs":    {"contact_eff": ev.EFF_ROUGH_SKIN},   # same effect as Rough Skin
+    # Iron Barbs is Gen 5 only; omitted for Gen 4
     "Static":        {"contact_eff": ev.EFF_STATIC_CONTACT},
     "Poison Point":  {"contact_eff": ev.EFF_POISON_POINT},
     "Flame Body":    {"contact_eff": ev.EFF_FLAME_BODY},
@@ -554,7 +576,7 @@ ABILITY_HANDLERS = {
 
     # ==== Switch-out effects (Tier 2) ====
     "Natural Cure":  {"switch_out_eff": ev.EFF_NATURAL_CURE},
-    "Regenerator":   {"switch_out_eff": ev.EFF_REGENERATOR},
+    # Regenerator is Gen 5 only; omitted for Gen 4
 
     # ==== Residual (end-of-turn state, Tier 2) ====
     "Speed Boost":   {"residual_eff": ev.EFF_SPEED_BOOST},
@@ -565,33 +587,34 @@ ABILITY_HANDLERS = {
     "Shed Skin":     {"residual_eff": ev.EFF_SHED_SKIN},
     # Dry Skin residual is set above with its TryHit entry
 
-    # ==== No-op / passive abilities (no array updates needed) ====
-    # These abilities have effects handled elsewhere or are too niche for RL:
-    # Adaptability (handled via ADAPTABILITY_ID check in hit_pipeline)
-    # Arena Trap, Magnet Pull, Shadow Tag (trapping — handled in switch legality)
-    # Battle Armor, Shell Armor (anti-crit — handled in damage calc)
-    # Clear Body, White Smoke (prevent stat drops — handled in boost application)
-    # Compound Eyes (accuracy boost — handled in step5)
-    # Damp (prevent Explosion — niche)
-    # Early Bird (wake up faster — handled in sleep turn count)
-    # Filter, Solid Rock (reduce SE damage — handled in damage calc)
-    # Gluttony (berry threshold — handled in berry check)
-    # Hyper Cutter (prevent Atk drop — handled in boost application)
-    # Keen Eye (prevent accuracy drop — handled in boost application)
-    # Mold Breaker (ignore target ability — handled in pipeline)
-    # No Guard (all moves hit — handled in accuracy)
-    # Pressure (extra PP usage — handled in PP deduction)
-    # Rock Head (no recoil — handled in recoil step)
-    # Scrappy (hit Ghost with Normal/Fighting — handled in type chart)
-    # Serene Grace (double secondary chance — handled in secondary roll)
-    # Simple (double stat changes — handled in boost application)
-    # Skill Link (multi-hit always 5 — handled in multi-hit roll)
-    # Steadfast (flinch → +1 Spe — handled in flinch check)
-    # Sturdy (survive OHKO at full HP — handled in damage application)
-    # Super Luck (+1 crit stage — handled in crit calc)
-    # Synchronize (pass status to attacker — handled in status application)
-    # Tangled Feet (evasion boost when confused — handled in accuracy)
-    # Unaware (ignore boosts — handled in damage calc)
+    # ==== Passive abilities (handled via ID checks in specific engine files) ====
+    # Adaptability — ADAPTABILITY_ID in hit_pipeline.py (STAB 2.0×)
+    # Arena Trap, Magnet Pull, Shadow Tag — trapping in action_mask.py
+    # Battle Armor, Shell Armor — BATTLE_ARMOR_ID/SHELL_ARMOR_ID in damage.py (prevent crits)
+    # Clear Body, White Smoke — CLEAR_BODY_ID/WHITE_SMOKE_ID in moves.py (prevent foe stat drops)
+    # Compound Eyes — COMPOUND_EYES_ID in hit_pipeline.py (×1.3 accuracy)
+    # Early Bird — EARLY_BIRD_ID in conditions.py (halve sleep turns)
+    # Filter, Solid Rock — FILTER_ID/SOLID_ROCK_ID in damage.py (×0.75 SE damage)
+    # Hyper Cutter — HYPER_CUTTER_ID in moves.py (prevent ATK drops from foes)
+    # Keen Eye — KEEN_EYE_ID in moves.py (prevent accuracy drops from foes)
+    # Mold Breaker — MOLD_BREAKER_ID in events.py (bypass defender ability)
+    # No Guard — NO_GUARD_ID in hit_pipeline.py (always hit)
+    # Pressure — PRESSURE_ID in actions.py (extra PP deduction)
+    # Rock Head — ROCK_HEAD_ID in hit_pipeline.py (no recoil)
+    # Scrappy — SCRAPPY_ID in hit_pipeline.py (Normal/Fighting hit Ghost)
+    # Serene Grace — SERENE_GRACE_ID in hit_pipeline.py (double secondary chance)
+    # Simple — SIMPLE_ID in moves.py (double stat changes)
+    # Skill Link — SKILL_LINK_ID in hit_pipeline.py (multi-hit always 5)
+    # Sniper — SNIPER_ID in damage.py (×3 crit multiplier)
+    # Steadfast — STEADFAST_ID in conditions.py (flinch → +1 SPE)
+    # Sturdy — STURDY_ID in hit_pipeline.py (survive OHKO at full HP)
+    # Super Luck — SUPER_LUCK_ID in damage.py (+1 crit stage)
+    # Synchronize — SYNCHRONIZE_ID in hit_pipeline.py (reflect status)
+    # Tangled Feet — TANGLED_FEET_ID in hit_pipeline.py (evasion when confused)
+    # Thick Fat — THICK_FAT_ID in damage.py (halve Fire/Ice attack)
+    # Unaware — UNAWARE_ID in damage.py (ignore foe boosts)
+    # Damp — too niche for Gen 4 randbats (prevent Self-Destruct/Explosion)
+    # Gluttony — no pinch berries in Gen 4 randbats
 }
 
 
@@ -613,26 +636,57 @@ def populate_ability_tables(ability_name_to_id: dict, tables=None) -> None:
     global LEVITATE_ID, NO_GUARD_ID, COMPOUND_EYES_ID, HUSTLE_ID
     global SAND_VEIL_ID, SNOW_CLOAK_ID
     global ARENA_TRAP_ID, SHADOW_TAG_ID, MAGNET_PULL_ID
+    global BATTLE_ARMOR_ID, SHELL_ARMOR_ID, SNIPER_ID, SERENE_GRACE_ID
+    global ROCK_HEAD_ID, STURDY_ID, SKILL_LINK_ID, SCRAPPY_ID
+    global SUPER_LUCK_ID, THICK_FAT_ID
+    global CLEAR_BODY_ID, WHITE_SMOKE_ID, HYPER_CUTTER_ID, KEEN_EYE_ID
+    global SIMPLE_ID, UNAWARE_ID, SYNCHRONIZE_ID, EARLY_BIRD_ID
+    global FILTER_ID, SOLID_ROCK_ID, STEADFAST_ID, TANGLED_FEET_ID, PRESSURE_ID
 
     if tables is not None:
         ev._TABLES_REF = tables
 
-    GUTS_ID           = ability_name_to_id.get("Guts", -1)
-    ADAPTABILITY_ID   = ability_name_to_id.get("Adaptability", -1)
-    WONDER_GUARD_ID   = ability_name_to_id.get("Wonder Guard", -1)
-    MOLD_BREAKER_ID   = ability_name_to_id.get("Mold Breaker", -1)
-    LEVITATE_ID       = ability_name_to_id.get("Levitate", -1)
-    NO_GUARD_ID       = ability_name_to_id.get("No Guard", -1)
-    COMPOUND_EYES_ID  = ability_name_to_id.get("Compound Eyes", -1)
-    # Showdown uses "Compoundeyes" in some contexts
+    def _get(name):
+        return ability_name_to_id.get(name, -1)
+
+    GUTS_ID           = _get("Guts")
+    ADAPTABILITY_ID   = _get("Adaptability")
+    WONDER_GUARD_ID   = _get("Wonder Guard")
+    MOLD_BREAKER_ID   = _get("Mold Breaker")
+    LEVITATE_ID       = _get("Levitate")
+    NO_GUARD_ID       = _get("No Guard")
+    COMPOUND_EYES_ID  = _get("Compound Eyes")
     if COMPOUND_EYES_ID < 0:
-        COMPOUND_EYES_ID = ability_name_to_id.get("Compoundeyes", -1)
-    HUSTLE_ID         = ability_name_to_id.get("Hustle", -1)
-    SAND_VEIL_ID      = ability_name_to_id.get("Sand Veil", -1)
-    SNOW_CLOAK_ID     = ability_name_to_id.get("Snow Cloak", -1)
-    ARENA_TRAP_ID     = ability_name_to_id.get("Arena Trap", -1)
-    SHADOW_TAG_ID     = ability_name_to_id.get("Shadow Tag", -1)
-    MAGNET_PULL_ID    = ability_name_to_id.get("Magnet Pull", -1)
+        COMPOUND_EYES_ID = _get("Compoundeyes")
+    HUSTLE_ID         = _get("Hustle")
+    SAND_VEIL_ID      = _get("Sand Veil")
+    SNOW_CLOAK_ID     = _get("Snow Cloak")
+    ARENA_TRAP_ID     = _get("Arena Trap")
+    SHADOW_TAG_ID     = _get("Shadow Tag")
+    MAGNET_PULL_ID    = _get("Magnet Pull")
+    BATTLE_ARMOR_ID   = _get("Battle Armor")
+    SHELL_ARMOR_ID    = _get("Shell Armor")
+    SNIPER_ID         = _get("Sniper")
+    SERENE_GRACE_ID   = _get("Serene Grace")
+    ROCK_HEAD_ID      = _get("Rock Head")
+    STURDY_ID         = _get("Sturdy")
+    SKILL_LINK_ID     = _get("Skill Link")
+    SCRAPPY_ID        = _get("Scrappy")
+    SUPER_LUCK_ID     = _get("Super Luck")
+    THICK_FAT_ID      = _get("Thick Fat")
+    CLEAR_BODY_ID     = _get("Clear Body")
+    WHITE_SMOKE_ID    = _get("White Smoke")
+    HYPER_CUTTER_ID   = _get("Hyper Cutter")
+    KEEN_EYE_ID       = _get("Keen Eye")
+    SIMPLE_ID         = _get("Simple")
+    UNAWARE_ID        = _get("Unaware")
+    SYNCHRONIZE_ID    = _get("Synchronize")
+    EARLY_BIRD_ID     = _get("Early Bird")
+    FILTER_ID         = _get("Filter")
+    SOLID_ROCK_ID     = _get("Solid Rock")
+    STEADFAST_ID      = _get("Steadfast")
+    TANGLED_FEET_ID   = _get("Tangled Feet")
+    PRESSURE_ID       = _get("Pressure")
 
     # --- Install state-mutating handlers into the small handler lists ---
     # SwitchIn
@@ -719,6 +773,10 @@ def populate_ability_tables(ability_name_to_id: dict, tables=None) -> None:
         if "modify_dmg_mult" in params:
             ev._AB_DMG_MULT = ev._AB_DMG_MULT.at[ability_id].set(
                 jnp.float32(params["modify_dmg_mult"]))
+
+        if "modify_dmg_cond" in params:
+            ev._AB_DMG_COND = ev._AB_DMG_COND.at[ability_id].set(
+                jnp.int8(params["modify_dmg_cond"]))
 
         if "speed_cond" in params:
             ev._AB_SPEED_COND = ev._AB_SPEED_COND.at[ability_id].set(
