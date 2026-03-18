@@ -244,6 +244,8 @@ def eval_vs_opponents(model, params, env, tables, n_games: int = 64) -> dict:
 def _run_ps_eval(checkpoint_path: str, n_games: int, writer, global_step: int):
     """Run eval on local Pokemon Showdown server via subprocess.
 
+    Uses Windows Python (CPU) for faster startup and to avoid competing
+    with GPU training for VRAM. Called from WSL training loop.
     Requires a local PS server running (node pokemon-showdown start --no-security).
     """
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -252,25 +254,33 @@ def _run_ps_eval(checkpoint_path: str, n_games: int, writer, global_step: int):
         print("  PS eval script not found, skipping")
         return None
 
+    # Convert WSL paths to Windows paths for Windows Python
+    win_python = "/mnt/c/Windows/py.exe"
+    win_script = script.replace("/mnt/c/", "C:/")
+    win_checkpoint = checkpoint_path.replace("/mnt/c/", "C:/")
+    win_output = os.path.join(repo_root, "ps_eval_results").replace("/mnt/c/", "C:/")
+    os.makedirs(os.path.join(repo_root, "ps_eval_results"), exist_ok=True)
+
     results = {}
-    for vs in ["heuristic", "random"]:
+    for vs in ["heuristic"]:
         try:
             proc = subprocess.run(
                 [
-                    "python3", script,
-                    "--checkpoint", checkpoint_path,
+                    win_python, "-3", win_script,
+                    "--checkpoint", win_checkpoint,
                     "--games", str(n_games),
                     "--vs", vs,
-                    "--output-dir", "/tmp/ps_eval",
+                    "--output-dir", win_output,
                 ],
                 capture_output=True, text=True, timeout=600,
+                env={**os.environ, "JAX_PLATFORMS": "cpu"},
             )
             if proc.returncode != 0:
                 print(f"  PS eval vs {vs} failed: {proc.stderr[:200]}")
                 continue
 
             import json
-            summary_path = "/tmp/ps_eval/local_summary.json"
+            summary_path = os.path.join(repo_root, "ps_eval_results", "local_summary.json")
             if os.path.exists(summary_path):
                 with open(summary_path) as f:
                     summary = json.load(f)
