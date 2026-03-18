@@ -867,6 +867,86 @@ class PokejaxPlayer(Player):
         dummy_mask = jnp.ones(N_ACTIONS, dtype=jnp.float32)
         _ = self._forward(self.params, dummy_int, dummy_float, dummy_mask)
 
+    def _stale_request_type(self, battle: AbstractBattle) -> int:
+        """Detect when poke-env calls choose_move with stale request data.
+
+        After a switch, poke-env processes |switch| (updating active_pokemon)
+        before the new |request| arrives. This means available_moves still
+        belongs to the PREVIOUS active pokemon.
+
+        Returns:
+            0: not stale
+            1: move mismatch (available_moves from different pokemon)
+            2: forced switch stale (active pokemon in available_switches)
+        """
+        active = battle.active_pokemon
+        if not active:
+            return 0
+        available_moves = battle.available_moves
+        available_switches = battle.available_switches
+        # Case 1: any available move doesn't belong to active pokemon
+        if available_moves and active.moves:
+            active_move_ids = set(m.id for m in active.moves.values())
+            # Add Hidden Power base form for variant matching
+            active_hp = set(active_move_ids)
+            for mid in active_move_ids:
+                if mid.startswith('hiddenpower'):
+                    active_hp.add('hiddenpower')
+            for m in available_moves:
+                mid = m.id
+                norm = mid if not mid.startswith('hiddenpower') else 'hiddenpower'
+                if mid not in active_hp and norm not in active_hp:
+                    return 1
+        # Case 2: forced switch but active pokemon is in available_switches
+        if not available_moves and available_switches:
+            if active in available_switches:
+                return 2
+        return 0
+
+    async def _handle_battle_request(
+        self,
+        battle: AbstractBattle,
+        from_teampreview_request: bool = False,
+        maybe_default_order: bool = False,
+    ):
+        """Override to handle stale requests after switches.
+
+        When poke-env processes |switch| + |turn| before the new |request|
+        arrives, the battle state is inconsistent (active_pokemon updated
+        from |switch| msg but available_moves from old request). We send a
+        deliberately wrong move so PS rejects it and sends the correct
+        request, avoiding running the model on garbage data.
+        """
+        if (not from_teampreview_request and not maybe_default_order
+                and not battle.teampreview):
+            stale_type = self._stale_request_type(battle)
+            if stale_type == 1:
+                # Move mismatch: send a stale move that PS will reject
+                if self.verbose:
+                    print(f"  [STALE] turn={battle.turn}: active="
+                          f"{battle.active_pokemon.species} — sending "
+                          f"rejectable move")
+                available_moves = battle.available_moves
+                if available_moves:
+                    message = self.create_order(available_moves[0]).message
+                    await self.ps_client.send_message(
+                        message, battle.battle_tag)
+                    return
+            elif stale_type == 2:
+                # Forced switch stale: switch to active (PS rejects)
+                if self.verbose:
+                    print(f"  [STALE] turn={battle.turn}: active="
+                          f"{battle.active_pokemon.species} — sending "
+                          f"rejectable switch")
+                message = self.create_order(battle.active_pokemon).message
+                await self.ps_client.send_message(message, battle.battle_tag)
+                return
+        await super()._handle_battle_request(
+            battle,
+            from_teampreview_request=from_teampreview_request,
+            maybe_default_order=maybe_default_order,
+        )
+
     def choose_move(self, battle: AbstractBattle):
         """Choose a move for the current turn."""
         try:

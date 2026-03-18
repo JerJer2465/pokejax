@@ -164,6 +164,70 @@ class TreeSearchPlayer(Player):
 
         print(f"[TreeSearch] Ready! Init took {time.time() - t0:.1f}s", flush=True)
 
+    def _stale_request_type(self, battle: AbstractBattle) -> int:
+        """Detect stale request data after switches.
+
+        Returns 0 (not stale), 1 (move mismatch), 2 (forced switch stale).
+        See PokejaxPlayer._stale_request_type for full documentation.
+        """
+        active = battle.active_pokemon
+        if not active:
+            return 0
+        available_moves = battle.available_moves
+        available_switches = battle.available_switches
+        if available_moves and active.moves:
+            active_move_ids = set(m.id for m in active.moves.values())
+            active_hp = set(active_move_ids)
+            for mid in active_move_ids:
+                if mid.startswith('hiddenpower'):
+                    active_hp.add('hiddenpower')
+            for m in available_moves:
+                mid = m.id
+                norm = mid if not mid.startswith('hiddenpower') else 'hiddenpower'
+                if mid not in active_hp and norm not in active_hp:
+                    return 1
+        if not available_moves and available_switches:
+            if active in available_switches:
+                return 2
+        return 0
+
+    async def _handle_battle_request(
+        self,
+        battle: AbstractBattle,
+        from_teampreview_request: bool = False,
+        maybe_default_order: bool = False,
+    ):
+        """Override to handle stale requests after switches.
+
+        Sends a deliberately wrong command so PS rejects it and sends
+        the correct request, avoiding running MCTS on stale data.
+        """
+        if (not from_teampreview_request and not maybe_default_order
+                and not battle.teampreview):
+            stale_type = self._stale_request_type(battle)
+            if stale_type == 1:
+                if self.verbose:
+                    print(f"  [STALE] turn={battle.turn}: sending rejectable move",
+                          flush=True)
+                available_moves = battle.available_moves
+                if available_moves:
+                    message = self.create_order(available_moves[0]).message
+                    await self.ps_client.send_message(
+                        message, battle.battle_tag)
+                    return
+            elif stale_type == 2:
+                if self.verbose:
+                    print(f"  [STALE] turn={battle.turn}: sending rejectable switch",
+                          flush=True)
+                message = self.create_order(battle.active_pokemon).message
+                await self.ps_client.send_message(message, battle.battle_tag)
+                return
+        await super()._handle_battle_request(
+            battle,
+            from_teampreview_request=from_teampreview_request,
+            maybe_default_order=maybe_default_order,
+        )
+
     def choose_move(self, battle: AbstractBattle):
         """Choose a move using MCTS search."""
         try:
