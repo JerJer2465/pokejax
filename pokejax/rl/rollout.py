@@ -343,3 +343,5 @@ def make_jit_rollout_asymmetric(model, env, tables, cfg: RolloutConfig):
         return collect_rollout(model, params, env, tables, cfg, key, opp_params=opp_params)
 
     return _jit_rollout
+
+

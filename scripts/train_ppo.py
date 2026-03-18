@@ -61,14 +61,14 @@ def main():
     parser.add_argument("--gae-lambda",  type=float, default=0.95)
     parser.add_argument("--clip-eps",    type=float, default=0.2)
     parser.add_argument("--ent-coef",    type=float, default=0.02)
-    parser.add_argument("--vf-coef",     type=float, default=0.5)
+    parser.add_argument("--vf-coef",     type=float, default=1.0)
     parser.add_argument("--n-epochs",    type=int,   default=2)
     parser.add_argument("--minibatch-size", type=int, default=8192)
     parser.add_argument("--lr-warmup",   type=int,   default=1000,
                         help="Linear LR warmup steps")
     parser.add_argument("--lr-min",      type=float, default=1e-5,
                         help="Minimum LR floor for cosine decay")
-    parser.add_argument("--ent-coef-end", type=float, default=0.001,
+    parser.add_argument("--ent-coef-end", type=float, default=0.005,
                         help="Final entropy coef after annealing")
     parser.add_argument("--ent-coef-decay-steps", type=int, default=15000,
                         help="Optimizer steps to anneal entropy coef")
@@ -77,7 +77,7 @@ def main():
     parser.add_argument("--pool-size",   type=int,   default=20)
     parser.add_argument("--pool-save-interval", type=int, default=50)
     parser.add_argument("--pool-latest-ratio",  type=float, default=0.75,
-                        help="Probability of self-play vs pool opponent")
+                        help="Probability of symmetric self-play (rest = pool)")
 
     # Eval
     parser.add_argument("--eval-interval", type=int, default=50,

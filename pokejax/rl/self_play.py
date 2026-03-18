@@ -26,7 +26,8 @@ import optax
 from pokejax.rl.model import PokeTransformer, MODEL_CONFIG
 from pokejax.rl.ppo import PPOConfig, TrainState, create_train_state, ppo_step, make_jit_ppo_epochs
 from pokejax.rl.rollout import (
-    RolloutConfig, collect_rollout, make_jit_rollout, RolloutBatch,
+    RolloutConfig, collect_rollout, make_jit_rollout,
+    make_jit_rollout_asymmetric, RolloutBatch,
 )
 
 
@@ -57,7 +58,7 @@ class TrainConfig:
     # Opponent pool config
     pool_size:         int   = 20     # max historical checkpoints in pool
     pool_save_interval: int  = 50     # save to pool every N updates
-    pool_latest_ratio:  float = 0.75  # probability of playing against latest vs pool
+    pool_latest_ratio:  float = 0.75  # probability of symmetric self-play (rest = pool)
 
     # LR warmup
     lr_warmup_steps: int = 1000      # linear warmup steps before cosine decay
@@ -404,10 +405,14 @@ def train(
         )
 
     # JIT compile rollout + PPO
-    # Symmetric self-play only — asymmetric doubles XLA memory and OOMs on 10GB.
-    # Opponent diversity comes from periodic eval checkpoints instead.
     jit_rollout = make_jit_rollout(model, env, tables, cfg.rollout)
     jit_epochs = make_jit_ppo_epochs(model, optimizer, cfg.ppo)
+
+    # Lazy-compiled asymmetric rollout for pool opponents (compiled on first use)
+    jit_rollout_asymmetric = None
+
+    # Opponent pool for historical self-play diversity
+    opponent_pool = OpponentPool(max_size=cfg.pool_size)
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
@@ -426,7 +431,8 @@ def train(
     print(f"  LR: {cfg.ppo.lr}, Gamma: {cfg.ppo.gamma}, GAE λ: {cfg.ppo.gae_lambda}")
     print(f"  Entropy coeff: {cfg.ppo.ent_coef}, Clip ε: {cfg.ppo.clip_eps}")
     print(f"  Epochs: {cfg.ppo.n_epochs}, Minibatch: {cfg.ppo.minibatch_size}")
-    print(f"  Self-play: symmetric (latest vs latest)")
+    print(f"  Opponent mix: {cfg.pool_latest_ratio:.0%} self-play, "
+          f"{1 - cfg.pool_latest_ratio:.0%} pool")
     print(f"  TensorBoard: {cfg.tensorboard_dir}/{run_name}")
     if resume_checkpoint is not None:
         print(f"  Resumed from checkpoint: update_idx={update_idx}, "
@@ -439,8 +445,26 @@ def train(
     while timesteps_collected < cfg.total_timesteps:
         key, rollout_key, ppo_key = jax.random.split(key, 3)
 
-        # Symmetric self-play: rollout + PPO, fully async on GPU
-        _, batch, info = jit_rollout(train_state.params, rollout_key)
+        # --- Opponent selection ---
+        roll = py_random.random()
+        opp_type = "self"
+
+        if roll > cfg.pool_latest_ratio and len(opponent_pool) > 0:
+            # Historical opponent from pool
+            opp_type = "pool"
+            if jit_rollout_asymmetric is None:
+                print("  [JIT] Compiling asymmetric rollout...")
+                jit_rollout_asymmetric = make_jit_rollout_asymmetric(
+                    model, env, tables, cfg.rollout
+                )
+            opp_params = opponent_pool.sample()
+            _, batch, info = jit_rollout_asymmetric(
+                train_state.params, opp_params, rollout_key
+            )
+        else:
+            # Symmetric self-play (latest vs latest)
+            _, batch, info = jit_rollout(train_state.params, rollout_key)
+
         train_state, metrics, _ = jit_epochs(train_state, batch, ppo_key)
 
         timesteps_collected += transitions_per_rollout
@@ -482,7 +506,8 @@ def train(
                   f"clip={vals['m/diagnostics/clip_fraction']:.3f}  "
                   f"wr={vals['i/win_rate']:.2f}  "
                   f"ep={vals['i/n_episodes']:.0f}  "
-                  f"SPS={sps:,.0f}")
+                  f"SPS={sps:,.0f}  "
+                  f"opp={opp_type}")
 
         # --- Eval vs heuristic + random ---
         if update_idx % cfg.eval_interval == 0:
@@ -531,6 +556,11 @@ def train(
             with open(latest_path, "wb") as f:
                 pickle.dump(ckpt, f)
             print(f"  Checkpoint saved: {path}")
+
+        # --- Save to opponent pool ---
+        if update_idx % cfg.pool_save_interval == 0:
+            opponent_pool.add(train_state.params, update_idx)
+            print(f"  Pool: saved checkpoint (pool size: {len(opponent_pool)})")
 
         # --- PS server eval ---
         if cfg.ps_eval and update_idx % cfg.ps_eval_interval == 0:
