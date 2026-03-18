@@ -105,19 +105,23 @@ def _build_type_chart(gen: int) -> np.ndarray:
         ("Grass",    "Fire"),  ("Grass",   "Grass"),    ("Grass",   "Poison"),
         ("Grass",    "Flying"),("Grass",   "Bug"),      ("Grass",   "Dragon"),
         ("Grass",    "Steel"),
-        ("Ice",      "Water"), ("Ice",     "Ice"),
-        ("Fighting", "Psychic"),("Fighting","Bug"),     ("Fighting","Fairy"),
+        ("Ice",      "Fire"),  ("Ice",     "Water"),  ("Ice",     "Ice"),
+        ("Ice",      "Steel"),
+        ("Fighting", "Poison"),("Fighting","Flying"),  ("Fighting","Psychic"),
+        ("Fighting", "Bug"),   ("Fighting","Fairy"),
         ("Poison",   "Poison"),("Poison",  "Ground"),   ("Poison",  "Rock"),
         ("Poison",   "Ghost"),
         ("Ground",   "Grass"), ("Ground",  "Bug"),
         ("Flying",   "Electric"),("Flying","Rock"),     ("Flying",  "Steel"),
         ("Psychic",  "Psychic"),("Psychic","Steel"),
-        ("Bug",      "Fire"),  ("Bug",     "Fighting"), ("Bug",     "Flying"),
-        ("Bug",      "Ghost"), ("Bug",     "Steel"),    ("Bug",     "Fairy"),
+        ("Bug",      "Fire"),  ("Bug",     "Fighting"), ("Bug",     "Poison"),
+        ("Bug",      "Flying"),("Bug",     "Ghost"),    ("Bug",     "Steel"),
+        ("Bug",      "Fairy"),
         ("Rock",     "Fighting"),("Rock",  "Ground"),   ("Rock",    "Steel"),
-        ("Ghost",    "Dark"),
+        ("Ghost",    "Dark"),  ("Ghost",   "Steel"),
         ("Dragon",   "Steel"),
-        ("Dark",     "Fighting"),("Dark",  "Dark"),     ("Dark",    "Fairy"),
+        ("Dark",     "Fighting"),("Dark",  "Dark"),     ("Dark",    "Steel"),
+        ("Dark",     "Fairy"),
         ("Steel",    "Fire"),  ("Steel",   "Water"),    ("Steel",   "Electric"),
         ("Steel",    "Steel"),
         ("Fairy",    "Fire"),  ("Fairy",   "Poison"),   ("Fairy",   "Steel"),
@@ -129,20 +133,7 @@ def _build_type_chart(gen: int) -> np.ndarray:
         ("Fighting", "Ghost"),
         ("Ground",   "Flying"),
         ("Psychic",  "Dark"),
-        ("Ghost",    "Normal"),("Ghost",   "Fighting"),
-        ("Dragon",   "Fairy"),
-        ("Dark",     "???"),   # placeholder; dark is not immune to anything real
-        ("Steel",    "Poison"),
-        ("Poison",   "Steel"),  # actually nve, but keep for clarity
-    ]
-    # Fix: the only true immunities in the main chart:
-    immune = [
-        ("Normal",   "Ghost"),
-        ("Electric", "Ground"),
-        ("Fighting", "Ghost"),
-        ("Ground",   "Flying"),
-        ("Psychic",  "Dark"),
-        ("Ghost",    "Normal"),("Ghost",   "Fighting"),
+        ("Ghost",    "Normal"),
         ("Dragon",   "Fairy"),   # Gen 6+ only (skipped below for gen<6)
         ("Poison",   "Steel"),   # Poison-type moves do 0x to Steel in Gen 2-5
     ]

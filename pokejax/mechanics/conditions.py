@@ -574,6 +574,7 @@ def apply_entry_hazards(state: BattleState, side: int, tables) -> BattleState:
     # ----------------------------------------------------------------
     tspike_layers  = state.sides_side_conditions[side, SC_TOXICSPIKES].astype(jnp.int32)
     is_poison_type = (t0 == jnp.int32(TYPE_POISON)) | (t1 == jnp.int32(TYPE_POISON))
+    is_steel_type  = (t0 == jnp.int32(TYPE_STEEL))  | (t1 == jnp.int32(TYPE_STEEL))
 
     # Grounded Poison-type absorbs the spikes (removes them)
     absorb_tspikes = is_grounded & is_poison_type & (tspike_layers > 0)
@@ -582,13 +583,15 @@ def apply_entry_hazards(state: BattleState, side: int, tables) -> BattleState:
     new_sc = state.sides_side_conditions.at[side, SC_TOXICSPIKES].set(new_tspikes)
     state  = state._replace(sides_side_conditions=new_sc)
 
-    # Apply status from toxic spikes (grounded, non-Poison-type, no existing status)
+    # Apply status from toxic spikes (grounded, non-Poison, non-Steel, no existing status)
+    # Steel types are immune to poison in all gens.
+    can_be_poisoned = ~is_poison_type & ~is_steel_type
     no_status = state.sides_team_status[side, idx] == jnp.int8(STATUS_NONE)
     tspike_status = jnp.where(
-        is_grounded & ~is_poison_type & no_status & (tspike_layers >= 2),
+        is_grounded & can_be_poisoned & no_status & (tspike_layers >= 2),
         jnp.int8(STATUS_TOX),
         jnp.where(
-            is_grounded & ~is_poison_type & no_status & (tspike_layers == 1),
+            is_grounded & can_be_poisoned & no_status & (tspike_layers == 1),
             jnp.int8(STATUS_PSN),
             state.sides_team_status[side, idx],
         ),
