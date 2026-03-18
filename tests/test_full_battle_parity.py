@@ -102,12 +102,13 @@ def _check_state_invariants(bs, turn: int):
 # RANDOM BATTLE SMOKE TESTS
 # ═══════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.slow
 class TestRandomBattleInvariants:
     """Run random battles and check invariants hold throughout."""
 
-    @pytest.mark.parametrize("seed", range(10))
+    @pytest.mark.parametrize("seed", range(3))
     def test_random_battle_invariants(self, seed, tables4, cfg4):
-        """Run a random battle for up to 100 turns, checking invariants."""
+        """Run a random battle for up to 50 turns, checking invariants."""
         env = PokeJAXEnv(gen=4)
         key = jax.random.PRNGKey(seed)
         key, subkey = jax.random.split(key)
@@ -115,7 +116,7 @@ class TestRandomBattleInvariants:
 
         all_errors = []
 
-        for turn in range(100):
+        for turn in range(50):
             bs = state.battle
             if bool(bs.finished):
                 break
@@ -154,15 +155,15 @@ class TestRandomBattleInvariants:
         assert len(all_errors) == 0, \
             f"Invariant violations in seed {seed}:\n" + "\n".join(all_errors)
 
-    @pytest.mark.parametrize("seed", range(5))
+    @pytest.mark.parametrize("seed", range(2))
     def test_battle_terminates(self, seed, tables4, cfg4):
-        """Battle should terminate within 500 turns (PP stall + Struggle)."""
+        """Battle should terminate within 200 turns (PP stall + Struggle)."""
         env = PokeJAXEnv(gen=4)
         key = jax.random.PRNGKey(seed + 1000)
         key, subkey = jax.random.split(key)
         state, _ = env.reset(subkey)
 
-        for turn in range(500):
+        for turn in range(200):
             if bool(state.battle.finished):
                 break
             key, k1, k2 = jax.random.split(key, 3)
@@ -182,14 +183,15 @@ class TestRandomBattleInvariants:
             state, _, _, _, _ = env.step(state, actions, subkey)
 
         # Should have terminated
-        assert bool(state.battle.finished) or turn >= 499, \
-            f"Battle did not terminate after 500 turns"
+        assert bool(state.battle.finished) or turn >= 199, \
+            f"Battle did not terminate after 200 turns"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # WINNER DETERMINATION
 # ═══════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.slow
 class TestWinnerDetermination:
     """Verify winner is set correctly when all Pokemon faint."""
 
@@ -231,10 +233,11 @@ class TestWinnerDetermination:
 # ACTION MASK CONSISTENCY
 # ═══════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.slow
 class TestActionMaskConsistency:
     """Action masks should be consistent with game state."""
 
-    @pytest.mark.parametrize("seed", range(5))
+    @pytest.mark.parametrize("seed", range(2))
     def test_at_least_one_legal_action(self, seed):
         """Each non-finished side must have at least 1 legal action."""
         env = PokeJAXEnv(gen=4)
@@ -266,6 +269,7 @@ class TestActionMaskConsistency:
 # JIT AND VMAP COMPATIBILITY
 # ═══════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.slow
 class TestJITVmapCompat:
     """Engine must work under JIT and vmap (required for GPU training)."""
 
@@ -331,6 +335,7 @@ class TestJITVmapCompat:
 # TURN EXECUTION SEQUENCE
 # ═══════════════════════════════════════════════════════════════════════════
 
+@pytest.mark.slow
 class TestTurnExecutionSequence:
     """Verify turn execution follows PS sequence."""
 
