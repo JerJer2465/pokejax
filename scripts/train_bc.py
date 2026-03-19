@@ -47,6 +47,9 @@ def main():
     parser.add_argument("--eval-games", type=int, default=50)
     parser.add_argument("--no-eval", action="store_true",
                         help="Skip all eval (avoids JIT recompilation overhead)")
+    parser.add_argument("--arch", type=str, default="transformer",
+                        choices=["transformer", "mlp"],
+                        help="Model architecture")
     parser.add_argument("--data-file", type=str, default=None,
                         help="Load pre-collected BC data from .npz")
     parser.add_argument("--save-data", type=str, default=None,
@@ -57,7 +60,7 @@ def main():
     print(f"Devices: {jax.devices()}")
 
     from pokejax.env.pokejax_env import PokeJAXEnv
-    from pokejax.rl.model import PokeTransformer
+    from pokejax.rl.model import PokeTransformer, create_model
     from pokejax.rl.bc import (
         BCConfig, BCBatch,
         collect_bc_data,
@@ -110,7 +113,8 @@ def main():
           f"{switch_count} switches ({100*switch_count/n_data:.1f}%)")
 
     # --- Setup model + optimizer ---
-    model = PokeTransformer()
+    model = create_model(args.arch)
+    print(f"Architecture: {args.arch} ({type(model).__name__})")
     cfg = BCConfig(
         lr=args.lr,
         batch_size=args.batch_size,
@@ -220,7 +224,7 @@ def main():
                     best_win_rate = combined_wr
                     path = os.path.join(cfg.checkpoint_dir, "bc_best.pkl")
                     with open(path, "wb") as f:
-                        pickle.dump({"params": train_state.params, "step": global_update}, f)
+                        pickle.dump({"params": train_state.params, "step": global_update, "arch": args.arch}, f)
                     print(f"  Saved best checkpoint ({combined_wr:.1%}) -> {path}")
 
         avg_loss = epoch_loss / max(n_batches, 1)
@@ -230,7 +234,7 @@ def main():
         # Save epoch checkpoint
         path = os.path.join(cfg.checkpoint_dir, "bc_latest.pkl")
         with open(path, "wb") as f:
-            pickle.dump({"params": train_state.params, "step": global_update}, f)
+            pickle.dump({"params": train_state.params, "step": global_update, "arch": args.arch}, f)
 
     # Final eval
     if not args.no_eval:
@@ -245,7 +249,7 @@ def main():
     # Save final
     path = os.path.join(cfg.checkpoint_dir, "bc_final.pkl")
     with open(path, "wb") as f:
-        pickle.dump({"params": train_state.params, "step": global_update}, f)
+        pickle.dump({"params": train_state.params, "step": global_update, "arch": args.arch}, f)
     print(f"\nSaved final checkpoint -> {path}")
     print("BC training complete.")
 

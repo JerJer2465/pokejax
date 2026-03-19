@@ -105,6 +105,11 @@ def main():
     parser.add_argument("--tensorboard-dir", type=str, default="runs")
     parser.add_argument("--print-interval",  type=int, default=10)
 
+    # Model architecture
+    parser.add_argument("--arch", type=str, default="transformer",
+                        choices=["transformer", "mlp"],
+                        help="Model architecture")
+
     parser.add_argument("--seed",        type=int,   default=42)
     args = parser.parse_args()
 
@@ -148,6 +153,7 @@ def main():
         pool_latest_ratio=args.pool_latest_ratio,
         lr_warmup_steps=args.lr_warmup,
         lr_min=args.lr_min,
+        arch=args.arch,
         ps_eval=not args.no_ps_eval,
         ps_eval_interval=args.ps_eval_interval,
         ps_eval_games=args.ps_eval_games,

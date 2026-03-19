@@ -184,18 +184,18 @@ def main():
     print(f"JAX backend: {jax.default_backend()}")
 
     from pokejax.env.pokejax_env import PokeJAXEnv
-    from pokejax.rl.model import PokeTransformer
+    from pokejax.rl.model import create_model
     from pokejax.rl.obs_builder import build_obs
     from pokejax.env.heuristic import smart_heuristic_action, random_action, _state_to_numpy
     from pokejax.env.action_mask import get_action_mask
 
     env = PokeJAXEnv(gen=args.gen, team_pool_path=args.team_pool)
     tables = env.tables
-    model = PokeTransformer()
-
     print(f"Loading checkpoint: {args.checkpoint}")
     with open(args.checkpoint, "rb") as f:
         ckpt = pickle.load(f)
+    arch = ckpt.get("arch", "transformer")
+    model = create_model(arch)
     params = ckpt["params"]
 
     # JIT compile

@@ -132,7 +132,7 @@ async def main():
              args.simulations, args.c_puct, args.opp_temperature,
              args.max_depth, args.batch_size, args.batched)
 
-    from pokejax.rl.model import PokeTransformer
+    from pokejax.rl.model import create_model
     from pokejax.data.tables import load_tables
     from pokejax.env.pokejax_env import PokeJAXEnv
     from pokejax.search.mcts import MCTSSearch
@@ -141,9 +141,10 @@ async def main():
     t_compile = time.time()
 
     tables = load_tables(args.gen)
-    model = PokeTransformer()
     with open(args.checkpoint, "rb") as f:
         ckpt = pickle.load(f)
+    arch = ckpt.get("arch", "transformer")
+    model = create_model(arch)
     params = ckpt["params"]
     env = PokeJAXEnv(gen=args.gen)
 

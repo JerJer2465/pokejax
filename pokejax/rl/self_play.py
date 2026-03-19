@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from pokejax.rl.model import PokeTransformer, MODEL_CONFIG
+from pokejax.rl.model import PokeTransformer, create_model, MODEL_CONFIG
 from pokejax.rl.ppo import PPOConfig, TrainState, create_train_state, ppo_step, make_jit_ppo_epochs
 from pokejax.rl.rollout import (
     RolloutConfig, collect_rollout, make_jit_rollout,
@@ -63,6 +63,9 @@ class TrainConfig:
     # LR warmup
     lr_warmup_steps: int = 1000      # linear warmup steps before cosine decay
     lr_min:          float = 1e-5    # minimum LR floor (cosine decay alpha)
+
+    # Model architecture
+    arch: str = "transformer"        # "transformer" or "mlp"
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +306,7 @@ def create_model_and_state(
     Uses linear warmup + cosine decay LR schedule.
     If init_params is provided (e.g. from BC), use those instead of random init.
     """
-    model = PokeTransformer()
+    model = create_model(cfg.arch)
 
     if init_params is None:
         B = 1
@@ -386,6 +389,7 @@ def train(
         "pool_size": cfg.pool_size,
         "pool_latest_ratio": cfg.pool_latest_ratio,
         "lr_warmup_steps": cfg.lr_warmup_steps,
+        "arch": cfg.arch,
     }
     writer.add_text("hyperparameters", str(hparams), 0)
 
@@ -533,6 +537,7 @@ def train(
                     "timesteps": timesteps_collected,
                     "best_win_rate": best_win_rate,
                     "eval_win_rate_heuristic": wr_h,
+                    "arch": cfg.arch,
                 }
                 path = os.path.join(cfg.checkpoint_dir, "ppo_best.pkl")
                 with open(path, "wb") as f:
@@ -548,6 +553,7 @@ def train(
                 "update_idx": update_idx,
                 "timesteps": timesteps_collected,
                 "best_win_rate": best_win_rate,
+                "arch": cfg.arch,
             }
             path = os.path.join(cfg.checkpoint_dir, f"ppo_{update_idx:06d}.pkl")
             with open(path, "wb") as f:
@@ -577,6 +583,7 @@ def train(
         "update_idx": update_idx,
         "timesteps": timesteps_collected,
         "best_win_rate": best_win_rate,
+        "arch": cfg.arch,
     }
     path = os.path.join(cfg.checkpoint_dir, "ppo_final.pkl")
     with open(path, "wb") as f:

@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from poke_env.player import Player
 from poke_env.environment import AbstractBattle
 
-from pokejax.rl.model import PokeTransformer
+from pokejax.rl.model import PokeTransformer, create_model
 from pokejax.data.tables import load_tables
 from pokejax.env.pokejax_env import PokeJAXEnv, EnvState
 from pokejax.search.battle_bridge import BattleBridge
@@ -85,13 +85,15 @@ class MctsPlayer(Player):
 
         # Load model + params
         print(f"[MctsPlayer] Loading checkpoint: {checkpoint_path}", flush=True)
-        self.model = PokeTransformer()
         if prebuilt_params is not None:
             self.params = prebuilt_params
+            arch = "transformer"
         else:
             with open(checkpoint_path, "rb") as f:
                 ckpt = pickle.load(f)
             self.params = ckpt["params"]
+            arch = ckpt.get("arch", "transformer")
+        self.model = create_model(arch)
 
         # Initialize the pokejax environment (for engine simulation)
         print("[MctsPlayer] Creating pokejax environment...", flush=True)
