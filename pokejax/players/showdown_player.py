@@ -693,6 +693,17 @@ class ObsBridge:
         available_moves = battle.available_moves
         available_switches = battle.available_switches
 
+        # poke-env sequencing fix: on turn 1, available_moves can be empty
+        # even though the active pokemon has moves (parse_request runs before
+        # |switch| sets the active pokemon). Reconstruct from pokemon.moves.
+        if not available_moves and battle.active_pokemon and battle.active_pokemon.moves:
+            available_moves = list(battle.active_pokemon.moves.values())[:4]
+        if not available_switches and battle.active_pokemon:
+            available_switches = [
+                p for p in battle.team.values()
+                if p is not battle.active_pokemon and not p.fainted
+            ]
+
         # Token 0: field
         field_feats = np.zeros(FLOAT_DIM, dtype=np.float32)
         field_feats[:FIELD_DIM] = self._encode_field(battle)
@@ -919,8 +930,7 @@ class PokejaxPlayer(Player):
 
         if len(available_switches) == 1:
             if self.verbose:
-                print(f"  [FORCED SWITCH] Only one option: "
-                      f"{available_switches[0].species}")
+                print(f"  [FORCED SWITCH] Only one option: {available_switches[0].species}")
             return self.create_order(available_switches[0])
 
         # For each candidate, build obs pretending it's active and get value
@@ -943,34 +953,41 @@ class PokejaxPlayer(Player):
                 continue
 
             # Modify obs to make this candidate appear as active:
-            # Update the float_feats for the candidate's token to mark active
+            # Update the float_feats for the candidate's token (slot+1 since
+            # token 0 is field) to mark it as active
             modified_float = base_obs["float_feats"].copy()
             modified_int = base_obs["int_ids"].copy()
 
-            # Clear is_active for all own team tokens (tokens 1-6)
+            # Clear is_active for all own Pokemon tokens (1-6)
             for s in range(6):
                 modified_float[1 + s, _OFF_IS_ACTIVE] = 0.0
+
             # Set is_active for the candidate
             modified_float[1 + candidate_slot, _OFF_IS_ACTIVE] = 1.0
 
-            # Build a plausible legal mask (all moves + valid switches)
+            # Build a legal mask as if this Pokemon were active (all moves legal)
+            # This matches what training sees after a forced switch
             sim_mask = np.zeros(N_ACTIONS, dtype=np.float32)
+            # Enable all 4 move slots (the model will see a normal state)
             for i in range(4):
-                sim_mask[i] = 1.0  # assume all moves legal
+                sim_mask[i] = 1.0
+            # Enable switches to other alive non-candidate slots
             for s in range(6):
                 p = own_team[s]
                 if (p is not None and not p.fainted and
                         p is not candidate and s != candidate_slot):
                     sim_mask[4 + s] = 1.0
+
+            # Ensure at least one action is legal
             if sim_mask.sum() == 0:
                 sim_mask[0] = 1.0
 
+            # Forward pass to get value
             int_ids = jnp.array(modified_int)
             float_feats = jnp.array(modified_float)
             legal_mask = jnp.array(sim_mask)
 
-            _, value = self._forward(self.params, int_ids, float_feats,
-                                     legal_mask)
+            _, value = self._forward(self.params, int_ids, float_feats, legal_mask)
             val = float(value)
             candidate_values.append((candidate, val))
 
@@ -980,12 +997,14 @@ class PokejaxPlayer(Player):
 
         if self.verbose:
             print(f"  [FORCED SWITCH] Value-based replacement selection:")
-            for p, v in sorted(candidate_values, key=lambda x: -x[1]):
-                marker = " <--" if p is best_pokemon else ""
-                print(f"    {p.species}: value={v:.3f}{marker}")
+            for pokemon, val in sorted(candidate_values, key=lambda x: -x[1]):
+                marker = " <--" if pokemon is best_pokemon else ""
+                print(f"    {pokemon.species}: value={val:.3f}{marker}")
 
         if best_pokemon is not None:
             return self.create_order(best_pokemon)
+
+        # Fallback: first available switch
         return self.create_order(available_switches[0])
 
     def _choose_move_impl(self, battle: AbstractBattle):
@@ -993,7 +1012,26 @@ class PokejaxPlayer(Player):
         available_moves = battle.available_moves
         available_switches = battle.available_switches
 
-        # Early return: no moves AND no switches (pre-battle request)
+        # poke-env sequencing issue: on the first turn of gen4randombattle,
+        # parse_request() runs before |switch| sets the active pokemon, so
+        # available_moves is empty even though the active pokemon has moves.
+        # Reconstruct from the active pokemon's data.
+        if not available_moves and battle.active_pokemon and battle.active_pokemon.moves:
+            available_moves = list(battle.active_pokemon.moves.values())[:4]
+            if self.verbose:
+                print(f"  Turn {battle.turn}: reconstructed available_moves from "
+                      f"{battle.active_pokemon.species}.moves: "
+                      f"{[m.id for m in available_moves]}")
+        if not available_switches and battle.active_pokemon:
+            available_switches = [
+                p for p in battle.team.values()
+                if p is not battle.active_pokemon and not p.fainted
+            ]
+            if self.verbose and available_switches:
+                print(f"  Turn {battle.turn}: reconstructed available_switches: "
+                      f"{[p.species for p in available_switches]}")
+
+        # If still no moves AND no switches, nothing to decide.
         if not available_moves and not available_switches:
             if self.verbose:
                 print(f"  Turn {battle.turn}: no moves or switches available, "

@@ -35,7 +35,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 from pokejax.env.pokejax_env import PokeJAXEnv, EnvState
 from pokejax.env.action_mask import N_ACTIONS
 from pokejax.rl.obs_builder import build_obs as build_obs_jax
-from pokejax.rl.model import PokeTransformer
+from pokejax.rl.model import PokeTransformer  # used for type hints
 
 
 class SearchResult(NamedTuple):

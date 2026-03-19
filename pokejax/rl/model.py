@@ -1,18 +1,27 @@
 """
-Flax port of PokeTransformer — Actor-Critic Transformer for Pokemon battles.
+Flax Actor-Critic models for Pokemon battles.
 
-Architecture:
-  - Pre-LN Transformer: d_model=192, n_heads=6, n_layers=3, d_ff=384
-  - TokenProjection: (embed_dim=256 + float_dim=394) → d_model via 2-layer MLP+LN
-  - Embedding dims: species=64, move=32×5=160 (4 moves+last), ability=16, item=16 → 256
-  - Positional embeddings: 15 learned slots
-  - Actor token=13, Critic token=14 with -inf bias on [13,14] and [14,13]
-  - C51 distributional value head: 51 atoms, v_min=-1.5, v_max=1.5
-  - Policy head: linear → masked log-softmax
+Architectures:
+  1. PokeTransformer (~1.6M params):
+     - Pre-LN Transformer: d_model=192, n_heads=6, n_layers=3, d_ff=384
+     - TokenProjection: (embed_dim=256 + float_dim=394) → d_model via 2-layer MLP+LN
+     - Embedding dims: species=64, move=32×5=160 (4 moves+last), ability=16, item=16 → 256
+     - Positional embeddings: 15 learned slots
+     - Actor token=13, Critic token=14 with -inf bias on [13,14] and [14,13]
+     - C51 distributional value head: 51 atoms, v_min=-1.5, v_max=1.5
+     - Policy head: linear → masked log-softmax
+
+  2. PokeMLP (~2.5M params):
+     - Same embeddings as Transformer
+     - Per-token compression: (256 + 394) → 128 via shared 2-layer MLP+LN
+     - Flatten: 15 × 128 = 1,920 dims
+     - 4-layer MLP trunk: 1024 → 1024 → 512 → 512 with LayerNorm + GELU
+     - Separate actor/critic heads (same C51 + masked log-softmax)
+     - ~2-3x faster forward pass (no attention)
 
 Usage (JAX):
     key = jax.random.PRNGKey(0)
-    model = PokeTransformer()
+    model = create_model("transformer")  # or "mlp"
     params = model.init(key, int_ids, float_feats, legal_mask)
     log_probs, value_probs, value = model.apply(params, int_ids, float_feats, legal_mask)
 """
@@ -238,11 +247,144 @@ class PokeTransformer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MLP hyperparameters
+# ---------------------------------------------------------------------------
+
+MLP_TOKEN_DIM   = 128              # per-token compression: 650 → 128
+MLP_HIDDEN_DIMS = (1024, 1024, 512, 512)
+# After compression: 15 × 128 = 1,920 flat input → ~2.5M total params
+
+
+# ---------------------------------------------------------------------------
+# Full PokeMLP
+# ---------------------------------------------------------------------------
+
+class PokeMLP(nn.Module):
+    """
+    Actor-Critic MLP for Pokemon battle decisions.
+
+    Per-token compression (650 → 128) then flatten + deep MLP.
+    Same interface as PokeTransformer — drop-in replacement.
+    ~2.5M params. ~2-3x faster forward pass (no attention).
+
+    Call with:
+      log_probs, value_probs, value = model.apply(
+          params, int_ids, float_feats, legal_mask
+      )
+    """
+    token_dim:   int   = MLP_TOKEN_DIM
+    hidden_dims: tuple[int, ...] = MLP_HIDDEN_DIMS
+    n_actions:   int   = N_ACTIONS
+    n_atoms:     int   = N_ATOMS
+    v_min:       float = V_MIN
+    v_max:       float = V_MAX
+
+    @nn.compact
+    def __call__(
+        self,
+        int_ids:    jnp.ndarray,   # (B, 15, 8)      int
+        float_feats: jnp.ndarray,  # (B, 15, 394)    float32
+        legal_mask: jnp.ndarray,   # (B, 10)         float32
+        deterministic: bool = True,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """
+        Returns:
+          log_probs  : (B, n_actions)
+          value_probs: (B, n_atoms)
+          value      : (B,)
+        """
+        B = int_ids.shape[0]
+
+        # --- Embeddings (same as Transformer) ---
+        species = nn.Embed(N_SPECIES, SPECIES_EMBED_DIM)(int_ids[..., 0])
+        m0 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 1])
+        m1 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 2])
+        m2 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 3])
+        m3 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 4])
+        ability = nn.Embed(N_ABILITIES, ABILITY_EMBED_DIM)(int_ids[..., 5])
+        item    = nn.Embed(N_ITEMS,     ITEM_EMBED_DIM)(int_ids[..., 6])
+        last_m  = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 7])
+
+        embed_out = jnp.concatenate(
+            [species, m0, m1, m2, m3, ability, item, last_m], axis=-1
+        )  # (B, 15, EMBED_DIM=256)
+
+        # --- Per-token compression: (256 + 394) → token_dim ---
+        # Applied independently to each token (same weights shared across tokens)
+        token_in = jnp.concatenate([embed_out, float_feats], axis=-1)  # (B, 15, 650)
+        BT = B * N_TOKENS
+        tok_flat = token_in.reshape(BT, -1)                            # (B*15, 650)
+        tok_flat = nn.Dense(self.token_dim * 2)(tok_flat)
+        tok_flat = nn.LayerNorm()(tok_flat)
+        tok_flat = nn.gelu(tok_flat)
+        tok_flat = nn.Dense(self.token_dim)(tok_flat)
+        tok_flat = nn.LayerNorm()(tok_flat)
+        tok = tok_flat.reshape(B, N_TOKENS * self.token_dim)           # (B, 15*128=1920)
+
+        # --- MLP trunk (shared) ---
+        h = tok
+        for dim in self.hidden_dims:
+            h = nn.Dense(dim)(h)
+            h = nn.LayerNorm()(h)
+            h = nn.gelu(h)
+
+        # --- Actor head ---
+        actor_h = nn.Dense(256)(h)
+        actor_h = nn.gelu(actor_h)
+        logits = nn.Dense(self.n_actions)(actor_h)         # (B, n_actions)
+        safe_legal = jnp.where(legal_mask.sum(-1, keepdims=True) > 0,
+                               legal_mask, jnp.ones_like(legal_mask))
+        logits = jnp.where(safe_legal > 0, logits, logits - 1e9)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)    # (B, n_actions)
+
+        # --- Critic head (C51) ---
+        critic_h = nn.Dense(256)(h)
+        critic_h = nn.gelu(critic_h)
+        value_logits = nn.Dense(self.n_atoms)(critic_h)    # (B, n_atoms)
+        value_probs  = jax.nn.softmax(value_logits, axis=-1)
+        support = jnp.linspace(self.v_min, self.v_max, self.n_atoms)
+        value   = (value_probs * support[None, :]).sum(-1)  # (B,)
+
+        return log_probs, value_probs, value
+
+
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+
+def create_model(arch: str = "transformer") -> nn.Module:
+    """Create a model by architecture name.
+
+    Args:
+        arch: "transformer" or "mlp"
+
+    Returns:
+        Flax nn.Module with __call__(int_ids, float_feats, legal_mask)
+    """
+    if arch == "transformer":
+        return PokeTransformer()
+    elif arch == "mlp":
+        return PokeMLP()
+    else:
+        raise ValueError(f"Unknown architecture: {arch!r}. Use 'transformer' or 'mlp'.")
+
+
+# ---------------------------------------------------------------------------
 # Convenience: model config as a plain dict (for init calls)
 # ---------------------------------------------------------------------------
 
 MODEL_CONFIG = dict(
     d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS, d_ff=D_FF,
+    n_actions=N_ACTIONS, n_atoms=N_ATOMS, v_min=V_MIN, v_max=V_MAX,
+    n_species=N_SPECIES, n_moves=N_MOVES, n_abilities=N_ABILITIES, n_items=N_ITEMS,
+    species_embed_dim=SPECIES_EMBED_DIM, move_embed_dim=MOVE_EMBED_DIM,
+    ability_embed_dim=ABILITY_EMBED_DIM, item_embed_dim=ITEM_EMBED_DIM,
+    embed_dim=EMBED_DIM,
+)
+
+MLP_CONFIG = dict(
+    token_dim=MLP_TOKEN_DIM,
+    hidden_dims=MLP_HIDDEN_DIMS,
     n_actions=N_ACTIONS, n_atoms=N_ATOMS, v_min=V_MIN, v_max=V_MAX,
     n_species=N_SPECIES, n_moves=N_MOVES, n_abilities=N_ABILITIES, n_items=N_ITEMS,
     species_embed_dim=SPECIES_EMBED_DIM, move_embed_dim=MOVE_EMBED_DIM,

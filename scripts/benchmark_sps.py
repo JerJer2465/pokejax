@@ -14,7 +14,7 @@ print(f"JAX backend: {jax.default_backend()}")
 print(f"Devices: {jax.devices()}")
 
 from pokejax.env.pokejax_env import PokeJAXEnv
-from pokejax.rl.model import PokeTransformer
+from pokejax.rl.model import PokeTransformer, create_model
 from pokejax.rl.rollout import RolloutConfig, make_jit_rollout
 from pokejax.rl.ppo import PPOConfig, make_jit_ppo_epochs
 from pokejax.rl.self_play import create_model_and_state, TrainConfig

@@ -33,15 +33,16 @@ def main():
     print(f"JAX backend: {jax.default_backend()}")
 
     from pokejax.env.pokejax_env import PokeJAXEnv
-    from pokejax.rl.model import PokeTransformer
+    from pokejax.rl.model import create_model
     from pokejax.rl.bc import eval_vs_random, eval_vs_heuristic
 
     env = PokeJAXEnv(gen=args.gen, team_pool_path=args.team_pool)
-    model = PokeTransformer()
 
     print(f"Loading checkpoint: {args.checkpoint}")
     with open(args.checkpoint, "rb") as f:
         ckpt = pickle.load(f)
+    arch = ckpt.get("arch", "transformer")
+    model = create_model(arch)
     params = ckpt["params"]
     step = ckpt.get("step", "?")
     print(f"  Step: {step}")
