@@ -1,10 +1,10 @@
 """
 Behavioral Cloning (BC) for PokeJAX.
 
-Collects (obs, expert_action) pairs from heuristic vs random battles,
+Collects (obs, expert_action) pairs from heuristic vs random/heuristic battles,
 then trains the PokeTransformer via supervised cross-entropy loss.
 
-Data collection uses JIT-compiled heuristic + random opponent for GPU speed.
+Data collection is fully vectorized (vmap + lax.scan) for GPU speed.
 The training loop is also JIT-compiled.
 """
 
@@ -54,6 +54,211 @@ class BCBatch(NamedTuple):
     actions: np.ndarray      # (B,) int32
 
 
+# ---------------------------------------------------------------------------
+# Vectorized BC data collection (vmap + lax.scan, fully on GPU)
+# ---------------------------------------------------------------------------
+
+class _BCStepCarry(NamedTuple):
+    env_state: EnvState
+    key: jnp.ndarray
+
+class _BCStepOutput(NamedTuple):
+    int_ids: jnp.ndarray      # (15, 8)
+    float_feats: jnp.ndarray  # (15, 394)
+    legal_mask: jnp.ndarray   # (10,)
+    action: jnp.ndarray       # scalar int32
+    valid: jnp.ndarray        # scalar bool (True if game was active)
+
+
+def collect_bc_data_vectorized(
+    env: PokeJAXEnv,
+    n_envs: int = 512,
+    n_steps: int = 256,
+    seed: int = 0,
+    teacher_side: int = 0,
+    opp_mode: str = "random",
+    verbose: bool = True,
+) -> BCBatch:
+    """
+    Collect BC training data fully on GPU using vmap + lax.scan.
+
+    Runs n_envs games in parallel for n_steps each, collecting
+    (obs, heuristic_action) pairs at every step. Auto-resets finished
+    games so all steps produce useful data.
+
+    Args:
+        env: PokeJAXEnv instance
+        n_envs: number of parallel environments (vmap width)
+        n_steps: steps per environment (lax.scan length)
+        seed: random seed
+        teacher_side: which side the heuristic plays (0 or 1)
+        opp_mode: "random" or "heuristic" — opponent policy
+        verbose: print progress
+
+    Returns:
+        BCBatch with n_envs * n_steps transitions
+    """
+    tables = env.tables
+    opp_side = 1 - teacher_side
+
+    # Pre-build heuristic move categories BEFORE JIT to avoid tracer leaks.
+    # The heuristic caches these by id(tables), but during JIT tracing
+    # the cached values become stale tracers. Force-build them as concrete
+    # JAX arrays here so they are captured as constants in the JIT closure.
+    from pokejax.rl.heuristic import _build_move_categories
+    _build_move_categories(tables)
+
+    def _bc_step(carry: _BCStepCarry, _) -> tuple[_BCStepCarry, _BCStepOutput]:
+        env_state, key = carry
+        key, heur_key, opp_key, step_key, reset_key = jax.random.split(key, 5)
+
+        state = env_state.battle
+        reveal = env_state.reveal
+
+        # Build observation for teacher
+        obs = build_obs(state, reveal, teacher_side, tables)
+
+        # Teacher picks action via heuristic
+        teacher_action = heuristic_action(state, teacher_side, tables, heur_key)
+
+        # Opponent picks action
+        if opp_mode == "heuristic":
+            opp_action = heuristic_action(state, opp_side, tables, opp_key)
+        else:
+            opp_action = random_action(state, opp_side, opp_key)
+
+        # Assemble actions array
+        actions = jnp.zeros(2, dtype=jnp.int32)
+        actions = actions.at[teacher_side].set(teacher_action)
+        actions = actions.at[opp_side].set(opp_action)
+
+        # Track whether game is active (valid data point)
+        valid = ~state.finished
+
+        # Step environment
+        new_env_state, _, _, _, _ = env.step(env_state, actions, step_key)
+
+        # Auto-reset if game finished
+        reset_state, _ = env.reset(reset_key)
+        done = new_env_state.battle.finished
+        final_env_state = jax.tree.map(
+            lambda r, n: jnp.where(done, r, n),
+            reset_state, new_env_state,
+        )
+
+        output = _BCStepOutput(
+            int_ids=obs["int_ids"],
+            float_feats=obs["float_feats"],
+            legal_mask=obs["legal_mask"],
+            action=teacher_action.astype(jnp.int32),
+            valid=valid,
+        )
+
+        return _BCStepCarry(env_state=final_env_state, key=key), output
+
+    # Build the full vectorized collection function.
+    # Use a fixed chunk size (32 envs × 64 steps) that compiles quickly,
+    # then run multiple chunks to reach the desired total.
+    CHUNK_ENVS = min(n_envs, 32)
+    CHUNK_STEPS = min(n_steps, 64)
+    n_rounds = max(1, (n_envs * n_steps) // (CHUNK_ENVS * CHUNK_STEPS))
+
+    def _collect_one_env(init_carry: _BCStepCarry) -> _BCStepOutput:
+        _, outputs = jax.lax.scan(_bc_step, init_carry, None, length=CHUNK_STEPS)
+        return outputs
+
+    if verbose:
+        chunk_total = CHUNK_ENVS * CHUNK_STEPS
+        print(f"  Vectorized BC: {n_rounds} rounds × "
+              f"({CHUNK_ENVS} envs × {CHUNK_STEPS} steps = {chunk_total}), "
+              f"opp={opp_mode}")
+
+    import time as _time
+
+    # JIT the chunk-sized vmap+scan pipeline (compiles once, reused for all rounds)
+    @jax.jit
+    def _collect_chunk(key):
+        env_keys = jax.random.split(key, CHUNK_ENVS + 1)
+        master_key, env_keys = env_keys[0], env_keys[1:]
+
+        init_states, _ = jax.vmap(env.reset)(env_keys)
+
+        scan_keys = jax.random.split(master_key, CHUNK_ENVS)
+        init_carries = jax.vmap(lambda s, k: _BCStepCarry(env_state=s, key=k))(
+            init_states, scan_keys,
+        )
+
+        outputs = jax.vmap(_collect_one_env)(init_carries)
+        return outputs  # each field: (CHUNK_ENVS, CHUNK_STEPS, ...)
+
+    # Warmup / compile
+    if verbose:
+        print(f"  JIT compiling chunk ({CHUNK_ENVS} × {CHUNK_STEPS})...")
+    t0 = _time.time()
+    key = jax.random.PRNGKey(seed)
+    key, warmup_key = jax.random.split(key)
+    warmup_out = _collect_chunk(warmup_key)
+    jax.block_until_ready(warmup_out.action)
+    if verbose:
+        print(f"  Compiled in {_time.time() - t0:.1f}s. Collecting {n_rounds} rounds...")
+
+    # Run all rounds, accumulating results on CPU
+    all_int_ids = []
+    all_float_feats = []
+    all_legal_mask = []
+    all_actions = []
+    all_valid = []
+
+    t0 = _time.time()
+    for r in range(n_rounds):
+        key, round_key = jax.random.split(key)
+        outputs = _collect_chunk(round_key)
+
+        chunk_sz = CHUNK_ENVS * CHUNK_STEPS
+        all_int_ids.append(np.array(outputs.int_ids.reshape(chunk_sz, 15, 8)))
+        all_float_feats.append(np.array(outputs.float_feats.reshape(chunk_sz, 15, 394)))
+        all_legal_mask.append(np.array(outputs.legal_mask.reshape(chunk_sz, 10)))
+        all_actions.append(np.array(outputs.action.reshape(chunk_sz)))
+        all_valid.append(np.array(outputs.valid.reshape(chunk_sz)))
+
+        if verbose and (r + 1) % max(1, n_rounds // 10) == 0:
+            elapsed = _time.time() - t0
+            collected = (r + 1) * chunk_sz
+            rate = collected / max(elapsed, 0.001)
+            print(f"  Round {r+1}/{n_rounds}: {collected:,} transitions "
+                  f"({rate:.0f} trans/s)")
+
+    elapsed = _time.time() - t0
+    total_collected = n_rounds * CHUNK_ENVS * CHUNK_STEPS
+    if verbose:
+        print(f"  Collection done in {elapsed:.1f}s ({total_collected:,} total, "
+              f"{total_collected/max(elapsed,0.001):.0f} trans/s)")
+
+    # Concatenate and filter valid
+    int_ids_flat = np.concatenate(all_int_ids)
+    float_feats_flat = np.concatenate(all_float_feats)
+    legal_mask_flat = np.concatenate(all_legal_mask)
+    actions_flat = np.concatenate(all_actions)
+    valid_flat = np.concatenate(all_valid)
+
+    valid_idx = np.where(valid_flat)[0]
+    n_valid = len(valid_idx)
+    if verbose:
+        print(f"  Valid transitions: {n_valid}/{total_collected} "
+              f"({100*n_valid/total_collected:.1f}%)")
+
+    return BCBatch(
+        int_ids=int_ids_flat[valid_idx],
+        float_feats=float_feats_flat[valid_idx],
+        legal_mask=legal_mask_flat[valid_idx],
+        actions=actions_flat[valid_idx].astype(np.int32),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy sequential collection (kept for compatibility)
+# ---------------------------------------------------------------------------
+
 def collect_bc_data(
     env: PokeJAXEnv,
     n_transitions: int,
@@ -68,6 +273,8 @@ def collect_bc_data(
     teacher_side: which side the heuristic plays (0 or 1).
 
     Returns BCBatch with n_transitions samples.
+
+    NOTE: Prefer collect_bc_data_vectorized() for much faster GPU collection.
     """
     tables = env.tables
     key = jax.random.PRNGKey(seed)
