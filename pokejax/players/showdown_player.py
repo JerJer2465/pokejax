@@ -84,14 +84,17 @@ for _attr, _val in [("SNOW", 4), ("DESOLATELAND", 1),
         pass
 
 # Volatile status mapping for float features
+# Must match _VOL_MAP in pokejax/rl/obs_builder.py exactly.
+# Indices 11, 13, 14, 19, 22, 24 are unmapped in training (always 0)
+# so we must NOT write to them during PS inference either.
 _VOLATILE_NAMES = {
     "confusion": 0, "infatuation": 1, "leechseed": 2, "curse": 3,
     "aquaring": 4, "ingrain": 5, "taunt": 6, "encore": 7,
-    "flinch": 8, "embargo": 9, "healblock": 10, "magnetrise": 11,
-    "partiallytrapped": 12, "perishsong": 13, "powertrick": 14,
+    "flinch": 8, "embargo": 9, "healblock": 10,
+    "partiallytrapped": 12,
     "substitute": 15, "yawn": 16, "focusenergy": 17, "charge": 18,
-    "stockpile": 19, "torment": 20, "nightmare": 21, "imprison": 22,
-    "mustrecharge": 23, "twoturnmove": 24, "destinybond": 25, "grudge": 26,
+    "torment": 20, "nightmare": 21,
+    "mustrecharge": 23, "destinybond": 25, "grudge": 26,
 }
 
 _N_VOLATILE = 27
@@ -690,6 +693,17 @@ class ObsBridge:
         available_moves = battle.available_moves
         available_switches = battle.available_switches
 
+        # poke-env sequencing fix: on turn 1, available_moves can be empty
+        # even though the active pokemon has moves (parse_request runs before
+        # |switch| sets the active pokemon). Reconstruct from pokemon.moves.
+        if not available_moves and battle.active_pokemon and battle.active_pokemon.moves:
+            available_moves = list(battle.active_pokemon.moves.values())[:4]
+        if not available_switches and battle.active_pokemon:
+            available_switches = [
+                p for p in battle.team.values()
+                if p is not battle.active_pokemon and not p.fainted
+            ]
+
         # Token 0: field
         field_feats = np.zeros(FLOAT_DIM, dtype=np.float32)
         field_feats[:FIELD_DIM] = self._encode_field(battle)
@@ -998,9 +1012,26 @@ class PokejaxPlayer(Player):
         available_moves = battle.available_moves
         available_switches = battle.available_switches
 
-        # Early return: no moves AND no switches (pre-battle request before
-        # full team is populated, e.g. first |request| in gen4randombattle).
-        # Nothing meaningful to decide — skip the model entirely.
+        # poke-env sequencing issue: on the first turn of gen4randombattle,
+        # parse_request() runs before |switch| sets the active pokemon, so
+        # available_moves is empty even though the active pokemon has moves.
+        # Reconstruct from the active pokemon's data.
+        if not available_moves and battle.active_pokemon and battle.active_pokemon.moves:
+            available_moves = list(battle.active_pokemon.moves.values())[:4]
+            if self.verbose:
+                print(f"  Turn {battle.turn}: reconstructed available_moves from "
+                      f"{battle.active_pokemon.species}.moves: "
+                      f"{[m.id for m in available_moves]}")
+        if not available_switches and battle.active_pokemon:
+            available_switches = [
+                p for p in battle.team.values()
+                if p is not battle.active_pokemon and not p.fainted
+            ]
+            if self.verbose and available_switches:
+                print(f"  Turn {battle.turn}: reconstructed available_switches: "
+                      f"{[p.species for p in available_switches]}")
+
+        # If still no moves AND no switches, nothing to decide.
         if not available_moves and not available_switches:
             if self.verbose:
                 print(f"  Turn {battle.turn}: no moves or switches available, "

@@ -90,6 +90,29 @@ async def main():
             """Instrumented version with full diagnostics."""
             available_moves = battle.available_moves
             available_switches = battle.available_switches
+
+            # poke-env sequencing fix: reconstruct from active pokemon data
+            reconstructed = False
+            if not available_moves and battle.active_pokemon and battle.active_pokemon.moves:
+                available_moves = list(battle.active_pokemon.moves.values())[:4]
+                reconstructed = True
+            if not available_switches and battle.active_pokemon:
+                available_switches = [
+                    p for p in battle.team.values()
+                    if p is not battle.active_pokemon and not p.fainted
+                ]
+                if not reconstructed:
+                    reconstructed = bool(available_switches)
+
+            # If still no moves AND no switches, nothing to decide.
+            if not available_moves and not available_switches:
+                print(f"\n{'='*70}")
+                print(f"Turn {battle.turn} | No moves or switches available")
+                print(f"  battle.team count: {len(battle.team)}")
+                print(f"  Skipping model, using default move")
+                self._diag_turns += 1
+                return self.choose_default_move()
+
             trapped = battle.trapped if hasattr(battle, 'trapped') else False
             active = battle.active_pokemon
 
