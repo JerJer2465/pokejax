@@ -39,7 +39,7 @@ try:
 except ImportError:
     Effect = None
 
-from pokejax.rl.model import PokeTransformer
+from pokejax.rl.model import PokeTransformer, create_model
 from pokejax.data.tables import load_tables
 
 
@@ -84,14 +84,17 @@ for _attr, _val in [("SNOW", 4), ("DESOLATELAND", 1),
         pass
 
 # Volatile status mapping for float features
+# Must match _VOL_MAP in pokejax/rl/obs_builder.py exactly.
+# Indices 11, 13, 14, 19, 22, 24 are unmapped in training (always 0)
+# so we must NOT write to them during PS inference either.
 _VOLATILE_NAMES = {
     "confusion": 0, "infatuation": 1, "leechseed": 2, "curse": 3,
     "aquaring": 4, "ingrain": 5, "taunt": 6, "encore": 7,
-    "flinch": 8, "embargo": 9, "healblock": 10, "magnetrise": 11,
-    "partiallytrapped": 12, "perishsong": 13, "powertrick": 14,
+    "flinch": 8, "embargo": 9, "healblock": 10,
+    "partiallytrapped": 12,
     "substitute": 15, "yawn": 16, "focusenergy": 17, "charge": 18,
-    "stockpile": 19, "torment": 20, "nightmare": 21, "imprison": 22,
-    "mustrecharge": 23, "twoturnmove": 24, "destinybond": 25, "grudge": 26,
+    "torment": 20, "nightmare": 21,
+    "mustrecharge": 23, "destinybond": 25, "grudge": 26,
 }
 
 _N_VOLATILE = 27
@@ -856,9 +859,10 @@ class PokejaxPlayer(Player):
         self.obs_bridge = ObsBridge(self.tables)
 
         # Load model and checkpoint
-        self.model = PokeTransformer()
         with open(checkpoint_path, "rb") as f:
             ckpt = pickle.load(f)
+        arch = ckpt.get("arch", "transformer")
+        self.model = create_model(arch)
         self.params = ckpt["params"]
 
         # JIT compile the forward pass
@@ -890,10 +894,116 @@ class PokejaxPlayer(Player):
                 print(f"  Error in choose_move: {e}, using default")
             return self.choose_default_move()
 
+    def _is_forced_switch(self, battle: AbstractBattle) -> bool:
+        """Detect forced switch: no moves available, only switches.
+
+        In the pokejax training engine, forced switches after fainting are
+        handled transparently (auto-switch to first alive slot). The model
+        was never trained on forced-switch-only states, so its switch
+        probabilities are meaningless in this situation. We use a value-based
+        heuristic instead.
+        """
+        return (not battle.available_moves and
+                len(battle.available_switches) > 0)
+
+    def _choose_forced_switch(self, battle: AbstractBattle):
+        """Choose the best replacement Pokemon using value-based evaluation.
+
+        For each available switch target, we build an observation as if that
+        Pokemon were already active, run the model to get a value estimate,
+        and pick the switch target with the highest value. This is more
+        principled than the model's untrained forced-switch distribution.
+        """
+        available_switches = battle.available_switches
+        own_team = self.obs_bridge._get_stable_team_order(battle, is_own=True)
+
+        if len(available_switches) == 1:
+            if self.verbose:
+                print(f"  [FORCED SWITCH] Only one option: "
+                      f"{available_switches[0].species}")
+            return self.create_order(available_switches[0])
+
+        # For each candidate, build obs pretending it's active and get value
+        best_pokemon = None
+        best_value = -float('inf')
+        candidate_values = []
+
+        # Build base obs once for the field/opponent tokens
+        base_obs = self.obs_bridge.build_obs(battle)
+
+        for candidate in available_switches:
+            # Find candidate's slot in own_team
+            candidate_slot = None
+            for slot_idx, p in enumerate(own_team):
+                if p is not None and p is candidate:
+                    candidate_slot = slot_idx
+                    break
+
+            if candidate_slot is None:
+                continue
+
+            # Modify obs to make this candidate appear as active:
+            # Update the float_feats for the candidate's token to mark active
+            modified_float = base_obs["float_feats"].copy()
+            modified_int = base_obs["int_ids"].copy()
+
+            # Clear is_active for all own team tokens (tokens 1-6)
+            for s in range(6):
+                modified_float[1 + s, _OFF_IS_ACTIVE] = 0.0
+            # Set is_active for the candidate
+            modified_float[1 + candidate_slot, _OFF_IS_ACTIVE] = 1.0
+
+            # Build a plausible legal mask (all moves + valid switches)
+            sim_mask = np.zeros(N_ACTIONS, dtype=np.float32)
+            for i in range(4):
+                sim_mask[i] = 1.0  # assume all moves legal
+            for s in range(6):
+                p = own_team[s]
+                if (p is not None and not p.fainted and
+                        p is not candidate and s != candidate_slot):
+                    sim_mask[4 + s] = 1.0
+            if sim_mask.sum() == 0:
+                sim_mask[0] = 1.0
+
+            int_ids = jnp.array(modified_int)
+            float_feats = jnp.array(modified_float)
+            legal_mask = jnp.array(sim_mask)
+
+            _, value = self._forward(self.params, int_ids, float_feats,
+                                     legal_mask)
+            val = float(value)
+            candidate_values.append((candidate, val))
+
+            if val > best_value:
+                best_value = val
+                best_pokemon = candidate
+
+        if self.verbose:
+            print(f"  [FORCED SWITCH] Value-based replacement selection:")
+            for p, v in sorted(candidate_values, key=lambda x: -x[1]):
+                marker = " <--" if p is best_pokemon else ""
+                print(f"    {p.species}: value={v:.3f}{marker}")
+
+        if best_pokemon is not None:
+            return self.create_order(best_pokemon)
+        return self.create_order(available_switches[0])
+
     def _choose_move_impl(self, battle: AbstractBattle):
         """Internal move selection logic."""
         available_moves = battle.available_moves
         available_switches = battle.available_switches
+
+        # Early return: no moves AND no switches (pre-battle request)
+        if not available_moves and not available_switches:
+            if self.verbose:
+                print(f"  Turn {battle.turn}: no moves or switches available, "
+                      f"using default move")
+            return self.choose_default_move()
+
+        # Detect forced switch (after faint): use value-based heuristic
+        # instead of the model's untrained forced-switch distribution
+        if self._is_forced_switch(battle):
+            return self._choose_forced_switch(battle)
 
         # Check if trapped (can't switch)
         trapped = battle.trapped if hasattr(battle, 'trapped') else False
