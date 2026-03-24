@@ -620,64 +620,24 @@ def _encode_field(state: BattleState, player: int) -> jnp.ndarray:
 def _build_legal_mask(state: BattleState, player: int, tables) -> jnp.ndarray:
     """Return float32[10] legal action mask for player.
 
-    Marks moves as illegal when they would have no effect:
-      - Hazard moves when opponent's side already has max layers
-      - Status moves targeting foe when foe has a Substitute
+    Only masks moves that are truly illegal (no PP, disabled, choice-locked, etc.).
+    Moves that would fail (hazards at max layers, status vs Substitute) are NOT
+    masked — the model should learn these waste a turn, matching Pokemon Showdown
+    behavior where they are selectable but fail.
     """
-    from pokejax.data.move_effects_data import ME_HAZARD
-    from pokejax.core.damage import MF_CATEGORY, MF_TARGET
-
-    _CATEGORY_STATUS = jnp.int32(2)
-    # Target types that do NOT target the foe (self/field/side)
-    _TARGET_SELF      = jnp.int32(1)
-    _TARGET_ALL       = jnp.int32(8)
-    _TARGET_ALLY_TEAM = jnp.int32(9)
-    _TARGET_FOE_SIDE  = jnp.int32(10)
-    _TARGET_ALLY_SIDE = jnp.int32(11)
-
     s = player
     opp = 1 - player
     active_idx = state.sides_active_idx[s]
-    opp_active_idx = state.sides_active_idx[opp]
 
     pp  = state.sides_team_move_pp[s, active_idx]            # int8[4]
     dis = state.sides_team_move_disabled[s, active_idx]       # bool[4]
     move_legal = (pp > jnp.int8(0)) & (~dis)
 
-    # Check if opponent's active has a Substitute
-    opp_has_sub = (state.sides_team_volatiles[opp, opp_active_idx]
-                   & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
-
-    move_ids = state.sides_team_move_ids[s, active_idx]       # int16[4]
-    for i in range(4):
-        mid = move_ids[i].astype(jnp.int32)
-        eff_type = tables.move_effects[mid, 0].astype(jnp.int32)
-
-        # --- Hazard moves at max layers ---
-        is_hazard = eff_type == jnp.int32(ME_HAZARD)
-        sc_idx = tables.move_effects[mid, 1].astype(jnp.int32)
-        max_layers = tables.move_effects[mid, 2].astype(jnp.int32)
-        sc_idx_clamped = jnp.clip(sc_idx, 0, 9)
-        cur_layers = state.sides_side_conditions[opp, sc_idx_clamped].astype(jnp.int32)
-        at_max = cur_layers >= max_layers
-        blocked_hazard = is_hazard & at_max
-
-        # --- Status moves vs Substitute ---
-        move_cat = tables.moves[mid, MF_CATEGORY].astype(jnp.int32)
-        move_tgt = tables.moves[mid, MF_TARGET].astype(jnp.int32)
-        is_status = move_cat == _CATEGORY_STATUS
-        targets_foe = ~(
-            (move_tgt == _TARGET_SELF) |
-            (move_tgt == _TARGET_ALL) |
-            (move_tgt == _TARGET_ALLY_TEAM) |
-            (move_tgt == _TARGET_FOE_SIDE) |
-            (move_tgt == _TARGET_ALLY_SIDE)
-        )
-        blocked_sub = is_status & targets_foe & opp_has_sub
-
-        move_legal = move_legal.at[i].set(
-            jnp.where(blocked_hazard | blocked_sub, jnp.bool_(False), move_legal[i])
-        )
+    # NOTE: We intentionally do NOT mask hazard moves at max layers or status
+    # moves vs Substitute here. The model should learn from the engine that
+    # these moves fail/waste a turn, rather than being shielded from them.
+    # This avoids train/test distribution mismatch with Pokemon Showdown,
+    # which allows these moves to be selected (they just fail).
 
     fainted_arr = state.sides_team_fainted[s]                 # bool[6]
     is_active_arr = state.sides_team_is_active[s]             # bool[6]

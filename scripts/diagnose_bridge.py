@@ -22,7 +22,7 @@ async def main():
 
     from poke_env import LocalhostServerConfiguration, AccountConfiguration
     from poke_env.player import RandomPlayer
-    from poke_env.environment import AbstractBattle, Pokemon, Move
+    from poke_env.battle import AbstractBattle, Pokemon, Move
 
     from pokejax.players.showdown_player import PokejaxPlayer, ObsBridge
     import jax.numpy as jnp

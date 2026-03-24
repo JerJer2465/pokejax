@@ -66,6 +66,7 @@ ABCOND_BP_TECHNICIAN  = jnp.int8(1)   # if bp ≤ 60 → ×1.5
 ABCOND_BP_IRON_FIST   = jnp.int8(2)   # if punch_flag → ×1.2
 ABCOND_BP_RECKLESS    = jnp.int8(3)   # if recoil → ×1.2
 ABCOND_BP_STARTER     = jnp.int8(4)   # if move_type==_AB_BP_TYPE && low_hp → ×1.5
+ABCOND_BP_FLASH_FIRE  = jnp.int8(5)   # if VOL_FLASH_FIRE set && move is Fire → ×1.5
 
 # ModifyDef conditions
 ABCOND_DEF_NONE         = jnp.int8(0)
@@ -209,7 +210,8 @@ EFF_SAP_SIPPER            = 4
 EFF_STORM_DRAIN           = 5
 EFF_LIGHTNING_ROD         = 6
 EFF_DRY_SKIN_ABSORB       = 7
-_N_TRYHIT_STATE_EFFS      = 8
+EFF_FLASH_FIRE            = 8
+_N_TRYHIT_STATE_EFFS      = 9
 
 # Contact punishment effect IDs (state-mutating):
 EFF_CONTACT_NOOP          = 0
@@ -407,6 +409,15 @@ def run_event_base_power(relay: jnp.ndarray, state: BattleState,
         ab_type = _AB_BP_TYPE[aid].astype(jnp.int32)
         relay = relay * jnp.where(
             (cond == ABCOND_BP_STARTER) & (move_type == ab_type) & low_hp,
+            jnp.float32(1.5), jnp.float32(1.0)
+        )
+
+        # Flash Fire: if VOL_FLASH_FIRE bit is set on attacker AND move is Fire-type → ×1.5
+        from pokejax.types import TYPE_FIRE as _TYPE_FIRE, VOL_FLASH_FIRE as _VOL_FLASH_FIRE
+        ff_mask = jnp.uint32(1 << _VOL_FLASH_FIRE)
+        ff_active = (state.sides_team_volatiles[atk_side, atk_idx] & ff_mask) != jnp.uint32(0)
+        relay = relay * jnp.where(
+            (cond == ABCOND_BP_FLASH_FIRE) & ff_active & (move_type == jnp.int32(_TYPE_FIRE)),
             jnp.float32(1.5), jnp.float32(1.0)
         )
 

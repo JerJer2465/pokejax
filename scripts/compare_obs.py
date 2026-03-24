@@ -14,7 +14,7 @@ sys.stdout = open(sys.stdout.fileno(), 'w', buffering=1, closefd=False)
 async def main():
     from poke_env import LocalhostServerConfiguration, AccountConfiguration
     from poke_env.player import RandomPlayer
-    from poke_env.environment import AbstractBattle
+    from poke_env.battle import AbstractBattle
     from pokejax.players.showdown_player import PokejaxPlayer, ObsBridge
     import jax.numpy as jnp
 

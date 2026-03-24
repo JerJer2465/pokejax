@@ -23,7 +23,8 @@ from pokejax.types import (
     BOOST_ATK, BOOST_DEF, BOOST_SPA, BOOST_SPD, BOOST_SPE,
     STATUS_BRN, STATUS_PAR, STATUS_NONE,
     WEATHER_RAIN, WEATHER_SUN, WEATHER_NONE,
-    TYPE_WATER, TYPE_ELECTRIC, TYPE_GROUND, TYPE_GRASS, TYPE_NORMAL,
+    TYPE_WATER, TYPE_ELECTRIC, TYPE_GROUND, TYPE_GRASS, TYPE_NORMAL, TYPE_FIRE,
+    VOL_FLASH_FIRE,
 )
 from pokejax.data.tables import load_tables
 from pokejax.config import GenConfig
@@ -664,3 +665,107 @@ class TestDamageIntegration:
         # Huge Power should roughly double damage (within 10% due to rounding)
         ratio = float(dmg_hp) / max(1, float(dmg_no))
         assert 1.8 <= ratio <= 2.2, f"Expected ~2x damage ratio, got {ratio:.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Flash Fire ability tests
+# ---------------------------------------------------------------------------
+
+class TestFlashFire:
+    """Flash Fire: immune to Fire moves; absorbing one sets VOL_FLASH_FIRE boost (+1.5× Fire BP)."""
+
+    def _patch_tables_fire(self):
+        """Patch events._TABLES_REF so move 0 has TYPE_FIRE."""
+        from pokejax.mechanics import events as ev_mod
+        from pokejax.core.damage import MF_TYPE
+        from dataclasses import replace as dc_replace
+        if ev_mod._TABLES_REF is None:
+            return None
+        move_data_np = np.array(ev_mod._TABLES_REF.moves)
+        move_data_np[0, MF_TYPE] = TYPE_FIRE
+        patched = dc_replace(ev_mod._TABLES_REF, moves=jnp.array(move_data_np))
+        original = ev_mod._TABLES_REF
+        ev_mod._TABLES_REF = patched
+        return original
+
+    def _restore_tables(self, original):
+        from pokejax.mechanics import events as ev_mod
+        ev_mod._TABLES_REF = original
+
+    def test_flash_fire_cancels_fire_move(self, tables, cfg):
+        """Flash Fire defender should be immune to Fire-type moves."""
+        from pokejax.mechanics import events as ev_mod
+        if ev_mod._TABLES_REF is None:
+            pytest.skip("events._TABLES_REF not set")
+        state = _make_state(tables, cfg, p2_ability=_ABILITY_IDS["Flash Fire"])
+        atk_idx = state.sides_active_idx[0]
+        def_idx = state.sides_active_idx[1]
+        orig = self._patch_tables_fire()
+        try:
+            _, cancelled = run_event_try_hit(
+                jnp.bool_(True), state, 0, atk_idx, 1, def_idx, _dummy_move_id()
+            )
+        finally:
+            self._restore_tables(orig)
+        assert bool(cancelled) is True
+
+    def test_flash_fire_absorb_sets_volatile(self, tables, cfg):
+        """Absorbing a Fire move sets VOL_FLASH_FIRE on the defender."""
+        state = _make_state(tables, cfg, p2_ability=_ABILITY_IDS["Flash Fire"])
+        state2 = run_event_try_hit_state(
+            state, 0, jnp.int32(0), 1, jnp.int32(0),
+            jnp.int16(0), jnp.int32(TYPE_FIRE)
+        )
+        ff_mask = jnp.uint32(1 << VOL_FLASH_FIRE)
+        ff_active = (state2.sides_team_volatiles[1, 0] & ff_mask) != jnp.uint32(0)
+        assert bool(ff_active) is True
+
+    def test_flash_fire_absorb_no_volatile_on_non_fire(self, tables, cfg):
+        """Absorbing a non-Fire move does NOT set VOL_FLASH_FIRE."""
+        state = _make_state(tables, cfg, p2_ability=_ABILITY_IDS["Flash Fire"])
+        state2 = run_event_try_hit_state(
+            state, 0, jnp.int32(0), 1, jnp.int32(0),
+            jnp.int16(0), jnp.int32(TYPE_WATER)
+        )
+        ff_mask = jnp.uint32(1 << VOL_FLASH_FIRE)
+        ff_active = (state2.sides_team_volatiles[1, 0] & ff_mask) != jnp.uint32(0)
+        assert bool(ff_active) is False
+
+    def test_flash_fire_boosts_fire_bp_when_active(self, tables, cfg):
+        """With VOL_FLASH_FIRE set, Fire-type move BP should be boosted by ×1.5."""
+        from pokejax.mechanics import events as ev_mod
+        if ev_mod._TABLES_REF is None:
+            pytest.skip("events._TABLES_REF not set")
+        state = _make_state(tables, cfg, p1_ability=_ABILITY_IDS["Flash Fire"])
+        # Manually set VOL_FLASH_FIRE on attacker (side 0, slot 0)
+        ff_mask = jnp.uint32(1 << VOL_FLASH_FIRE)
+        new_vols = state.sides_team_volatiles.at[0, 0].set(ff_mask)
+        state = state._replace(sides_team_volatiles=new_vols)
+        atk_idx = state.sides_active_idx[0]
+        def_idx = state.sides_active_idx[1]
+        orig = self._patch_tables_fire()
+        try:
+            relay_with = run_event_base_power(
+                jnp.float32(80.0), state, 0, atk_idx, 1, def_idx, _dummy_move_id()
+            )
+        finally:
+            self._restore_tables(orig)
+        assert float(relay_with) == pytest.approx(120.0, abs=0.5)  # 80 × 1.5
+
+    def test_flash_fire_no_boost_without_volatile(self, tables, cfg):
+        """Without VOL_FLASH_FIRE set, Fire-type move BP is unchanged."""
+        from pokejax.mechanics import events as ev_mod
+        if ev_mod._TABLES_REF is None:
+            pytest.skip("events._TABLES_REF not set")
+        state = _make_state(tables, cfg, p1_ability=_ABILITY_IDS["Flash Fire"])
+        # VOL_FLASH_FIRE NOT set (volatiles = 0)
+        atk_idx = state.sides_active_idx[0]
+        def_idx = state.sides_active_idx[1]
+        orig = self._patch_tables_fire()
+        try:
+            relay_without = run_event_base_power(
+                jnp.float32(80.0), state, 0, atk_idx, 1, def_idx, _dummy_move_id()
+            )
+        finally:
+            self._restore_tables(orig)
+        assert float(relay_without) == pytest.approx(80.0, abs=0.5)  # unchanged

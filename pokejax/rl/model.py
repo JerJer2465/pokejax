@@ -8,7 +8,7 @@ Architectures:
      - Embedding dims: species=64, move=32×5=160 (4 moves+last), ability=16, item=16 → 256
      - Positional embeddings: 15 learned slots
      - Actor token=13, Critic token=14 with -inf bias on [13,14] and [14,13]
-     - C51 distributional value head: 51 atoms, v_min=-1.5, v_max=1.5
+     - C51 distributional value head: 51 atoms, v_min=-2.5, v_max=2.5
      - Policy head: linear → masked log-softmax
 
   2. PokeMLP (~2.5M params):
@@ -56,8 +56,8 @@ EMBED_DIM          = SPECIES_EMBED_DIM + 4 * MOVE_EMBED_DIM + ABILITY_EMBED_DIM 
 
 # C51 parameters
 N_ATOMS  = 51
-V_MIN    = -1.5
-V_MAX    =  1.5
+V_MIN    = -2.5    # wider support: returns can reach ±1.95 with PBRS shaping
+V_MAX    =  2.5
 
 ACTOR_IDX  = 13
 CRITIC_IDX = 14
@@ -272,12 +272,16 @@ class PokeMLP(nn.Module):
           params, int_ids, float_feats, legal_mask
       )
     """
-    token_dim:   int   = MLP_TOKEN_DIM
-    hidden_dims: tuple[int, ...] = MLP_HIDDEN_DIMS
-    n_actions:   int   = N_ACTIONS
-    n_atoms:     int   = N_ATOMS
-    v_min:       float = V_MIN
-    v_max:       float = V_MAX
+    token_dim:         int   = MLP_TOKEN_DIM
+    hidden_dims:       tuple[int, ...] = MLP_HIDDEN_DIMS
+    species_embed_dim: int   = SPECIES_EMBED_DIM
+    move_embed_dim:    int   = MOVE_EMBED_DIM
+    ability_embed_dim: int   = ABILITY_EMBED_DIM
+    item_embed_dim:    int   = ITEM_EMBED_DIM
+    n_actions:         int   = N_ACTIONS
+    n_atoms:           int   = N_ATOMS
+    v_min:             float = V_MIN
+    v_max:             float = V_MAX
 
     @nn.compact
     def __call__(
@@ -295,15 +299,15 @@ class PokeMLP(nn.Module):
         """
         B = int_ids.shape[0]
 
-        # --- Embeddings (same as Transformer) ---
-        species = nn.Embed(N_SPECIES, SPECIES_EMBED_DIM)(int_ids[..., 0])
-        m0 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 1])
-        m1 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 2])
-        m2 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 3])
-        m3 = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 4])
-        ability = nn.Embed(N_ABILITIES, ABILITY_EMBED_DIM)(int_ids[..., 5])
-        item    = nn.Embed(N_ITEMS,     ITEM_EMBED_DIM)(int_ids[..., 6])
-        last_m  = nn.Embed(N_MOVES, MOVE_EMBED_DIM)(int_ids[..., 7])
+        # --- Embeddings (configurable dims for HP tuning) ---
+        species = nn.Embed(N_SPECIES, self.species_embed_dim)(int_ids[..., 0])
+        m0 = nn.Embed(N_MOVES, self.move_embed_dim)(int_ids[..., 1])
+        m1 = nn.Embed(N_MOVES, self.move_embed_dim)(int_ids[..., 2])
+        m2 = nn.Embed(N_MOVES, self.move_embed_dim)(int_ids[..., 3])
+        m3 = nn.Embed(N_MOVES, self.move_embed_dim)(int_ids[..., 4])
+        ability = nn.Embed(N_ABILITIES, self.ability_embed_dim)(int_ids[..., 5])
+        item    = nn.Embed(N_ITEMS,     self.item_embed_dim)(int_ids[..., 6])
+        last_m  = nn.Embed(N_MOVES, self.move_embed_dim)(int_ids[..., 7])
 
         embed_out = jnp.concatenate(
             [species, m0, m1, m2, m3, ability, item, last_m], axis=-1
@@ -352,19 +356,21 @@ class PokeMLP(nn.Module):
 # Model factory
 # ---------------------------------------------------------------------------
 
-def create_model(arch: str = "transformer") -> nn.Module:
+def create_model(arch: str = "transformer", **model_kwargs) -> nn.Module:
     """Create a model by architecture name.
 
     Args:
         arch: "transformer" or "mlp"
+        **model_kwargs: forwarded to the model constructor (e.g. token_dim,
+            hidden_dims, species_embed_dim for PokeMLP).
 
     Returns:
         Flax nn.Module with __call__(int_ids, float_feats, legal_mask)
     """
     if arch == "transformer":
-        return PokeTransformer()
+        return PokeTransformer(**model_kwargs)
     elif arch == "mlp":
-        return PokeMLP()
+        return PokeMLP(**model_kwargs)
     else:
         raise ValueError(f"Unknown architecture: {arch!r}. Use 'transformer' or 'mlp'.")
 

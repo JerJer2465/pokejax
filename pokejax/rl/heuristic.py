@@ -62,20 +62,14 @@ def _normalize(name: str) -> str:
 # Pre-computed move category lookup arrays (built once per Tables instance)
 # ---------------------------------------------------------------------------
 
-_CACHED_CATS = {}
-
 def _build_move_categories(tables: Tables):
     """Build boolean JAX arrays: is_sleep[move_id], is_para[move_id], etc.
-    Cached by id(tables) to avoid recomputation."""
-    tid = id(tables)
-    if tid in _CACHED_CATS:
-        return _CACHED_CATS[tid]
-    result = _build_move_categories_impl(tables)
-    _CACHED_CATS[tid] = result
-    return result
 
-def _build_move_categories_impl(tables: Tables):
-    """Build boolean JAX arrays: is_sleep[move_id], is_para[move_id], etc."""
+    No global caching — called inside JAX-traced functions (jax.lax.scan),
+    so cached jnp arrays from a previous trace become stale tracers and
+    cause UnexpectedTracerError. The computation is cheap (string lookups)
+    and JAX's XLA compilation cache handles the real deduplication.
+    """
     n = len(tables.move_names)
     cats = {}
     for cat_name, name_set in [
@@ -401,6 +395,57 @@ def heuristic_action(state: BattleState, side: int, tables: Tables,
     fallback = jnp.argmax(mask.astype(jnp.int32)).astype(jnp.int32)
     action = jnp.where(mask[action], action, fallback)
 
+    return action
+
+
+# ---------------------------------------------------------------------------
+# MaxPower action: always pick highest base power move (pure JAX)
+# ---------------------------------------------------------------------------
+
+def maxpower_action(state: BattleState, side: int, tables: Tables,
+                    rng_key: jnp.ndarray) -> jnp.ndarray:
+    """
+    Pick the highest-damage legal move, ignoring type effectiveness.
+    Falls back to random legal action if no moves are legal.
+    Forces the model to learn defensive play and switching.
+    """
+    moves_table = tables.moves
+    type_chart = tables.type_chart
+    mask = get_action_mask(state, side)
+    active_idx = state.sides_active_idx[side]
+    opp = 1 - side
+    opp_active_idx = state.sides_active_idx[opp]
+
+    own_types = state.sides_team_types[side, active_idx]
+    opp_types = state.sides_team_types[opp, opp_active_idx]
+
+    scores = jnp.full(10, -1e9, dtype=jnp.float32)
+    n_moves = moves_table.shape[0]
+
+    for m in range(4):
+        move_id = state.sides_team_move_ids[side, active_idx, m].astype(jnp.int32)
+        safe_id = jnp.clip(move_id, 0, n_moves - 1)
+        row = moves_table[safe_id]
+        bp = row[MF_BASE_POWER].astype(jnp.float32)
+        move_type = row[MF_TYPE].astype(jnp.int32)
+
+        # STAB bonus
+        stab = jnp.where(
+            (move_type == own_types[0]) | ((own_types[1] > 0) & (move_type == own_types[1])),
+            1.5, 1.0,
+        )
+        # Type effectiveness
+        eff = _type_eff(move_type, opp_types[0], opp_types[1], type_chart)
+
+        score = bp * stab * eff
+        score = jnp.where(mask[m] & (move_id >= 0), score, -1e9)
+        scores = scores.at[m].set(score)
+
+    # No switching — always attacks
+    action = jnp.argmax(scores[:4]).astype(jnp.int32)
+    # Fallback to any legal action if no move is legal
+    fallback = jnp.argmax(mask.astype(jnp.int32)).astype(jnp.int32)
+    action = jnp.where(mask[action], action, fallback)
     return action
 
 

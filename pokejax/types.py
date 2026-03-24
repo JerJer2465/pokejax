@@ -167,6 +167,7 @@ VOL_DESTINYBOND   = 27
 VOL_GRUDGE        = 28
 VOL_POWEROFALOOFONE = 29  # placeholder for future
 VOL_PERISH        = 30  # perish song counter (data = turns remaining, faints at 0)
+VOL_FLASH_FIRE    = 31  # Flash Fire boost active (set when absorbing a Fire move)
 
 # ---------------------------------------------------------------------------
 # State NamedTuples

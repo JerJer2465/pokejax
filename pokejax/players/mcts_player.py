@@ -25,7 +25,10 @@ import jax
 import jax.numpy as jnp
 
 from poke_env.player import Player
-from poke_env.environment import AbstractBattle
+try:
+    from poke_env.battle import AbstractBattle
+except ModuleNotFoundError:
+    from poke_env.environment import AbstractBattle
 
 from pokejax.rl.model import PokeTransformer, create_model
 from pokejax.data.tables import load_tables

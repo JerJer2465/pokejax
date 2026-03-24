@@ -19,7 +19,7 @@ import jax.numpy as jnp
 
 from pokejax.types import (
     BattleState,
-    VOL_CHARGING, VOL_SUBSTITUTE, CATEGORY_STATUS,
+    VOL_CHARGING, VOL_PROTECT, VOL_SUBSTITUTE, CATEGORY_STATUS,
     TYPE_NONE, STATUS_FRZ, STATUS_NONE,
     WEATHER_SAND, WEATHER_HAIL,
     CATEGORY_PHYSICAL,
@@ -31,7 +31,7 @@ from pokejax.core.damage import (
     MF_SEC_CHANCE, MF_SEC_STATUS, MF_SEC_BOOST_STAT, MF_SEC_BOOST_AMT,
     MF_DRAIN_NUM, MF_DRAIN_DEN,
     MF_RECOIL_NUM, MF_RECOIL_DEN, MF_HEAL_NUM, MF_HEAL_DEN,
-    MF_FLAGS_LO, FLAG_DEFROST,
+    MF_FLAGS_LO, MF_TARGET, FLAG_DEFROST, FLAG_PROTECT,
 )
 from pokejax.core.state import set_fainted
 from pokejax.core.damage import apply_heal, fraction_of_max_hp
@@ -70,7 +70,7 @@ def step1_invulnerability(state: BattleState,
     return is_charging  # True = cancelled (target is invulnerable)
 
 
-def step2_try_hit(state: BattleState,
+def step2_try_hit(tables, state: BattleState,
                    atk_side: int, atk_idx: jnp.ndarray,
                    def_side: int, def_idx: jnp.ndarray,
                    move_id: jnp.ndarray,
@@ -88,6 +88,30 @@ def step2_try_hit(state: BattleState,
     Returns (relay, cancelled, new_state).
     """
     relay = jnp.bool_(True)
+
+    # --- Protect check (Showdown Step 2) ---
+    # If the defender has Protect active and the move has the protect flag
+    # (i.e., is blockable by Protect), cancel the move.
+    # Self-targeting and field/side-targeting moves are never blocked.
+    def_vols = state.sides_team_volatiles[def_side, def_idx]
+    defender_protected = (def_vols & jnp.uint32(1 << VOL_PROTECT)) != jnp.uint32(0)
+
+    move_id_i32 = move_id.astype(jnp.int32)
+    flags_lo = tables.moves[move_id_i32, MF_FLAGS_LO].astype(jnp.int32)
+    move_has_protect_flag = (flags_lo & jnp.int32(FLAG_PROTECT)) != jnp.int32(0)
+
+    move_target = tables.moves[move_id_i32, MF_TARGET].astype(jnp.int32)
+    targets_opponent = ~(
+        (move_target == jnp.int32(_TARGET_SELF)) |
+        (move_target == jnp.int32(_TARGET_ALL)) |
+        (move_target == jnp.int32(_TARGET_ALLY_TEAM)) |
+        (move_target == jnp.int32(_TARGET_FOE_SIDE)) |
+        (move_target == jnp.int32(_TARGET_ALLY_SIDE))
+    )
+
+    protect_blocks = defender_protected & move_has_protect_flag & targets_opponent
+    cancelled = cancelled | protect_blocks
+
     relay, new_cancel = run_event_try_hit(
         relay, state, atk_side, atk_idx, def_side, def_idx, move_id
     )
@@ -515,7 +539,7 @@ def execute_move_hit(tables, state: BattleState,
     # Step 2: TryHit (protection/absorption + state-mutating effects).
     # move_type_i32 is forwarded so absorption abilities (Water Absorb, Volt Absorb,
     # Sap Sipper, Motor Drive, etc.) can match on the correct move type.
-    _, cancelled, state = step2_try_hit(state, atk_side, atk_idx, def_side, def_idx,
+    _, cancelled, state = step2_try_hit(tables, state, atk_side, atk_idx, def_side, def_idx,
                                          move_id, cancelled, move_type_i32)
 
     # Step 3: Type immunity — skipped for self/field-targeting moves

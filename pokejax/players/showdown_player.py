@@ -23,21 +23,26 @@ import jax
 import jax.numpy as jnp
 
 from poke_env.player import Player
-from poke_env.environment import (
-    AbstractBattle,
-    Pokemon,
-    Move,
-    Weather,
-    Field,
-    SideCondition,
-    PokemonType,
-    Status,
-)
+
+# poke-env 0.12 moved types from poke_env.environment to poke_env.battle
+try:
+    from poke_env.battle import (
+        AbstractBattle, Pokemon, Move, Weather, Field,
+        SideCondition, PokemonType, Status,
+    )
+except ModuleNotFoundError:
+    from poke_env.environment import (  # poke-env 0.8
+        AbstractBattle, Pokemon, Move, Weather, Field,
+        SideCondition, PokemonType, Status,
+    )
 
 try:
-    from poke_env.environment import Effect
-except ImportError:
-    Effect = None
+    from poke_env.battle import Effect
+except (ModuleNotFoundError, ImportError):
+    try:
+        from poke_env.environment import Effect
+    except (ModuleNotFoundError, ImportError):
+        Effect = None
 
 from pokejax.rl.model import PokeTransformer, create_model
 from pokejax.data.tables import load_tables
@@ -511,8 +516,12 @@ class ObsBridge:
         buf[_OFF_PERISH_BIN + perish_count] = 1.0
 
         # Protect count — match training: min(prot_data, 4) / 4
-        # poke-env doesn't track successive protect count; default 0
-        buf[_OFF_PROTECT] = 0.0
+        # Use externally-set counter if available (set by PokejaxPlayer)
+        protect_count = getattr(self, '_protect_counter_value', 0)
+        if is_own and is_active:
+            buf[_OFF_PROTECT] = min(protect_count, 4) / 4.0
+        else:
+            buf[_OFF_PROTECT] = 0.0
 
         # Locked move (choice item lock or outrage/petal dance)
         # Match training: checks VOL_LOCKEDMOVE | VOL_CHOICELOCK bits
@@ -693,11 +702,20 @@ class ObsBridge:
         available_moves = battle.available_moves
         available_switches = battle.available_switches
 
-        # poke-env sequencing fix: on turn 1, available_moves can be empty
-        # even though the active pokemon has moves (parse_request runs before
-        # |switch| sets the active pokemon). Reconstruct from pokemon.moves.
+        # poke-env sequencing fix: parse_request() runs before |switch| sets
+        # the active pokemon, so available_moves can be empty. Reconstruct
+        # from the raw request data to respect choice-lock and disabled moves.
         if not available_moves and battle.active_pokemon and battle.active_pokemon.moves:
-            available_moves = list(battle.active_pokemon.moves.values())[:4]
+            last_req = getattr(battle, '_last_request', None)
+            active_req = None
+            if last_req and 'active' in last_req:
+                active_req = last_req['active'][0]
+            if active_req:
+                available_moves = battle.active_pokemon.available_moves_from_request(
+                    active_req
+                )
+            else:
+                available_moves = list(battle.active_pokemon.moves.values())[:4]
         if not available_switches and battle.active_pokemon:
             available_switches = [
                 p for p in battle.team.values()
@@ -799,6 +817,8 @@ class ObsBridge:
         # Move actions 0-3: legal if the move (by slot order) is in available_moves
         # Use move.id string matching (not object identity) to handle poke-env
         # creating new Move objects for variants like Hidden Power Ice
+        # NOTE: We do NOT mask hazards at max layers or substitute when one exists.
+        # The model learns these waste a turn (matching both training and PS behavior).
         available_move_names = set(m.id for m in available_moves)
         for i, m in enumerate(own_move_list[:4]):
             if m is not None and m.id in available_move_names:
@@ -865,6 +885,11 @@ class PokejaxPlayer(Player):
         self.temperature = temperature
         self.verbose = verbose
 
+        # Track consecutive protect count per battle for observation accuracy
+        # Key: battle_tag, Value: int (consecutive protect count for active mon)
+        self._protect_counter: Dict[str, int] = {}
+        self._last_action_was_protect: Dict[str, bool] = {}
+
         # Load tables and obs bridge
         self.tables = load_tables(gen)
         self.obs_bridge = ObsBridge(self.tables)
@@ -906,16 +931,32 @@ class PokejaxPlayer(Player):
             return self.choose_default_move()
 
     def _is_forced_switch(self, battle: AbstractBattle) -> bool:
-        """Detect forced switch: no moves available, only switches.
+        """Detect forced switch: fainted pokemon OR U-turn/Volt Switch/Baton Pass.
 
         In the pokejax training engine, forced switches after fainting are
         handled transparently (auto-switch to first alive slot). The model
         was never trained on forced-switch-only states, so its switch
         probabilities are meaningless in this situation. We use a value-based
         heuristic instead.
+
+        We check both battle.force_switch (covers U-turn, Volt Switch, Baton
+        Pass, etc.) and active.fainted (covers KO'd pokemon).
         """
-        return (not battle.available_moves and
-                len(battle.available_switches) > 0)
+        # poke-env's force_switch flag covers all forced-switch scenarios:
+        # fainted pokemon, U-turn, Volt Switch, Baton Pass, etc.
+        if battle.force_switch:
+            return True
+        active = battle.active_pokemon
+        if active is not None and not active.fainted:
+            return False
+        # Active is fainted or None — check if we have switches available
+        available_switches = battle.available_switches
+        if not available_switches and active is not None:
+            available_switches = [
+                p for p in battle.team.values()
+                if p is not active and not p.fainted
+            ]
+        return len(available_switches) > 0
 
     def _choose_forced_switch(self, battle: AbstractBattle):
         """Choose the best replacement Pokemon using value-based evaluation.
@@ -1011,13 +1052,28 @@ class PokejaxPlayer(Player):
         """Internal move selection logic."""
         available_moves = battle.available_moves
         available_switches = battle.available_switches
+        trapped = getattr(battle, 'trapped', False)
 
-        # poke-env sequencing issue: on the first turn of gen4randombattle,
-        # parse_request() runs before |switch| sets the active pokemon, so
-        # available_moves is empty even though the active pokemon has moves.
-        # Reconstruct from the active pokemon's data.
+        # poke-env sequencing issue: parse_request() runs before |switch|
+        # sets the active pokemon, so available_moves can be empty even though
+        # the request has moves. Reconstruct from the raw request data, which
+        # respects choice-lock (Outrage), disabled moves, and trapped state.
         if not available_moves and battle.active_pokemon and battle.active_pokemon.moves:
-            available_moves = list(battle.active_pokemon.moves.values())[:4]
+            last_req = getattr(battle, '_last_request', None)
+            active_req = None
+            if last_req and 'active' in last_req:
+                active_req = last_req['active'][0]
+            if active_req:
+                # Use available_moves_from_request which filters disabled moves
+                available_moves = battle.active_pokemon.available_moves_from_request(
+                    active_req
+                )
+                # Also fix trapped state if the request says so
+                if active_req.get('trapped'):
+                    trapped = True
+            else:
+                # Fallback: use all known moves
+                available_moves = list(battle.active_pokemon.moves.values())[:4]
             if self.verbose:
                 print(f"  Turn {battle.turn}: reconstructed available_moves from "
                       f"{battle.active_pokemon.species}.moves: "
@@ -1043,8 +1099,18 @@ class PokejaxPlayer(Player):
         if self._is_forced_switch(battle):
             return self._choose_forced_switch(battle)
 
-        # Check if trapped (can't switch)
-        trapped = battle.trapped if hasattr(battle, 'trapped') else False
+        # Update protect counter for observation
+        btag = battle.battle_tag if hasattr(battle, 'battle_tag') else ""
+        if btag not in self._protect_counter:
+            self._protect_counter[btag] = 0
+            self._last_action_was_protect[btag] = False
+
+        # If last action was NOT protect, reset counter
+        if not self._last_action_was_protect.get(btag, False):
+            self._protect_counter[btag] = 0
+
+        # Set counter on obs bridge so _encode_pokemon can use it
+        self.obs_bridge._protect_counter_value = self._protect_counter[btag]
 
         # Build observation (also stores _last_own_team and _last_own_move_list)
         obs = self.obs_bridge.build_obs(battle)
@@ -1102,41 +1168,61 @@ class PokejaxPlayer(Player):
                     pname = own_team[slot].species if slot < len(own_team) and own_team[slot] else "?"
                     print(f"    switch {slot} ({pname}): {probs[a]*100:.1f}%{marker}")
 
-        # Map action to poke-env order using stable slot mappings
+        # Map action to poke-env order using stable slot mappings.
+        # Try the top action first; if invalid (desync), fall back to next-best.
         own_team = self.obs_bridge._last_own_team
         own_move_list = self.obs_bridge._last_own_move_list
         active_pokemon = battle.active_pokemon
+        available_switch_set = set(id(p) for p in available_switches)
+        available_move_ids = set(m.id for m in available_moves)
 
-        if action < 4:
-            # Move action: action i = move slot i from pokemon.moves dict order
-            if action < len(own_move_list) and own_move_list[action] is not None:
-                chosen_move_id = own_move_list[action].id
-                # Find the matching Move in available_moves by string ID
-                # (poke-env may create new objects for variants like Hidden Power)
-                for m in available_moves:
-                    if m.id == chosen_move_id:
-                        return self.create_order(m)
-            # Fallback: try to find any legal move
-            if available_moves:
-                return self.create_order(available_moves[0])
-        else:
-            # Switch action: action 4+slot = switch to Pokemon at team slot
-            slot = action - 4
-            if slot < len(own_team) and own_team[slot] is not None:
-                target_pokemon = own_team[slot]
-                # Safety: never switch to the active pokemon
-                if target_pokemon is active_pokemon:
-                    if self.verbose:
-                        print(f"  [BUG] Model chose switch to active "
-                              f"{active_pokemon.species} (slot {slot}), "
-                              f"falling back")
-                elif target_pokemon in available_switches:
-                    return self.create_order(target_pokemon)
-            # Fallback: try to find any legal switch
-            if available_switches:
-                return self.create_order(available_switches[0])
+        # Build sorted action list by probability (greedy fallback)
+        masked_probs_all = probs * np.array(obs["legal_mask"])
+        sorted_actions = list(np.argsort(-masked_probs_all))
 
-        # Ultimate fallback
+        def _track_and_return(order, move_id=None):
+            """Track protect usage for counter, then return the order."""
+            is_protect = move_id in ("protect", "detect")
+            self._last_action_was_protect[btag] = is_protect
+            if is_protect:
+                self._protect_counter[btag] = self._protect_counter.get(btag, 0) + 1
+            return order
+
+        for act in sorted_actions:
+            if masked_probs_all[act] <= 0:
+                break  # no more legal actions
+
+            if act < 4:
+                # Move action
+                if act < len(own_move_list) and own_move_list[act] is not None:
+                    chosen_move_id = own_move_list[act].id
+                    if chosen_move_id in available_move_ids:
+                        for m in available_moves:
+                            if m.id == chosen_move_id:
+                                return _track_and_return(
+                                    self.create_order(m), chosen_move_id)
+                    elif self.verbose:
+                        print(f"  [DESYNC] move {act} ({chosen_move_id}) not in "
+                              f"available_moves, trying next action")
+            else:
+                # Switch action
+                slot = act - 4
+                if slot < len(own_team) and own_team[slot] is not None:
+                    target = own_team[slot]
+                    if target is active_pokemon:
+                        if self.verbose:
+                            print(f"  [DESYNC] switch to active "
+                                  f"{active_pokemon.species}, trying next action")
+                        continue
+                    if id(target) in available_switch_set:
+                        return _track_and_return(
+                            self.create_order(target), "switch")
+                    elif self.verbose:
+                        print(f"  [DESYNC] switch to {target.species} not in "
+                              f"available_switches, trying next action")
+
+        # Ultimate fallback: pick first available action
+        self._last_action_was_protect[btag] = False
         if available_moves:
             return self.create_order(available_moves[0])
         if available_switches:

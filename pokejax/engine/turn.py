@@ -193,17 +193,37 @@ def execute_turn(
     new_moved = jnp.zeros((2, 6), dtype=jnp.bool_)
     new_times_atk = jnp.zeros((2, 6), dtype=jnp.int8)
     # Clear Protect volatile (lasts 1 turn) and Flinch
+    # Also reset the consecutive Protect counter if Protect was NOT used last turn.
     from pokejax.types import VOL_PROTECT, VOL_FLINCH
     p0_idx = state.sides_active_idx[0]
     p1_idx = state.sides_active_idx[1]
+
+    # Check if Protect was active last turn (before clearing)
+    p0_had_protect = (state.sides_team_volatiles[0, p0_idx]
+                      & jnp.uint32(1 << VOL_PROTECT)) != jnp.uint32(0)
+    p1_had_protect = (state.sides_team_volatiles[1, p1_idx]
+                      & jnp.uint32(1 << VOL_PROTECT)) != jnp.uint32(0)
+
     vols0 = state.sides_team_volatiles[0, p0_idx] & ~jnp.uint32(1 << VOL_PROTECT) & ~jnp.uint32(1 << VOL_FLINCH)
     vols1 = state.sides_team_volatiles[1, p1_idx] & ~jnp.uint32(1 << VOL_PROTECT) & ~jnp.uint32(1 << VOL_FLINCH)
     new_vols = state.sides_team_volatiles.at[0, p0_idx].set(vols0).at[1, p1_idx].set(vols1)
+
+    # Reset protect counter to 0 if Protect was NOT used last turn
+    new_vol_data = state.sides_team_volatile_data
+    p0_prot_ctr = jnp.where(p0_had_protect,
+                             new_vol_data[0, p0_idx, VOL_PROTECT],
+                             jnp.int8(0))
+    p1_prot_ctr = jnp.where(p1_had_protect,
+                             new_vol_data[1, p1_idx, VOL_PROTECT],
+                             jnp.int8(0))
+    new_vol_data = new_vol_data.at[0, p0_idx, VOL_PROTECT].set(p0_prot_ctr)
+    new_vol_data = new_vol_data.at[1, p1_idx, VOL_PROTECT].set(p1_prot_ctr)
 
     state = state._replace(
         sides_team_move_this_turn=new_moved,
         sides_team_times_attacked=new_times_atk,
         sides_team_volatiles=new_vols,
+        sides_team_volatile_data=new_vol_data,
     )
 
     # --- PRNG: split key for this turn ---

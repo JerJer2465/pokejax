@@ -262,20 +262,27 @@ class PokeJAXEnv:
             jnp.float32(0.0)
         )
 
-        # Shaping: HP advantage delta + faint bonus
+        # Potential-based reward shaping (PBRS): gamma * Phi(s') - Phi(s)
+        # This preserves optimal policies and Nash equilibria (Ng et al. 1999).
+        _GAMMA = 0.999
+        _HP_COEF = 0.05
+        _FAINT_COEF = 0.05  # reduced from 0.15: prevents KO-chasing over winning
+
         old_p0_hp = hp_fraction(state, 0)
         old_p1_hp = hp_fraction(state, 1)
-        delta_p0 = (p0_hp - old_p0_hp) - (p1_hp - old_p1_hp)
 
-        # Faint-based shaping: clear discrete signal for KOs
         old_p0_fainted = state.sides_team_fainted[0].sum().astype(jnp.float32)
         old_p1_fainted = state.sides_team_fainted[1].sum().astype(jnp.float32)
         new_p0_fainted = new_state.sides_team_fainted[0].sum().astype(jnp.float32)
         new_p1_fainted = new_state.sides_team_fainted[1].sum().astype(jnp.float32)
-        faint_delta = (new_p1_fainted - old_p1_fainted) - (new_p0_fainted - old_p0_fainted)
 
-        r0 = win_reward + delta_p0 * 0.05 + faint_delta * 0.15
-        r1 = -win_reward - delta_p0 * 0.05 - faint_delta * 0.15
+        # Phi(s) = hp_advantage * HP_COEF + faint_advantage * FAINT_COEF
+        phi_old = (old_p0_hp - old_p1_hp) * _HP_COEF + (old_p1_fainted - old_p0_fainted) / 6.0 * _FAINT_COEF
+        phi_new = (p0_hp - p1_hp) * _HP_COEF + (new_p1_fainted - new_p0_fainted) / 6.0 * _FAINT_COEF
+        shaping = _GAMMA * phi_new - phi_old
+
+        r0 = win_reward + shaping
+        r1 = -win_reward - shaping
 
         rewards = jnp.array([r0, r1])
         dones   = jnp.broadcast_to(new_state.finished, (2,))
@@ -321,19 +328,25 @@ class PokeJAXEnv:
             jnp.float32(0.0)
         )
 
+        # Potential-based reward shaping (PBRS): gamma * Phi(s') - Phi(s)
+        _GAMMA = 0.999
+        _HP_COEF = 0.05
+        _FAINT_COEF = 0.05
+
         old_p0_hp = hp_fraction(state, 0)
         old_p1_hp = hp_fraction(state, 1)
-        delta_p0 = (p0_hp - old_p0_hp) - (p1_hp - old_p1_hp)
 
-        # Faint-based shaping: clear discrete signal for KOs
         old_p0_fainted = state.sides_team_fainted[0].sum().astype(jnp.float32)
         old_p1_fainted = state.sides_team_fainted[1].sum().astype(jnp.float32)
         new_p0_fainted = new_state.sides_team_fainted[0].sum().astype(jnp.float32)
         new_p1_fainted = new_state.sides_team_fainted[1].sum().astype(jnp.float32)
-        faint_delta = (new_p1_fainted - old_p1_fainted) - (new_p0_fainted - old_p0_fainted)
 
-        r0 = win_reward + delta_p0 * 0.05 + faint_delta * 0.15
-        r1 = -win_reward - delta_p0 * 0.05 - faint_delta * 0.15
+        phi_old = (old_p0_hp - old_p1_hp) * _HP_COEF + (old_p1_fainted - old_p0_fainted) / 6.0 * _FAINT_COEF
+        phi_new = (p0_hp - p1_hp) * _HP_COEF + (new_p1_fainted - new_p0_fainted) / 6.0 * _FAINT_COEF
+        shaping = _GAMMA * phi_new - phi_old
+
+        r0 = win_reward + shaping
+        r1 = -win_reward - shaping
 
         rewards = jnp.array([r0, r1])
         dones   = jnp.broadcast_to(new_state.finished, (2,))

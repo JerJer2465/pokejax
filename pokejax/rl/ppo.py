@@ -33,16 +33,16 @@ class PPOConfig:
     gae_lambda:      float = 0.95
     vf_coef:         float = 1.0     # increased: value head needs stronger gradient signal for C51
     ent_coef:        float = 0.02    # starting entropy for exploration in complex action space
-    ent_coef_end:    float = 0.005   # raised floor: prevents premature convergence
+    ent_coef_end:    float = 0.01    # raised floor: prevents premature convergence in complex game
     ent_coef_decay_steps: int = 15000  # optimizer steps over which to anneal entropy
     max_grad_norm:   float = 0.5
-    n_epochs:        int   = 2       # 2 epochs: balances learning vs SPS throughput
+    n_epochs:        int   = 2
     minibatch_size:  int   = 8192    # larger minibatch: better GPU utilization, fewer steps
 
     # C51
     n_atoms:   int   = 51
-    v_min:     float = -1.5
-    v_max:     float =  1.5
+    v_min:     float = -2.5    # wider support: returns can reach ±1.95 with shaping
+    v_max:     float =  2.5
 
 
 # ---------------------------------------------------------------------------

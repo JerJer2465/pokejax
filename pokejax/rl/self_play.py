@@ -27,7 +27,7 @@ from pokejax.rl.model import PokeTransformer, create_model, MODEL_CONFIG
 from pokejax.rl.ppo import PPOConfig, TrainState, create_train_state, ppo_step, make_jit_ppo_epochs
 from pokejax.rl.rollout import (
     RolloutConfig, collect_rollout, make_jit_rollout,
-    make_jit_rollout_asymmetric, RolloutBatch,
+    make_jit_rollout_asymmetric, make_jit_rollout_scripted, RolloutBatch,
 )
 
 
@@ -56,9 +56,11 @@ class TrainConfig:
     ps_eval_games:    int   = 20     # games per PS eval round
 
     # Opponent pool config
-    pool_size:         int   = 20     # max historical checkpoints in pool
+    pool_size:         int   = 50     # max historical checkpoints in pool (was 20)
     pool_save_interval: int  = 50     # save to pool every N updates
-    pool_latest_ratio:  float = 0.75  # probability of symmetric self-play (rest = pool)
+    pool_latest_ratio:  float = 0.60  # probability of symmetric self-play
+    pool_heuristic_ratio: float = 0.10  # probability of playing vs JAX heuristic
+    pool_maxpower_ratio: float = 0.05   # probability of playing vs maxpower opponent
 
     # LR warmup
     lr_warmup_steps: int = 1000      # linear warmup steps before cosine decay
@@ -66,6 +68,7 @@ class TrainConfig:
 
     # Model architecture
     arch: str = "transformer"        # "transformer" or "mlp"
+    model_kwargs: dict = field(default_factory=dict)  # forwarded to create_model
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +309,7 @@ def create_model_and_state(
     Uses linear warmup + cosine decay LR schedule.
     If init_params is provided (e.g. from BC), use those instead of random init.
     """
-    model = create_model(cfg.arch)
+    model = create_model(cfg.arch, **cfg.model_kwargs)
 
     if init_params is None:
         B = 1
@@ -357,6 +360,7 @@ def train(
     key: jnp.ndarray,
     init_params: Optional[dict] = None,
     resume_checkpoint: Optional[dict] = None,
+    eval_callback=None,
 ) -> TrainState:
     """Main PPO self-play training loop with full logging.
 
@@ -366,6 +370,8 @@ def train(
     key:              JAX PRNGKey
     init_params:      Optional pre-trained params (from BC) to warm-start
     resume_checkpoint: Optional full checkpoint dict for resuming training
+    eval_callback:    Optional callable(win_rate, timesteps) -> bool.
+                      Called after each heuristic eval. Return True to stop early.
     """
     # TensorBoard
     from tensorboardX import SummaryWriter
@@ -390,6 +396,7 @@ def train(
         "pool_latest_ratio": cfg.pool_latest_ratio,
         "lr_warmup_steps": cfg.lr_warmup_steps,
         "arch": cfg.arch,
+        "model_kwargs": cfg.model_kwargs,
     }
     writer.add_text("hyperparameters", str(hparams), 0)
 
@@ -412,8 +419,10 @@ def train(
     jit_rollout = make_jit_rollout(model, env, tables, cfg.rollout)
     jit_epochs = make_jit_ppo_epochs(model, optimizer, cfg.ppo)
 
-    # Lazy-compiled asymmetric rollout for pool opponents (compiled on first use)
+    # Lazy-compiled rollout variants (compiled on first use)
     jit_rollout_asymmetric = None
+    jit_rollout_heuristic = None
+    jit_rollout_maxpower = None
 
     # Opponent pool for historical self-play diversity
     opponent_pool = OpponentPool(max_size=cfg.pool_size)
@@ -435,8 +444,11 @@ def train(
     print(f"  LR: {cfg.ppo.lr}, Gamma: {cfg.ppo.gamma}, GAE λ: {cfg.ppo.gae_lambda}")
     print(f"  Entropy coeff: {cfg.ppo.ent_coef}, Clip ε: {cfg.ppo.clip_eps}")
     print(f"  Epochs: {cfg.ppo.n_epochs}, Minibatch: {cfg.ppo.minibatch_size}")
-    print(f"  Opponent mix: {cfg.pool_latest_ratio:.0%} self-play, "
-          f"{1 - cfg.pool_latest_ratio:.0%} pool")
+    pool_ratio = 1.0 - cfg.pool_latest_ratio - cfg.pool_heuristic_ratio - cfg.pool_maxpower_ratio
+    print(f"  Opponent mix: {cfg.pool_latest_ratio:.0%} self, "
+          f"{pool_ratio:.0%} pool, "
+          f"{cfg.pool_heuristic_ratio:.0%} heuristic, "
+          f"{cfg.pool_maxpower_ratio:.0%} maxpower")
     print(f"  TensorBoard: {cfg.tensorboard_dir}/{run_name}")
     if resume_checkpoint is not None:
         print(f"  Resumed from checkpoint: update_idx={update_idx}, "
@@ -450,10 +462,38 @@ def train(
         key, rollout_key, ppo_key = jax.random.split(key, 3)
 
         # --- Opponent selection ---
+        # Budget: self-play (60%) + pool (25%) + heuristic (10%) + maxpower (5%)
         roll = py_random.random()
         opp_type = "self"
 
-        if roll > cfg.pool_latest_ratio and len(opponent_pool) > 0:
+        if roll < cfg.pool_heuristic_ratio:
+            # JAX heuristic opponent — forces generalization
+            opp_type = "heuristic"
+            if jit_rollout_heuristic is None:
+                from pokejax.rl.heuristic import heuristic_action
+                print("  [JIT] Compiling heuristic rollout...")
+                jit_rollout_heuristic = make_jit_rollout_scripted(
+                    model, heuristic_action, env, tables, cfg.rollout
+                )
+            _, batch, info = jit_rollout_heuristic(
+                train_state.params, rollout_key
+            )
+        elif roll < cfg.pool_heuristic_ratio + cfg.pool_maxpower_ratio:
+            # MaxPower opponent — forces defensive play / switching
+            opp_type = "maxpower"
+            if jit_rollout_maxpower is None:
+                from pokejax.rl.heuristic import maxpower_action
+                print("  [JIT] Compiling maxpower rollout...")
+                jit_rollout_maxpower = make_jit_rollout_scripted(
+                    model, maxpower_action, env, tables, cfg.rollout
+                )
+            _, batch, info = jit_rollout_maxpower(
+                train_state.params, rollout_key
+            )
+        elif roll < cfg.pool_heuristic_ratio + cfg.pool_maxpower_ratio + cfg.pool_latest_ratio:
+            # Symmetric self-play (latest vs latest)
+            _, batch, info = jit_rollout(train_state.params, rollout_key)
+        elif len(opponent_pool) > 0:
             # Historical opponent from pool
             opp_type = "pool"
             if jit_rollout_asymmetric is None:
@@ -466,7 +506,7 @@ def train(
                 train_state.params, opp_params, rollout_key
             )
         else:
-            # Symmetric self-play (latest vs latest)
+            # Fallback: symmetric self-play
             _, batch, info = jit_rollout(train_state.params, rollout_key)
 
         train_state, metrics, _ = jit_epochs(train_state, batch, ppo_key)
@@ -526,6 +566,14 @@ def train(
             wr_r = eval_results["eval/win_rate_vs_random"]
             print(f"vs_heur={wr_h:.0%}  vs_rand={wr_r:.0%}")
 
+            # Optuna pruning callback
+            if eval_callback is not None:
+                should_stop = eval_callback(wr_h, timesteps_collected)
+                if should_stop:
+                    print(f"  Early stop requested by eval_callback at {timesteps_collected:,} steps")
+                    writer.close()
+                    return train_state
+
             # Save best checkpoint (by heuristic win rate)
             if wr_h > best_win_rate:
                 best_win_rate = wr_h
@@ -538,6 +586,7 @@ def train(
                     "best_win_rate": best_win_rate,
                     "eval_win_rate_heuristic": wr_h,
                     "arch": cfg.arch,
+                    "model_kwargs": cfg.model_kwargs,
                 }
                 path = os.path.join(cfg.checkpoint_dir, "ppo_best.pkl")
                 with open(path, "wb") as f:
@@ -554,6 +603,7 @@ def train(
                 "timesteps": timesteps_collected,
                 "best_win_rate": best_win_rate,
                 "arch": cfg.arch,
+                "model_kwargs": cfg.model_kwargs,
             }
             path = os.path.join(cfg.checkpoint_dir, f"ppo_{update_idx:06d}.pkl")
             with open(path, "wb") as f:
@@ -584,6 +634,7 @@ def train(
         "timesteps": timesteps_collected,
         "best_win_rate": best_win_rate,
         "arch": cfg.arch,
+        "model_kwargs": cfg.model_kwargs,
     }
     path = os.path.join(cfg.checkpoint_dir, "ppo_final.pkl")
     with open(path, "wb") as f:

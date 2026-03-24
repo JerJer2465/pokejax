@@ -252,7 +252,7 @@ async def run_diagnostic(args, log):
 
     from poke_env import LocalhostServerConfiguration, AccountConfiguration
     from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer, Player
-    from poke_env.environment import AbstractBattle
+    from poke_env.battle import AbstractBattle
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from pokejax.players.showdown_player import PokejaxPlayer, ObsBridge

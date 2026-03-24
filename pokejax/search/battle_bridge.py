@@ -21,19 +21,22 @@ from typing import Optional
 import numpy as np
 import jax.numpy as jnp
 
-from poke_env.environment import (
-    AbstractBattle,
-    Pokemon,
-    Weather,
-    Field,
-    SideCondition,
-    Status,
-)
+try:
+    from poke_env.battle import (
+        AbstractBattle, Pokemon, Weather, Field, SideCondition, Status,
+    )
+except ModuleNotFoundError:
+    from poke_env.environment import (
+        AbstractBattle, Pokemon, Weather, Field, SideCondition, Status,
+    )
 
 try:
-    from poke_env.environment import Effect
-except ImportError:
-    Effect = None
+    from poke_env.battle import Effect
+except (ModuleNotFoundError, ImportError):
+    try:
+        from poke_env.environment import Effect
+    except (ModuleNotFoundError, ImportError):
+        Effect = None
 
 from pokejax.types import (
     BattleState, FieldState, RevealState,

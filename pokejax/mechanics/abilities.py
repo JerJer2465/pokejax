@@ -35,6 +35,7 @@ from pokejax.mechanics import events as ev
 # Module-level ability ID constants (set by populate_ability_tables)
 # ---------------------------------------------------------------------------
 GUTS_ID           = -1
+FLASH_FIRE_ID     = -1
 ADAPTABILITY_ID   = -1
 WONDER_GUARD_ID   = -1
 MOLD_BREAKER_ID   = -1
@@ -70,6 +71,8 @@ SOLID_ROCK_ID     = -1
 STEADFAST_ID      = -1
 TANGLED_FEET_ID   = -1
 PRESSURE_ID       = -1
+OWN_TEMPO_ID      = -1
+OBLIVIOUS_ID      = -1
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +260,17 @@ def _dry_skin_absorb_try_hit_state(state, atk_si, atk_idx_i32, def_si, def_idx_i
         jnp.where(is_water, new_hp, state.sides_team_hp[def_si, def_idx_i32])
     )
     return state._replace(sides_team_hp=new_hp_arr)
+
+
+def _flash_fire_try_hit_state(state, atk_si, atk_idx_i32, def_si, def_idx_i32, move_type_i32):
+    """Flash Fire: absorbing a Fire move sets VOL_FLASH_FIRE, boosting Fire moves by ×1.5."""
+    from pokejax.types import VOL_FLASH_FIRE
+    is_fire = move_type_i32 == jnp.int32(TYPE_FIRE)
+    ff_mask = jnp.uint32(1 << VOL_FLASH_FIRE)
+    old_vols = state.sides_team_volatiles[def_si, def_idx_i32]
+    new_vols_val = jnp.where(is_fire, old_vols | ff_mask, old_vols)
+    new_vols_arr = state.sides_team_volatiles.at[def_si, def_idx_i32].set(new_vols_val)
+    return state._replace(sides_team_volatiles=new_vols_arr)
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +547,9 @@ ABILITY_HANDLERS = {
     # ==== Absorption / immunity (TryHit bool + state) ====
     "Water Absorb":  {"tryhit_immune": TYPE_WATER, "tryhit_state_eff": ev.EFF_WATER_ABSORB},
     "Volt Absorb":   {"tryhit_immune": TYPE_ELECTRIC, "tryhit_state_eff": ev.EFF_VOLT_ABSORB},
-    "Flash Fire":    {"tryhit_immune": TYPE_FIRE},
+    "Flash Fire":    {"tryhit_immune": TYPE_FIRE,
+                      "tryhit_state_eff": ev.EFF_FLASH_FIRE,
+                      "bp_cond": ev.ABCOND_BP_FLASH_FIRE},
     "Levitate":      {"tryhit_immune": TYPE_GROUND},
     "Motor Drive":   {"tryhit_immune": TYPE_ELECTRIC, "tryhit_state_eff": ev.EFF_MOTOR_DRIVE},
     "Sap Sipper":    {"tryhit_immune": TYPE_GRASS, "tryhit_state_eff": ev.EFF_SAP_SIPPER},
@@ -632,7 +648,7 @@ def populate_ability_tables(ability_name_to_id: dict, tables=None) -> None:
         ability_name_to_id: dict mapping ability display name → integer ID
         tables: optional Tables namedtuple (stored as ev._TABLES_REF for move/type data)
     """
-    global GUTS_ID, ADAPTABILITY_ID, WONDER_GUARD_ID, MOLD_BREAKER_ID
+    global GUTS_ID, FLASH_FIRE_ID, ADAPTABILITY_ID, WONDER_GUARD_ID, MOLD_BREAKER_ID
     global LEVITATE_ID, NO_GUARD_ID, COMPOUND_EYES_ID, HUSTLE_ID
     global SAND_VEIL_ID, SNOW_CLOAK_ID
     global ARENA_TRAP_ID, SHADOW_TAG_ID, MAGNET_PULL_ID
@@ -642,6 +658,7 @@ def populate_ability_tables(ability_name_to_id: dict, tables=None) -> None:
     global CLEAR_BODY_ID, WHITE_SMOKE_ID, HYPER_CUTTER_ID, KEEN_EYE_ID
     global SIMPLE_ID, UNAWARE_ID, SYNCHRONIZE_ID, EARLY_BIRD_ID
     global FILTER_ID, SOLID_ROCK_ID, STEADFAST_ID, TANGLED_FEET_ID, PRESSURE_ID
+    global OWN_TEMPO_ID, OBLIVIOUS_ID
 
     if tables is not None:
         ev._TABLES_REF = tables
@@ -650,6 +667,7 @@ def populate_ability_tables(ability_name_to_id: dict, tables=None) -> None:
         return ability_name_to_id.get(name, -1)
 
     GUTS_ID           = _get("Guts")
+    FLASH_FIRE_ID     = _get("Flash Fire")
     ADAPTABILITY_ID   = _get("Adaptability")
     WONDER_GUARD_ID   = _get("Wonder Guard")
     MOLD_BREAKER_ID   = _get("Mold Breaker")
@@ -687,6 +705,8 @@ def populate_ability_tables(ability_name_to_id: dict, tables=None) -> None:
     STEADFAST_ID      = _get("Steadfast")
     TANGLED_FEET_ID   = _get("Tangled Feet")
     PRESSURE_ID       = _get("Pressure")
+    OWN_TEMPO_ID      = _get("Own Tempo")
+    OBLIVIOUS_ID      = _get("Oblivious")
 
     # --- Install state-mutating handlers into the small handler lists ---
     # SwitchIn
@@ -704,7 +724,7 @@ def populate_ability_tables(ability_name_to_id: dict, tables=None) -> None:
 
     # SwitchOut
     ev._SWITCH_OUT_HANDLERS[ev.EFF_NATURAL_CURE] = _natural_cure_switch_out
-    ev._SWITCH_OUT_HANDLERS[ev.EFF_REGENERATOR]  = _regenerator_switch_out
+    # Regenerator is Gen 5 only — not registered for Gen 4
 
     # Ability Residual
     ev._AB_RESIDUAL_HANDLERS[ev.EFF_SPEED_BOOST]  = _speed_boost_residual
@@ -723,6 +743,7 @@ def populate_ability_tables(ability_name_to_id: dict, tables=None) -> None:
     ev._TRYHIT_STATE_HANDLERS[ev.EFF_STORM_DRAIN]     = _storm_drain_try_hit_state
     ev._TRYHIT_STATE_HANDLERS[ev.EFF_LIGHTNING_ROD]   = _lightning_rod_try_hit_state
     ev._TRYHIT_STATE_HANDLERS[ev.EFF_DRY_SKIN_ABSORB] = _dry_skin_absorb_try_hit_state
+    ev._TRYHIT_STATE_HANDLERS[ev.EFF_FLASH_FIRE]      = _flash_fire_try_hit_state
 
     # Contact punishment
     ev._CONTACT_HANDLERS[ev.EFF_ROUGH_SKIN]      = _rough_skin_contact

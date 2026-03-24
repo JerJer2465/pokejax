@@ -33,6 +33,14 @@ FOCUS_SASH_ID   = -1
 SCOPE_LENS_ID   = -1
 RAZOR_CLAW_ID   = -1
 
+# Weather-extending items (move-set weather → 8 turns instead of 5)
+DAMP_ROCK_ID    = -1   # Rain Dance → 8 turns
+HEAT_ROCK_ID    = -1   # Sunny Day  → 8 turns
+ICY_ROCK_ID     = -1   # Hail       → 8 turns
+SMOOTH_ROCK_ID  = -1   # Sandstorm  → 8 turns
+# Screen-extending item (Reflect/Light Screen → 8 turns instead of 5)
+LIGHT_CLAY_ID   = -1   # Reflect/Light Screen → 8 turns
+
 
 # ---------------------------------------------------------------------------
 # State-mutating item residual handlers
@@ -212,8 +220,14 @@ ITEM_HANDLERS = {
     # No relay entry needed — checked directly by item ID in damage calc.
 
     # ==== Duration-extending items ====
-    # Light Clay, Damp Rock, Heat Rock, Icy Rock, Smooth Rock
-    # These extend screen/weather duration when set. Handled at set-time, not relay.
+    # These extend screen/weather duration when the move is used.
+    # Handled at move execution time via item ID checks in moves.py.
+    # Registered here so their IDs are resolved during populate_item_tables.
+    "Damp Rock":   {},   # Rain Dance/Drizzle weather → 8 turns (checked in moves.py)
+    "Heat Rock":   {},   # Sunny Day/Drought weather → 8 turns
+    "Icy Rock":    {},   # Hail/Snow Warning weather → 8 turns
+    "Smooth Rock": {},   # Sandstorm weather → 8 turns
+    "Light Clay":  {},   # Reflect/Light Screen → 8 turns
 }
 
 
@@ -229,6 +243,7 @@ def populate_item_tables(item_name_to_id: dict, tables=None) -> None:
     """
     global _TABLES, LIFE_ORB_ID, CHOICE_BAND_ID, CHOICE_SPECS_ID, CHOICE_SCARF_ID
     global FOCUS_SASH_ID, SCOPE_LENS_ID, RAZOR_CLAW_ID
+    global DAMP_ROCK_ID, HEAT_ROCK_ID, ICY_ROCK_ID, SMOOTH_ROCK_ID, LIGHT_CLAY_ID
 
     if tables is not None:
         _TABLES = tables
@@ -243,6 +258,11 @@ def populate_item_tables(item_name_to_id: dict, tables=None) -> None:
         # Also check Razor Claw (same +1 crit stage effect)
         SCOPE_LENS_ID = item_name_to_id.get("Razor Claw", -1)
     RAZOR_CLAW_ID   = item_name_to_id.get("Razor Claw", -1)
+    DAMP_ROCK_ID    = item_name_to_id.get("Damp Rock", -1)
+    HEAT_ROCK_ID    = item_name_to_id.get("Heat Rock", -1)
+    ICY_ROCK_ID     = item_name_to_id.get("Icy Rock", -1)
+    SMOOTH_ROCK_ID  = item_name_to_id.get("Smooth Rock", -1)
+    LIGHT_CLAY_ID   = item_name_to_id.get("Light Clay", -1)
 
     # --- Install state-mutating residual handlers ---
     ev._ITEM_RESIDUAL_HANDLERS[ev.EFF_LEFTOVERS]         = _leftovers_residual_state

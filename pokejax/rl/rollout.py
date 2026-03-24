@@ -34,6 +34,31 @@ from pokejax.rl.ppo import RolloutBatch, compute_gae
 
 
 # ---------------------------------------------------------------------------
+# PP noise for domain-robustness (matches PS where PP is always 1.0)
+# ---------------------------------------------------------------------------
+
+# PP feature positions in float_feats (394-dim per token).
+# Moves start at offset 187, each move is 45 dims, PP is at offset 43.
+_PP_OFFSETS = tuple(187 + m * 45 + 43 for m in range(4))  # (230, 275, 320, 365)
+
+# Tokens 1-6 (own team) and 7-12 (opponent team) have move features.
+# Token 0 (field) and 13-14 (queries) do not.
+
+def _mask_pp_noise(float_feats: jnp.ndarray, key: jnp.ndarray) -> jnp.ndarray:
+    """With 50% probability, set all PP fractions to 1.0 (mimicking PS obs).
+
+    float_feats: (15, 394)
+    Returns same shape with PP slots overwritten.
+    """
+    do_mask = jax.random.uniform(key) < 0.5
+    masked = float_feats
+    for off in _PP_OFFSETS:
+        # Set PP to 1.0 for all 15 tokens (field/query tokens have 0 there anyway)
+        masked = masked.at[:, off].set(1.0)
+    return jnp.where(do_mask, masked, float_feats)
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -142,7 +167,7 @@ def make_rollout_step_fn(model, params, opp_params, env, tables, cfg: RolloutCon
 
     def _step(carry: StepCarry, _) -> tuple[StepCarry, StepOutput]:
         env_state, key = carry
-        key, act_key_p0, act_key_p1, step_key, reset_key = jax.random.split(key, 5)
+        key, act_key_p0, act_key_p1, step_key, reset_key, pp_key = jax.random.split(key, 6)
 
         # Build obs for both players
         obs_p0 = _obs_from_env_state(env_state, player=0, tables=tables)
@@ -176,6 +201,9 @@ def make_rollout_step_fn(model, params, opp_params, env, tables, cfg: RolloutCon
         val    = val_p0 if p == 0 else val_p1
         act    = act_p0 if p == 0 else act_p1
 
+        # PP noise: randomly mask PP to 1.0 (domain robustness for PS bridge)
+        obs_float_feats = _mask_pp_noise(obs_p["float_feats"], pp_key)
+
         # Auto-reset: if episode finished, reset to new battle
         reset_state, _ = env.reset(reset_key)
         final_env_state = jax.tree.map(
@@ -185,7 +213,7 @@ def make_rollout_step_fn(model, params, opp_params, env, tables, cfg: RolloutCon
 
         output = StepOutput(
             int_ids    = obs_p["int_ids"],
-            float_feats= obs_p["float_feats"],
+            float_feats= obs_float_feats,
             legal_mask = obs_p["legal_mask"],
             action     = act.astype(jnp.int32),
             log_prob   = lp,
@@ -341,6 +369,167 @@ def make_jit_rollout_asymmetric(model, env, tables, cfg: RolloutConfig):
     @jax.jit
     def _jit_rollout(params: dict, opp_params: dict, key: jnp.ndarray):
         return collect_rollout(model, params, env, tables, cfg, key, opp_params=opp_params)
+
+    return _jit_rollout
+
+
+# ---------------------------------------------------------------------------
+# Scripted-opponent rollout (heuristic / maxpower)
+# ---------------------------------------------------------------------------
+
+def make_rollout_step_fn_scripted(model, params, opp_fn, env, tables, cfg: RolloutConfig):
+    """Return a lax.scan step function where the opponent uses a scripted policy.
+
+    opp_fn: callable(state, side, tables, rng_key) -> int32 action
+            e.g. heuristic_action or maxpower_action
+    """
+    opp_side = 1 - cfg.player
+
+    def _step(carry: StepCarry, _) -> tuple[StepCarry, StepOutput]:
+        env_state, key = carry
+        key, act_key_p0, act_key_opp, step_key, reset_key, pp_key = jax.random.split(key, 6)
+
+        # Build obs only for the training agent
+        obs_agent = _obs_from_env_state(env_state, player=cfg.player, tables=tables)
+
+        # Training agent action (model forward pass)
+        act_agent, lp_agent, val_agent = _sample_action(
+            model, params, obs_agent, act_key_p0,
+        )
+
+        # Scripted opponent action
+        act_opp = opp_fn(env_state.battle, opp_side, tables, act_key_opp)
+
+        # Assemble actions in correct order
+        act_p0 = act_agent if cfg.player == 0 else act_opp
+        act_p1 = act_opp if cfg.player == 0 else act_agent
+        actions = jnp.array([act_p0, act_p1], dtype=jnp.int32)
+
+        new_env_state, rewards, dones = env.step_lean(env_state, actions, step_key)
+
+        reward = rewards[cfg.player]
+        done = dones[cfg.player]
+
+        # PP noise: randomly mask PP to 1.0 (domain robustness for PS bridge)
+        obs_float_feats = _mask_pp_noise(obs_agent["float_feats"], pp_key)
+
+        # Auto-reset
+        reset_state, _ = env.reset(reset_key)
+        final_env_state = jax.tree.map(
+            lambda r, n: jnp.where(done, r, n),
+            reset_state, new_env_state,
+        )
+
+        output = StepOutput(
+            int_ids     = obs_agent["int_ids"],
+            float_feats = obs_float_feats,
+            legal_mask  = obs_agent["legal_mask"],
+            action      = act_agent.astype(jnp.int32),
+            log_prob    = lp_agent,
+            value       = val_agent,
+            reward      = reward,
+            done        = done,
+        )
+
+        return StepCarry(env_state=final_env_state, key=key), output
+
+    return _step
+
+
+def collect_rollout_scripted(
+    model,
+    params: dict,
+    opp_fn,
+    env,
+    tables,
+    cfg: RolloutConfig,
+    key: jnp.ndarray,
+) -> tuple[StepCarry, RolloutBatch, dict]:
+    """Collect rollout with a scripted opponent (heuristic, maxpower, etc.)."""
+    env_keys = jax.random.split(key, cfg.n_envs + 1)
+    key, env_keys = env_keys[0], env_keys[1:]
+
+    v_reset = jax.vmap(env.reset)
+    init_env_states, _ = v_reset(env_keys)
+
+    step_fn = make_rollout_step_fn_scripted(model, params, opp_fn, env, tables, cfg)
+
+    def scan_env(carry: StepCarry, _) -> tuple[StepCarry, StepOutput]:
+        return step_fn(carry, None)
+
+    def collect_one_env(init_carry: StepCarry) -> tuple[StepCarry, StepOutput]:
+        final_carry, outputs = jax.lax.scan(
+            scan_env, init_carry, None, length=cfg.n_steps
+        )
+        return final_carry, outputs
+
+    init_keys_per_env = jax.random.split(key, cfg.n_envs)
+    init_carries = jax.vmap(lambda s, k: StepCarry(env_state=s, key=k))(
+        init_env_states, init_keys_per_env
+    )
+
+    final_carries, traj = jax.vmap(collect_one_env)(init_carries)
+
+    # Bootstrap values
+    def _boot_value(carry: StepCarry) -> jnp.ndarray:
+        obs = _obs_from_env_state(carry.env_state, cfg.player, tables)
+        _, _, val = model.apply(
+            params,
+            obs["int_ids"][None],
+            obs["float_feats"][None],
+            obs["legal_mask"][None],
+        )
+        return val[0]
+
+    boot_values = jax.vmap(_boot_value)(final_carries)
+
+    def _gae_one(rewards, values_traj, dones, boot_val):
+        values_ext = jnp.append(values_traj, boot_val)
+        return compute_gae(rewards, values_ext, dones, cfg.gamma, cfg.gae_lambda)
+
+    advantages, returns = jax.vmap(_gae_one)(
+        traj.reward, traj.value,
+        traj.done.astype(jnp.float32), boot_values,
+    )
+
+    def _flat(x):
+        return x.reshape(-1, *x.shape[2:])
+
+    batch = RolloutBatch(
+        int_ids       = _flat(traj.int_ids),
+        float_feats   = _flat(traj.float_feats),
+        legal_mask    = _flat(traj.legal_mask),
+        actions       = _flat(traj.action),
+        log_probs_old = _flat(traj.log_prob),
+        advantages    = advantages.reshape(-1),
+        returns       = returns.reshape(-1),
+        dones         = _flat(traj.done),
+    )
+
+    done_f = traj.done.astype(jnp.float32)
+    terminal_rewards = traj.reward * done_f
+    n_episodes = done_f.sum()
+    n_wins = (terminal_rewards > 0).astype(jnp.float32).sum()
+    mean_reward = jnp.where(n_episodes > 0, terminal_rewards.sum() / n_episodes, 0.0)
+    win_rate = jnp.where(n_episodes > 0, n_wins / n_episodes, 0.5)
+
+    info = {
+        "n_episodes":  n_episodes,
+        "win_rate":    win_rate,
+        "mean_reward": mean_reward,
+    }
+
+    return final_carries, batch, info
+
+
+def make_jit_rollout_scripted(model, opp_fn, env, tables, cfg: RolloutConfig):
+    """Return JIT-compiled rollout function for a scripted opponent.
+
+    Signature: jit_rollout(params, key) -> (StepCarry, RolloutBatch, info)
+    """
+    @jax.jit
+    def _jit_rollout(params: dict, key: jnp.ndarray):
+        return collect_rollout_scripted(model, params, opp_fn, env, tables, cfg, key)
 
     return _jit_rollout
 

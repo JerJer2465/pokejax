@@ -109,6 +109,14 @@ def main():
     parser.add_argument("--arch", type=str, default="transformer",
                         choices=["transformer", "mlp"],
                         help="Model architecture")
+    parser.add_argument("--token-dim", type=int, default=None,
+                        help="MLP per-token compression dim (default: 128)")
+    parser.add_argument("--hidden-dims", type=int, nargs="+", default=None,
+                        help="MLP trunk hidden dims (default: 1024 1024 512 512)")
+    parser.add_argument("--species-embed-dim", type=int, default=None,
+                        help="Species embedding dim (default: 64)")
+    parser.add_argument("--move-embed-dim", type=int, default=None,
+                        help="Move embedding dim (default: 32)")
 
     parser.add_argument("--seed",        type=int,   default=42)
     args = parser.parse_args()
@@ -154,6 +162,12 @@ def main():
         lr_warmup_steps=args.lr_warmup,
         lr_min=args.lr_min,
         arch=args.arch,
+        model_kwargs={k: v for k, v in {
+            "token_dim": args.token_dim,
+            "hidden_dims": tuple(args.hidden_dims) if args.hidden_dims else None,
+            "species_embed_dim": args.species_embed_dim,
+            "move_embed_dim": args.move_embed_dim,
+        }.items() if v is not None},
         ps_eval=not args.no_ps_eval,
         ps_eval_interval=args.ps_eval_interval,
         ps_eval_games=args.ps_eval_games,

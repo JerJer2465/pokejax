@@ -22,8 +22,9 @@ from pokejax.types import (
     WEATHER_NONE, WEATHER_SUN, WEATHER_RAIN, WEATHER_SAND, WEATHER_HAIL,
     TERRAIN_NONE,
     STATUS_NONE, STATUS_SLP,
-    VOL_SUBSTITUTE, VOL_SEEDED, VOL_PARTIALLY_TRAPPED, VOL_YAWN, VOL_DESTINYBOND,
-    VOL_DISABLE, VOL_PERISH,
+    VOL_PROTECT, VOL_SUBSTITUTE, VOL_SEEDED, VOL_PARTIALLY_TRAPPED, VOL_YAWN,
+    VOL_DESTINYBOND, VOL_DISABLE, VOL_PERISH,
+    VOL_CONFUSED, VOL_ATTRACT,
     BOOST_ATK, BOOST_ACC,
 )
 from pokejax.data.move_effects_data import (
@@ -34,6 +35,9 @@ from pokejax.data.move_effects_data import (
     ME_WISH, ME_HEAL_BELL, ME_DISABLE, ME_YAWN, ME_DESTINY_BOND,
     ME_PERISH_SONG, ME_SLEEP_TALK, ME_DEFOG, ME_TRICK, ME_HAZE, ME_TWO_TURN,
     NONE_STAT,
+)
+from pokejax.mechanics.items import (
+    DAMP_ROCK_ID, HEAT_ROCK_ID, ICY_ROCK_ID, SMOOTH_ROCK_ID, LIGHT_CLAY_ID,
 )
 
 # Move-effect table field indices
@@ -244,22 +248,37 @@ def execute_move_effects(
     # ------------------------------------------------------------------
     # ME_SCREEN: set screen / field effect on attacker's own side
     # stat1 = SC_* index,  amt1 = turns
+    # Light Clay extends Reflect/Light Screen to 8 turns.
     # ------------------------------------------------------------------
     is_screen = should_apply & (effect_type == jnp.int32(ME_SCREEN))
     sc_clamped_s = jnp.clip(stat1, 0, 9)
     already_up = state.sides_side_conditions[atk_side, sc_clamped_s] > jnp.int8(0)
+    atk_item_s = state.sides_team_item_id[atk_side, atk_idx].astype(jnp.int32)
+    has_light_clay = (atk_item_s == jnp.int32(LIGHT_CLAY_ID)) & (jnp.int32(LIGHT_CLAY_ID) > 0)
+    screen_turns_base = amt1.astype(jnp.int32)
+    screen_turns = jnp.where(has_light_clay, jnp.int32(8), screen_turns_base).astype(jnp.int8)
     screen_val = jnp.where(already_up,
                            state.sides_side_conditions[atk_side, sc_clamped_s],
-                           amt1.astype(jnp.int8))
+                           screen_turns)
     state = _apply_side_condition(state, atk_side, stat1, screen_val, is_screen)
 
     # ------------------------------------------------------------------
     # ME_WEATHER: set weather
     # stat1 = weather_id,  amt1 = turns
+    # Rock items extend move-set weather to 8 turns:
+    #   Damp Rock (Rain), Heat Rock (Sun), Icy Rock (Hail), Smooth Rock (Sand)
     # ------------------------------------------------------------------
     is_weather = should_apply & (effect_type == jnp.int32(ME_WEATHER))
+    atk_item_w = state.sides_team_item_id[atk_side, atk_idx].astype(jnp.int32)
+    weather_being_set = stat1  # int32 weather_id
+    has_damp_rock   = (atk_item_w == jnp.int32(DAMP_ROCK_ID))   & (jnp.int32(DAMP_ROCK_ID)   > 0) & (weather_being_set == jnp.int32(WEATHER_RAIN))
+    has_heat_rock   = (atk_item_w == jnp.int32(HEAT_ROCK_ID))   & (jnp.int32(HEAT_ROCK_ID)   > 0) & (weather_being_set == jnp.int32(WEATHER_SUN))
+    has_icy_rock    = (atk_item_w == jnp.int32(ICY_ROCK_ID))    & (jnp.int32(ICY_ROCK_ID)    > 0) & (weather_being_set == jnp.int32(WEATHER_HAIL))
+    has_smooth_rock = (atk_item_w == jnp.int32(SMOOTH_ROCK_ID)) & (jnp.int32(SMOOTH_ROCK_ID) > 0) & (weather_being_set == jnp.int32(WEATHER_SAND))
+    has_extend_rock = has_damp_rock | has_heat_rock | has_icy_rock | has_smooth_rock
+    w_turns_extended = jnp.where(has_extend_rock, jnp.int32(8), amt1)
     new_weather = jnp.where(is_weather, stat1.astype(jnp.int8), state.field.weather)
-    new_w_turns = jnp.where(is_weather, amt1.astype(jnp.int8), state.field.weather_turns)
+    new_w_turns = jnp.where(is_weather, w_turns_extended.astype(jnp.int8), state.field.weather_turns)
     new_field_w = state.field._replace(
         weather=new_weather,
         weather_turns=new_w_turns,
@@ -290,28 +309,81 @@ def execute_move_effects(
     # ------------------------------------------------------------------
     # ME_VOLATILE_SELF: set a volatile bit on the attacker
     # stat1 = vol_bit index
+    #
+    # Special handling for Protect/Detect (VOL_PROTECT):
+    #   Consecutive use has decreasing success rate: 1/(2^n) where n is
+    #   the number of consecutive successful uses (Gen 4 mechanics).
+    #   volatile_data[VOL_PROTECT] stores the consecutive-use counter.
     # ------------------------------------------------------------------
     is_vol_self = should_apply & (effect_type == jnp.int32(ME_VOLATILE_SELF))
-    state = _apply_volatile_bit(state, atk_side, atk_idx, stat1, is_vol_self)
+
+    # Protect consecutive failure check
+    is_protect = is_vol_self & (stat1 == jnp.int32(VOL_PROTECT))
+    protect_counter = state.sides_team_volatile_data[
+        atk_side, atk_idx, VOL_PROTECT
+    ].astype(jnp.int32)
+    # Success chance = 1 / (2^counter). At counter=0, always succeeds (1/1).
+    # At counter=1, 50%. At counter=2, 25%. etc.
+    # We cap at counter=4 to avoid extreme values.
+    capped_counter = jnp.minimum(protect_counter, jnp.int32(4))
+    # Denominator = 2^counter (1, 2, 4, 8, 16)
+    denom = jnp.int32(1) << capped_counter
+    # Roll: succeed if random value [0, denom) == 0
+    key, protect_key = jax.random.split(key)
+    roll = jax.random.randint(protect_key, (), 0, denom)
+    protect_succeeds = roll == jnp.int32(0)
+
+    # If Protect: gate on the roll result
+    # If non-Protect volatile_self: always apply
+    vol_self_applies = jnp.where(is_protect, is_protect & protect_succeeds, is_vol_self)
+    state = _apply_volatile_bit(state, atk_side, atk_idx, stat1, vol_self_applies)
+
+    # Update protect counter: increment on success, reset to 0 on failure
+    new_protect_counter = jnp.where(
+        is_protect & protect_succeeds,
+        jnp.minimum(protect_counter + jnp.int32(1), jnp.int32(127)).astype(jnp.int8),
+        jnp.where(
+            is_protect & ~protect_succeeds,
+            jnp.int8(0),
+            state.sides_team_volatile_data[atk_side, atk_idx, VOL_PROTECT],
+        ),
+    )
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[
+            atk_side, atk_idx, VOL_PROTECT
+        ].set(new_protect_counter)
+    )
 
     # ------------------------------------------------------------------
     # ME_VOLATILE_FOE: set a volatile bit on the defender
     # stat1 = vol_bit index
     # Substitute blocks volatile effects on the defender (Leech Seed, etc.)
+    # Own Tempo blocks confusion (VOL_CONFUSED).
+    # Oblivious blocks infatuation (VOL_ATTRACT).
     # ------------------------------------------------------------------
+    from pokejax.mechanics.abilities import OWN_TEMPO_ID, OBLIVIOUS_ID
     def_has_sub = (state.sides_team_volatiles[def_side, def_idx]
                    & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
-    is_vol_foe = should_apply & (effect_type == jnp.int32(ME_VOLATILE_FOE)) & ~def_has_sub
+    def_ability_mv = state.sides_team_ability_id[def_side, def_idx].astype(jnp.int32)
+    has_own_tempo  = (jnp.int32(OWN_TEMPO_ID) > 0) & (def_ability_mv == jnp.int32(OWN_TEMPO_ID))
+    has_oblivious  = (jnp.int32(OBLIVIOUS_ID) > 0) & (def_ability_mv == jnp.int32(OBLIVIOUS_ID))
+    blocked_confusion  = has_own_tempo & (stat1 == jnp.int32(VOL_CONFUSED))
+    blocked_infatuation = has_oblivious & (stat1 == jnp.int32(VOL_ATTRACT))
+    is_vol_foe = (should_apply & (effect_type == jnp.int32(ME_VOLATILE_FOE))
+                  & ~def_has_sub & ~blocked_confusion & ~blocked_infatuation)
     state = _apply_volatile_bit(state, def_side, def_idx, stat1, is_vol_foe)
 
     # ------------------------------------------------------------------
     # ME_SUBSTITUTE: create substitute at 25% max HP cost
     # ------------------------------------------------------------------
     is_substitute = should_apply & (effect_type == jnp.int32(ME_SUBSTITUTE))
+    # In Pokemon Showdown, Substitute fails if one already exists
+    already_has_sub = (state.sides_team_volatiles[atk_side, atk_idx]
+                       & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
     atk_hp     = state.sides_team_hp[atk_side, atk_idx].astype(jnp.int32)
     atk_max_hp = state.sides_team_max_hp[atk_side, atk_idx].astype(jnp.int32)
     sub_cost   = jnp.maximum(jnp.int32(1), atk_max_hp // 4)
-    can_sub    = is_substitute & (atk_hp > sub_cost)
+    can_sub    = is_substitute & (atk_hp > sub_cost) & ~already_has_sub
     # Deduct HP cost
     new_hp_sub = jnp.where(can_sub,
                            (atk_hp - sub_cost).astype(jnp.int16),

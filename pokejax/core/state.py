@@ -183,7 +183,13 @@ def set_volatile_counter(state: BattleState, side: int, slot: int,
     return state._replace(sides_team_volatile_data=new_data)
 
 def clear_volatiles(state: BattleState, side: int, slot: int) -> BattleState:
-    new_vols = state.sides_team_volatiles.at[side, slot].set(jnp.uint32(0))
+    # VOL_FLASH_FIRE (bit 31) persists through switching — Flash Fire boost is
+    # a permanent battle property of the Pokemon, not reset on switch-out.
+    from pokejax.types import VOL_FLASH_FIRE
+    _PERSISTENT_MASK = jnp.uint32(1 << VOL_FLASH_FIRE)
+    old_vols = state.sides_team_volatiles[side, slot]
+    preserved = old_vols & _PERSISTENT_MASK
+    new_vols = state.sides_team_volatiles.at[side, slot].set(preserved)
     new_data = state.sides_team_volatile_data.at[side, slot].set(
         jnp.zeros(MAX_VOLATILES, dtype=jnp.int8)
     )
