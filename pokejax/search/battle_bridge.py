@@ -53,6 +53,11 @@ from pokejax.types import (
 
 # Import the same enum maps that showdown_player uses
 from pokejax.players.showdown_player import _STATUS_MAP, _TYPE_MAP, _WEATHER_MAP
+from pokejax.data.extractor import NATURE_NAMES
+
+# Nature name → index lookup (normalized lowercase, matches poke-env's pokemon.nature)
+import re as _re
+_NATURE_LOOKUP = {_re.sub(r'[^a-z0-9]', '', n.lower()): i for i, n in enumerate(NATURE_NAMES)}
 
 # ── Effect enum → volatile bit index ─────────────────────────────────
 _EFFECT_TO_VOL_BIT = {}
@@ -156,15 +161,25 @@ class BattleBridge:
         base_stats = np.array([bst.get(s, 80) for s in stat_order], dtype=np.int16)
 
         # HP
+        # In gen4randombattle the protocol broadcasts exact HP/maxHP for all
+        # pokemon, so poke-env exposes current_hp and max_hp as integers even
+        # for opponent pokemon.  Use them directly when available.
         if is_own:
             hp = np.int16(pokemon.current_hp or 0)
             max_hp = np.int16(pokemon.max_hp or max(int(pokemon.current_hp or 1), 1))
         else:
-            frac = pokemon.current_hp_fraction if pokemon.current_hp_fraction is not None else 1.0
-            level = pokemon.level or 100
-            est_hp = int((2 * base_stats[0] + 31 + 21) * level / 100 + level + 10)
-            max_hp = np.int16(max(est_hp, 1))
-            hp = np.int16(max(int(frac * est_hp), 0))
+            exact_max = getattr(pokemon, 'max_hp', None)
+            exact_cur = getattr(pokemon, 'current_hp', None)
+            if exact_max and exact_max > 0:
+                max_hp = np.int16(exact_max)
+                hp = np.int16(max(int(exact_cur or 0), 0))
+            else:
+                # Fallback: estimate from base stats assuming 31 IVs, 85 EVs
+                frac = pokemon.current_hp_fraction if pokemon.current_hp_fraction is not None else 1.0
+                level = pokemon.level or 100
+                est_hp = int((2 * base_stats[0] + 31 + 21) * level / 100 + level + 10)
+                max_hp = np.int16(max(est_hp, 1))
+                hp = np.int16(max(int(frac * est_hp), 0))
 
         # Boosts
         boosts_dict = dict(pokemon.boosts) if pokemon.boosts else {}
@@ -213,6 +228,15 @@ class BattleBridge:
         level = np.int8(pokemon.level or 100)
         weight_hg = np.int16(getattr(pokemon, 'weight', 50) * 10)
 
+        # Nature — own pokemon's nature is known from the team sheet;
+        # for opponents it is never revealed, so default to 0 (Hardy/neutral).
+        nature_id = np.int8(0)
+        if is_own:
+            raw_nature = getattr(pokemon, 'nature', None)
+            if raw_nature is not None:
+                nature_key = _re.sub(r'[^a-z0-9]', '', str(raw_nature).lower())
+                nature_id = np.int8(_NATURE_LOOKUP.get(nature_key, 0))
+
         return {
             'species_id': np.int16(species_id),
             'ability_id': np.int16(ability_id),
@@ -228,7 +252,7 @@ class BattleBridge:
             'is_active': False, 'fainted': pokemon.fainted,
             'last_move_id': last_move_id,
             'level': level, 'gender': np.int8(0),
-            'nature_id': np.int8(0), 'weight_hg': weight_hg,
+            'nature_id': nature_id, 'weight_hg': weight_hg,
         }
 
     # ── Side conditions ──────────────────────────────────────────────

@@ -116,6 +116,7 @@ if Effect is not None:
         "FOCUS_ENERGY": "focusenergy", "SUBSTITUTE": "substitute",
         "YAWN": "yawn", "TORMENT": "torment", "NIGHTMARE": "nightmare",
         "DESTINY_BOND": "destinybond",
+        "HEAL_BLOCK": "healblock", "GRUDGE": "grudge",
     }
     for attr, val in _EFF_MAP.items():
         try:
@@ -431,26 +432,24 @@ class ObsBridge:
             moff = _OFF_MOVES + m_idx * 45
             buf[moff:moff + 45] = move_feats[m_idx]
 
-        # Sleep turns — match training obs_builder: clip(sleep_turns, 0, 3)
-        # Training engine starts sleep_turns at 0, poke-env at 0 or 1.
-        # Use 0 as default for non-sleeping to match training exactly.
+        # Sleep turns — the engine counts DOWN (sleep_turns = remaining turns,
+        # 1-3 at onset, reaches 0 on the wake turn). poke-env counts UP
+        # (sleep_turns = turns already slept, starts at 0). Invert to estimate
+        # remaining turns: remaining ≈ max(0, 3 - turns_slept).
         if status_code == 4:  # SLP
-            raw_sleep = getattr(pokemon, 'sleep_turns', 0)
-            if raw_sleep is None:
-                raw_sleep = 0
-            sleep_t = max(0, min(raw_sleep, 3))
-            buf[_OFF_SLEEP_BIN + sleep_t] = 1.0
+            turns_slept = getattr(pokemon, 'sleep_turns', 0) or 0
+            remaining = max(0, min(3 - turns_slept, 3))
+            buf[_OFF_SLEEP_BIN + remaining] = 1.0
         else:
             buf[_OFF_SLEEP_BIN] = 1.0  # bin 0 = not sleeping
 
-        # Rest turns bin — match training: uses sleep_turns for rest too
-        # Training encodes rest_bin from sleep_turns when status==SLP
+        # Rest turns bin — same inversion. Rest lasts 2 turns in the engine
+        # (sleep_turns set to 2 on use, decremented to 1, then 0).
+        # poke-env counts up from 0. Estimate remaining = max(0, 2 - turns_slept).
         if status_code == 4:  # SLP
-            raw_sleep = getattr(pokemon, 'sleep_turns', 0)
-            if raw_sleep is None:
-                raw_sleep = 0
-            rest_t = max(0, min(raw_sleep, 2))
-            buf[_OFF_REST_BIN + rest_t] = 1.0
+            turns_slept = getattr(pokemon, 'sleep_turns', 0) or 0
+            rest_remaining = max(0, min(2 - turns_slept, 2))
+            buf[_OFF_REST_BIN + rest_remaining] = 1.0
         else:
             buf[_OFF_REST_BIN] = 1.0  # bin 0 = not resting
 
@@ -507,12 +506,16 @@ class ObsBridge:
         buf[_OFF_LEVEL] = level / 100.0
 
         # Perish count bin (4 dims: 0=none, 1, 2, 3)
+        # Must check Effect.PERISH_SONG directly — it's not in _EFFECT_TO_VOLATILE
+        # since it has no slot in the 27-dim volatile multihot.
         perish_count = 0
-        for eff, turns in effects.items():
-            vol_name = _EFFECT_TO_VOLATILE.get(eff)
-            if vol_name == "perishsong":
-                perish_count = max(0, min(turns if isinstance(turns, int) else 3, 3))
-                break
+        if Effect is not None:
+            _perish_eff = getattr(Effect, 'PERISH_SONG', None)
+            if _perish_eff is not None:
+                for eff, turns in effects.items():
+                    if eff == _perish_eff:
+                        perish_count = max(0, min(int(turns) if isinstance(turns, int) else 3, 3))
+                        break
         buf[_OFF_PERISH_BIN + perish_count] = 1.0
 
         # Protect count — match training: min(prot_data, 4) / 4
@@ -546,7 +549,7 @@ class ObsBridge:
         buf[_FOFF_WEATHER + max(0, min(weather_code, 4))] = 1.0
         buf[_FOFF_WT_TURNS + max(0, min(weather_turns, 7))] = 1.0
 
-        # Trick room / gravity
+        # Trick room / gravity / wonder room
         # Defaults: engine always sets bin 0 for these when inactive
         buf[_FOFF_TR_TURNS] = 1.0
         buf[_FOFF_GRAVITY_T] = 1.0
@@ -559,6 +562,8 @@ class ObsBridge:
                 buf[_FOFF_PSEUDO + 1] = 1.0
                 buf[_FOFF_GRAVITY_T] = 0.0  # clear default
                 buf[_FOFF_GRAVITY_T + max(0, min(turns, 3))] = 1.0
+            elif f == Field.WONDER_ROOM:
+                buf[_FOFF_PSEUDO + 2] = 1.0
 
         # Hazards (own side)
         own_sc = battle.side_conditions or {}
@@ -736,39 +741,68 @@ class ObsBridge:
         opp_active = battle.opponent_active_pokemon
 
         # Resolve move list for the active Pokemon.
-        # IMPORTANT: poke-env's active_pokemon and available_moves can be out
-        # of sync after a switch — active_pokemon is the NEW Pokemon but
-        # available_moves still contains the PREVIOUS Pokemon's moves.
-        # We ALWAYS use available_moves as the authoritative move list since
-        # those are the actual legal moves for this turn.
+        # poke-env's active_pokemon and available_moves can be out of sync:
+        #   - After switch-in: active_pokemon is new but available_moves may lag
+        #   - All PP depleted: available_moves = [Struggle], not in pokemon.moves
+        #   - Timing: request parsed before |switch| updates active_pokemon
+        # We try three sources in order:
+        #   1. available_moves if they match active_pokemon (normal case)
+        #   2. available_moves_from_request — server's authoritative move list
+        #   3. active_pokemon.moves — best fallback for observation correctness
         real_active = own_active
+
+        def _moves_match(pokemon, avail):
+            """Check if ALL available moves belong to this Pokemon's known moves."""
+            if not pokemon or not pokemon.moves:
+                return False
+            p_names = set(m.id for m in pokemon.moves.values())
+            p_names_hp = set()
+            for n in p_names:
+                p_names_hp.add(n)
+                if n.startswith('hiddenpower'):
+                    p_names_hp.add('hiddenpower')
+            for m in avail:
+                n = m.id
+                norm = n if not n.startswith('hiddenpower') else 'hiddenpower'
+                if n not in p_names and norm not in p_names_hp:
+                    return False
+            return True
+
         own_move_list = []
         if available_moves:
-            avail_names = set(m.id for m in available_moves)
-
-            def _moves_match(pokemon):
-                """Check if ALL available moves are in this Pokemon's known moves."""
-                if not pokemon or not pokemon.moves:
-                    return False
-                p_names = set(m.id for m in pokemon.moves.values())
-                p_names_hp = set()
-                for n in p_names:
-                    p_names_hp.add(n)
-                    if n.startswith('hiddenpower'):
-                        p_names_hp.add('hiddenpower')
-                for n in avail_names:
-                    norm = n if not n.startswith('hiddenpower') else 'hiddenpower'
-                    if n not in p_names and norm not in p_names_hp:
-                        return False
-                return True
-
-            if _moves_match(own_active):
-                # Normal case: active Pokemon's moves match available_moves
+            if _moves_match(own_active, available_moves):
+                # Normal case: available_moves are for the active pokemon
                 own_move_list = list(own_active.moves.values())[:4]
             else:
-                # Desync: available_moves don't belong to active_pokemon.
-                # Use available_moves directly — these ARE the legal moves.
-                own_move_list = list(available_moves)[:4]
+                # Desync: try to get the authoritative move list from the request
+                last_req = getattr(battle, '_last_request', None)
+                active_req = (last_req['active'][0]
+                              if last_req and 'active' in last_req else None)
+                reconstructed = []
+                if active_req and own_active:
+                    try:
+                        reconstructed = list(
+                            own_active.available_moves_from_request(active_req)
+                        )
+                    except Exception:
+                        pass
+
+                if reconstructed:
+                    own_move_list = reconstructed
+                    # Update available_moves so legal_mask and action decoder agree
+                    available_moves = reconstructed
+                    print(f"  [DESYNC] {own_active.species if own_active else '?'}: "
+                          f"available_moves mismatch, reconstructed from request: "
+                          f"{[m.id for m in own_move_list]}")
+                else:
+                    # Request reconstruction failed — trust available_moves as
+                    # the legal set (handles Struggle, choice-lock edge cases)
+                    own_move_list = list(available_moves)[:4]
+                    print(f"  [DESYNC] {own_active.species if own_active else '?'}: "
+                          f"available_moves mismatch, no request data, using "
+                          f"available_moves: {[m.id for m in own_move_list]} | "
+                          f"pokemon.moves: "
+                          f"{[m.id for m in (own_active.moves.values() if own_active and own_active.moves else [])]}")
         elif own_active and own_active.moves:
             own_move_list = list(own_active.moves.values())[:4]
 
@@ -843,7 +877,12 @@ class ObsBridge:
                 legal_mask[4 + slot] = 0.0
 
         if legal_mask.sum() == 0:
-            legal_mask[0] = 1.0  # fallback
+            # Should not happen after desync repair above, but log if it does
+            active_name = battle.active_pokemon.species if battle.active_pokemon else '?'
+            print(f"  [BUG] legal_mask all zeros for {active_name}, "
+                  f"own_move_list={[m.id for m in own_move_list if m]}, "
+                  f"available_moves={[m.id for m in available_moves]}")
+            legal_mask[0] = 1.0  # emergency fallback
 
         # Store mappings for action decoding in choose_move
         self._last_own_team = own_team
@@ -1054,30 +1093,58 @@ class PokejaxPlayer(Player):
         available_switches = battle.available_switches
         trapped = getattr(battle, 'trapped', False)
 
-        # poke-env sequencing issue: parse_request() runs before |switch|
-        # sets the active pokemon, so available_moves can be empty even though
-        # the request has moves. Reconstruct from the raw request data, which
-        # respects choice-lock (Outrage), disabled moves, and trapped state.
-        if not available_moves and battle.active_pokemon and battle.active_pokemon.moves:
+        # Repair available_moves if empty or stale (doesn't match active pokemon).
+        # Uses available_moves_from_request as the authoritative source — it
+        # respects choice-lock (Outrage), disabled moves, Struggle, and trapped.
+        active = battle.active_pokemon
+
+        def _avail_matches_active(avail, poke):
+            """True if at least one move in avail belongs to poke's known moves."""
+            if not poke or not poke.moves or not avail:
+                return False
+            p_ids = {m.id for m in poke.moves.values()}
+            p_ids_norm = p_ids | {'hiddenpower'} if any(
+                n.startswith('hiddenpower') for n in p_ids) else p_ids
+            for m in avail:
+                n = m.id
+                norm = 'hiddenpower' if n.startswith('hiddenpower') else n
+                if n in p_ids or norm in p_ids_norm:
+                    return True
+            return False
+
+        def _try_request_reconstruction(poke):
             last_req = getattr(battle, '_last_request', None)
-            active_req = None
-            if last_req and 'active' in last_req:
-                active_req = last_req['active'][0]
-            if active_req:
-                # Use available_moves_from_request which filters disabled moves
-                available_moves = battle.active_pokemon.available_moves_from_request(
-                    active_req
-                )
-                # Also fix trapped state if the request says so
-                if active_req.get('trapped'):
+            if not last_req or 'active' not in last_req:
+                return [], None
+            active_req = last_req['active'][0]
+            try:
+                return list(poke.available_moves_from_request(active_req)), active_req
+            except Exception:
+                return [], active_req
+
+        needs_repair = (
+            not available_moves
+            or (active and active.moves
+                and not _avail_matches_active(available_moves, active))
+        )
+
+        if needs_repair and active:
+            reconstructed, active_req = _try_request_reconstruction(active) if active else ([], None)
+            if reconstructed:
+                if active_req and active_req.get('trapped'):
                     trapped = True
-            else:
-                # Fallback: use all known moves
-                available_moves = list(battle.active_pokemon.moves.values())[:4]
-            if self.verbose:
-                print(f"  Turn {battle.turn}: reconstructed available_moves from "
-                      f"{battle.active_pokemon.species}.moves: "
-                      f"{[m.id for m in available_moves]}")
+                reason = "empty" if not available_moves else "stale/desync"
+                if self.verbose or reason == "stale/desync":
+                    print(f"  Turn {battle.turn}: [{reason.upper()} AVAIL_MOVES] "
+                          f"{active.species}: was={[m.id for m in available_moves]}, "
+                          f"reconstructed={[m.id for m in reconstructed]}")
+                available_moves = reconstructed
+            elif not available_moves and active.moves:
+                available_moves = list(active.moves.values())[:4]
+                if self.verbose:
+                    print(f"  Turn {battle.turn}: reconstructed available_moves from "
+                          f"{active.species}.moves (no request): "
+                          f"{[m.id for m in available_moves]}")
         if not available_switches and battle.active_pokemon:
             available_switches = [
                 p for p in battle.team.values()
