@@ -65,6 +65,7 @@ class TrainConfig:
     # LR warmup
     lr_warmup_steps: int = 1000      # linear warmup steps before cosine decay
     lr_min:          float = 1e-5    # minimum LR floor (cosine decay alpha)
+    lr_schedule_type: str = "cosine" # "cosine" or "power_law" (Wang 2024)
 
     # Model architecture
     arch: str = "transformer"        # "transformer" or "mlp"
@@ -320,19 +321,33 @@ def create_model_and_state(
     else:
         params = init_params
 
-    # Linear warmup then cosine decay
+    # Linear warmup then decay (cosine or power-law)
     warmup_fn = optax.linear_schedule(
         init_value=0.0,
         end_value=cfg.ppo.lr,
         transition_steps=cfg.lr_warmup_steps,
     )
-    cosine_fn = optax.cosine_decay_schedule(
-        init_value=cfg.ppo.lr,
-        decay_steps=max(cfg.total_timesteps - cfg.lr_warmup_steps, 1),
-        alpha=cfg.lr_min / max(cfg.ppo.lr, 1e-10),
-    )
+    if cfg.lr_schedule_type == "power_law":
+        # Wang (2024) schedule: lr / (8x + 1)^1.5 where x = step / total_steps
+        # Critical finding: without this aggressive decay, training stalls at ~55%
+        post_warmup_steps = max(cfg.total_timesteps - cfg.lr_warmup_steps, 1)
+        lr_init = cfg.ppo.lr
+        lr_min = cfg.lr_min
+        def _power_law(count):
+            x = count / post_warmup_steps
+            return jnp.maximum(
+                lr_init / (8.0 * x + 1.0) ** 1.5,
+                lr_min,
+            )
+        decay_fn = _power_law
+    else:
+        decay_fn = optax.cosine_decay_schedule(
+            init_value=cfg.ppo.lr,
+            decay_steps=max(cfg.total_timesteps - cfg.lr_warmup_steps, 1),
+            alpha=cfg.lr_min / max(cfg.ppo.lr, 1e-10),
+        )
     lr_schedule = optax.join_schedules(
-        schedules=[warmup_fn, cosine_fn],
+        schedules=[warmup_fn, decay_fn],
         boundaries=[cfg.lr_warmup_steps],
     )
 
@@ -434,6 +449,7 @@ def train(
     metrics = {}
     t_start = time.time()
     best_win_rate = resume_checkpoint.get("best_win_rate", 0.0) if resume_checkpoint else 0.0
+    best_ps_win_rate = resume_checkpoint.get("best_ps_win_rate", 0.0) if resume_checkpoint else 0.0
 
     transitions_per_rollout = cfg.rollout.n_envs * cfg.rollout.n_steps
 
@@ -539,6 +555,7 @@ def train(
             writer.add_scalar("charts/selfplay_win_rate",    vals["i/win_rate"],    global_step)
             writer.add_scalar("charts/episodes_per_rollout", vals["i/n_episodes"],  global_step)
             writer.add_scalar("charts/mean_episode_reward",  vals["i/mean_reward"], global_step)
+            writer.add_scalar("charts/best_ps_win_rate",     best_ps_win_rate,      global_step)
 
             # Stdout
             print(f"[{timesteps_collected:>12,}] "
@@ -602,6 +619,7 @@ def train(
                 "update_idx": update_idx,
                 "timesteps": timesteps_collected,
                 "best_win_rate": best_win_rate,
+                "best_ps_win_rate": best_ps_win_rate,
                 "arch": cfg.arch,
                 "model_kwargs": cfg.model_kwargs,
             }
@@ -623,7 +641,29 @@ def train(
             latest_ckpt = os.path.join(cfg.checkpoint_dir, "ppo_latest.pkl")
             if os.path.exists(latest_ckpt):
                 print(f"  PS server eval ({cfg.ps_eval_games} games each)...")
-                _run_ps_eval(latest_ckpt, cfg.ps_eval_games, writer, timesteps_collected)
+                ps_results = _run_ps_eval(latest_ckpt, cfg.ps_eval_games, writer, timesteps_collected)
+
+                # Save best checkpoint based on PS eval (the real target metric)
+                if ps_results is not None:
+                    ps_wr_h = ps_results.get("ps_eval/win_rate_vs_heuristic", 0.0)
+                    if ps_wr_h > best_ps_win_rate:
+                        best_ps_win_rate = ps_wr_h
+                        ckpt_ps = {
+                            "params": train_state.params,
+                            "opt_state": train_state.opt_state,
+                            "train_step": train_state.step,
+                            "update_idx": update_idx,
+                            "timesteps": timesteps_collected,
+                            "best_win_rate": best_win_rate,
+                            "best_ps_win_rate": best_ps_win_rate,
+                            "ps_eval_win_rate_heuristic": ps_wr_h,
+                            "arch": cfg.arch,
+                            "model_kwargs": cfg.model_kwargs,
+                        }
+                        path_ps = os.path.join(cfg.checkpoint_dir, "ppo_best_ps.pkl")
+                        with open(path_ps, "wb") as f:
+                            pickle.dump(ckpt_ps, f)
+                        print(f"  New PS best! ps_win_rate_vs_heuristic={ps_wr_h:.0%} saved to {path_ps}")
 
     # Final checkpoint
     ckpt = {
@@ -633,6 +673,7 @@ def train(
         "update_idx": update_idx,
         "timesteps": timesteps_collected,
         "best_win_rate": best_win_rate,
+        "best_ps_win_rate": best_ps_win_rate,
         "arch": cfg.arch,
         "model_kwargs": cfg.model_kwargs,
     }

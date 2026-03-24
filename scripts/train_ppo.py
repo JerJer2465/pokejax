@@ -68,6 +68,9 @@ def main():
                         help="Linear LR warmup steps")
     parser.add_argument("--lr-min",      type=float, default=1e-5,
                         help="Minimum LR floor for cosine decay")
+    parser.add_argument("--lr-schedule", type=str, default="cosine",
+                        choices=["cosine", "power_law"],
+                        help="LR schedule type: cosine or power_law (Wang 2024)")
     parser.add_argument("--ent-coef-end", type=float, default=0.005,
                         help="Final entropy coef after annealing")
     parser.add_argument("--ent-coef-decay-steps", type=int, default=15000,
@@ -161,6 +164,7 @@ def main():
         pool_latest_ratio=args.pool_latest_ratio,
         lr_warmup_steps=args.lr_warmup,
         lr_min=args.lr_min,
+        lr_schedule_type=args.lr_schedule,
         arch=args.arch,
         model_kwargs={k: v for k, v in {
             "token_dim": args.token_dim,
