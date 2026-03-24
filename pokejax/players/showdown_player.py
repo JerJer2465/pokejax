@@ -795,14 +795,25 @@ class ObsBridge:
                           f"available_moves mismatch, reconstructed from request: "
                           f"{[m.id for m in own_move_list]}")
                 else:
-                    # Request reconstruction failed — trust available_moves as
-                    # the legal set (handles Struggle, choice-lock edge cases)
-                    own_move_list = list(available_moves)[:4]
-                    print(f"  [DESYNC] {own_active.species if own_active else '?'}: "
-                          f"available_moves mismatch, no request data, using "
-                          f"available_moves: {[m.id for m in own_move_list]} | "
-                          f"pokemon.moves: "
-                          f"{[m.id for m in (own_active.moves.values() if own_active and own_active.moves else [])]}")
+                    # Request reconstruction failed.
+                    # If active pokemon has known moves, use them — they give the
+                    # correct observation AND are legal for a freshly switched-in
+                    # pokemon (no choice-lock yet). Also update available_moves
+                    # so the legal_mask and action decoder agree.
+                    if own_active and own_active.moves:
+                        own_move_list = list(own_active.moves.values())[:4]
+                        available_moves = own_move_list  # sync for legal_mask
+                        print(f"  [DESYNC] {own_active.species}: "
+                              f"stale available_moves={[m.id for m in available_moves[:4]]}, "
+                              f"no request — using pokemon.moves: "
+                              f"{[m.id for m in own_move_list]}")
+                    else:
+                        # Last resort: available_moves (might be stale but
+                        # at least gives a legal action)
+                        own_move_list = list(available_moves)[:4]
+                        print(f"  [DESYNC] {own_active.species if own_active else '?'}: "
+                              f"stale available_moves, no request, no pokemon.moves — "
+                              f"using available_moves: {[m.id for m in own_move_list]}")
         elif own_active and own_active.moves:
             own_move_list = list(own_active.moves.values())[:4]
 
@@ -866,14 +877,13 @@ class ObsBridge:
             if p is not None and id(p) in available_switch_ids:
                 legal_mask[4 + slot] = 1.0
 
-        # Safety: ensure the active pokemon's slot is NEVER legal for switching,
-        # even if poke-env's available_switches is stale or inconsistent.
+        # Safety: ensure the active pokemon's slot is NEVER legal for switching.
+        # poke-env's available_switches can include the newly active pokemon
+        # during the switch-in turn (timing issue). Silently remove it.
         active_pokemon = battle.active_pokemon
         for slot in range(6):
             p = own_team[slot]
-            if p is not None and p is active_pokemon and legal_mask[4 + slot] > 0:
-                print(f"  [BUG] legal_mask included active pokemon "
-                      f"{active_pokemon.species} at slot {slot} — removing")
+            if p is not None and p is active_pokemon:
                 legal_mask[4 + slot] = 0.0
 
         if legal_mask.sum() == 0:
@@ -1139,12 +1149,17 @@ class PokejaxPlayer(Player):
                           f"{active.species}: was={[m.id for m in available_moves]}, "
                           f"reconstructed={[m.id for m in reconstructed]}")
                 available_moves = reconstructed
-            elif not available_moves and active.moves:
+            elif active.moves:
+                # Reconstruction failed — use active pokemon's known moves.
+                # These are the correct moves for any freshly switched-in pokemon
+                # (no choice-lock yet). Also covers the stale-available_moves case.
+                old = [m.id for m in available_moves]
                 available_moves = list(active.moves.values())[:4]
-                if self.verbose:
-                    print(f"  Turn {battle.turn}: reconstructed available_moves from "
-                          f"{active.species}.moves (no request): "
-                          f"{[m.id for m in available_moves]}")
+                if self.verbose or (old and set(old) != {m.id for m in available_moves}):
+                    label = "stale/desync" if old else "empty"
+                    print(f"  Turn {battle.turn}: [{label.upper()} AVAIL_MOVES no request] "
+                          f"{active.species}: was={old}, "
+                          f"using pokemon.moves={[m.id for m in available_moves]}")
         if not available_switches and battle.active_pokemon:
             available_switches = [
                 p for p in battle.team.values()
@@ -1181,6 +1196,20 @@ class PokejaxPlayer(Player):
 
         # Build observation (also stores _last_own_team and _last_own_move_list)
         obs = self.obs_bridge.build_obs(battle)
+
+        # Re-sync available_moves after build_obs: the PS |request| may have
+        # arrived asynchronously while build_obs was running, updating
+        # battle.available_moves after our pre-obs repair.  Only use the fresh
+        # battle state if it actually belongs to the current active pokemon;
+        # otherwise fall back to _last_own_move_list (what the obs/legal_mask
+        # were built from) so the action decoder is consistent.
+        fresh_avail = list(battle.available_moves)
+        if fresh_avail and _avail_matches_active(fresh_avail, battle.active_pokemon):
+            available_moves = fresh_avail
+        else:
+            available_moves = [
+                m for m in self.obs_bridge._last_own_move_list if m is not None
+            ] or available_moves
 
         # Override legal mask: if trapped, disable all switch actions
         if trapped:
