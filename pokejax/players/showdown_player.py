@@ -437,7 +437,9 @@ class ObsBridge:
         # (sleep_turns = turns already slept, starts at 0). Invert to estimate
         # remaining turns: remaining ≈ max(0, 3 - turns_slept).
         if status_code == 4:  # SLP
-            turns_slept = getattr(pokemon, 'sleep_turns', 0) or 0
+            # poke-env 0.12 renamed sleep_turns → status_counter
+            turns_slept = (getattr(pokemon, 'sleep_turns', None)
+                           or getattr(pokemon, 'status_counter', 0) or 0)
             remaining = max(0, min(3 - turns_slept, 3))
             buf[_OFF_SLEEP_BIN + remaining] = 1.0
         else:
@@ -447,7 +449,8 @@ class ObsBridge:
         # (sleep_turns set to 2 on use, decremented to 1, then 0).
         # poke-env counts up from 0. Estimate remaining = max(0, 2 - turns_slept).
         if status_code == 4:  # SLP
-            turns_slept = getattr(pokemon, 'sleep_turns', 0) or 0
+            turns_slept = (getattr(pokemon, 'sleep_turns', None)
+                           or getattr(pokemon, 'status_counter', 0) or 0)
             rest_remaining = max(0, min(2 - turns_slept, 2))
             buf[_OFF_REST_BIN + rest_remaining] = 1.0
         else:
@@ -506,16 +509,24 @@ class ObsBridge:
         buf[_OFF_LEVEL] = level / 100.0
 
         # Perish count bin (4 dims: 0=none, 1, 2, 3)
-        # Must check Effect.PERISH_SONG directly — it's not in _EFFECT_TO_VOLATILE
-        # since it has no slot in the 27-dim volatile multihot.
+        # poke-env 0.8: Effect.PERISH_SONG with turns remaining as value
+        # poke-env 0.12: PERISH3/PERISH2/PERISH1/PERISH0 separate effects
         perish_count = 0
         if Effect is not None:
-            _perish_eff = getattr(Effect, 'PERISH_SONG', None)
-            if _perish_eff is not None:
-                for eff, turns in effects.items():
-                    if eff == _perish_eff:
-                        perish_count = max(0, min(int(turns) if isinstance(turns, int) else 3, 3))
-                        break
+            # 0.12 style: PERISH3=3 turns, PERISH2=2, PERISH1=1, PERISH0=about to faint
+            for n in (3, 2, 1, 0):
+                _pe = getattr(Effect, f'PERISH{n}', None)
+                if _pe is not None and _pe in effects:
+                    perish_count = n
+                    break
+            else:
+                # 0.8 fallback
+                _perish_eff = getattr(Effect, 'PERISH_SONG', None)
+                if _perish_eff is not None:
+                    for eff, turns in effects.items():
+                        if eff == _perish_eff:
+                            perish_count = max(0, min(int(turns) if isinstance(turns, int) else 3, 3))
+                            break
         buf[_OFF_PERISH_BIN + perish_count] = 1.0
 
         # Protect count — match training: min(prot_data, 4) / 4
