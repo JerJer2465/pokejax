@@ -204,19 +204,21 @@ class TestSleepMechanicsParity:
         assert len(durations) >= 2, "Sleep should have variable duration"
 
     def test_sleep_decrement_and_wake(self):
-        """Counter decrements each residual and wakes at 0."""
+        """Counter decrements at BeforeMove (PS Gen 4) and wakes at 0.
+        Sleep decrements in check_sleep_before_move, NOT apply_sleep_residual."""
         state = _make_state()
         state = set_status(state, 0, 0, jnp.int8(STATUS_SLP))
         state = state._replace(
             sides_team_sleep_turns=state.sides_team_sleep_turns.at[0, 0].set(jnp.int8(2))
         )
-        # Turn 1: 2 → 1
-        state, _ = apply_sleep_residual(state, 0, jax.random.PRNGKey(0))
+        # Turn 1: 2 → 1 (at BeforeMove)
+        _, _, state = check_sleep_before_move(state, 0, jax.random.PRNGKey(0))
         assert int(state.sides_team_sleep_turns[0, 0]) == 1
         assert int(state.sides_team_status[0, 0]) == STATUS_SLP
         # Turn 2: 1 → 0 → wakes up
-        state, _ = apply_sleep_residual(state, 0, jax.random.PRNGKey(1))
+        can_move, _, state = check_sleep_before_move(state, 0, jax.random.PRNGKey(0))
         assert int(state.sides_team_status[0, 0]) == STATUS_NONE
+        assert bool(can_move)
 
     def test_sleeping_pokemon_cannot_move(self):
         state = _make_state()
