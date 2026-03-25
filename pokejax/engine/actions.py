@@ -16,7 +16,7 @@ import jax.numpy as jnp
 from pokejax.types import (
     BattleState,
     VOL_PROTECT, VOL_CHOICELOCK, VOL_RECHARGING, VOL_CHARGING, VOL_DESTINYBOND,
-    VOL_TAUNT,
+    VOL_TAUNT, VOL_FLINCH,
     STATUS_NONE,
     CATEGORY_STATUS,
     MAX_TEAM_SIZE,
@@ -152,6 +152,11 @@ def execute_move_action(
     # Confusion (deals self-hit and sets can_move=False if hit)
     conf_can_move, key, state = check_confusion_before_move(state, atk_side, key, tables)
     can_move = can_move & conf_can_move
+
+    # Flinch: flinched Pokemon cannot act this turn
+    atk_vols_flinch = state.sides_team_volatiles[atk_side, atk_idx]
+    is_flinched = (atk_vols_flinch & jnp.uint32(1 << VOL_FLINCH)) != jnp.uint32(0)
+    can_move = can_move & ~is_flinched
 
     # Taunt: cannot use status moves (CATEGORY_STATUS) while taunted
     atk_vols = state.sides_team_volatiles[atk_side, atk_idx]

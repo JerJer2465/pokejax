@@ -442,13 +442,14 @@ def _extract_species(showdown_path: Path, gen: int,
 # Move extraction
 # ---------------------------------------------------------------------------
 
-MOVE_FIELDS = 22
+MOVE_FIELDS = 23
 # Fields: [base_power, accuracy, type, category, priority, pp,
 #          target, flags_lo, flags_hi, crit_ratio,
 #          secondary_chance, secondary_status, secondary_boost_stat, secondary_boost_amount,
 #          drain_num, drain_den, recoil_num, recoil_den,
 #          multi_hit_min, multi_hit_max,
-#          heal_num, heal_den]
+#          heal_num, heal_den,
+#          flinch_chance]
 
 _CATEGORY_MAP = {"Physical": 0, "Special": 1, "Status": 2}
 _TARGET_MAP = {
@@ -601,6 +602,11 @@ def _extract_moves(showdown_path: Path, gen: int,
         if heal and isinstance(heal, list) and len(heal) == 2:
             data[i, 20] = int(heal[0])
             data[i, 21] = int(heal[1])
+
+        # Flinch chance (secondary.volatileStatus == 'flinch')
+        sec_volatile = sec.get("volatileStatus", "") if (sec and isinstance(sec, dict)) else ""
+        if str(sec_volatile) == "flinch":
+            data[i, 22] = data[i, 10]  # same chance as secondary_chance
 
     name_to_id = {name: i for i, name in enumerate(names)}
     return data, name_to_id, names

@@ -504,8 +504,8 @@ class TestHitPipelinePhase4:
         # Build a custom move table: move 0 = Normal-type, Status, target=self(1), bp=0
         from pokejax.data.extractor import MOVE_FIELDS
         moves_np = np.zeros((4, MOVE_FIELDS), dtype=np.int16)
-        moves_np[0] = [0, 101, 1, 2, 0, 10, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        #              bp acc  ty cat pri pp  tgt ...  (type=1=Normal, category=2=Status, target=1=self)
+        moves_np[0] = [0, 101, 1, 2, 0, 10, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        #              bp acc  ty cat pri pp  tgt ...  (type=1=Normal, category=2=Status, target=1=self, flinch=0)
 
         from pokejax.data.move_effects_data import MOVE_EFFECT_FIELDS, NONE_STAT
         eff_np = np.zeros((4, MOVE_EFFECT_FIELDS), dtype=np.int16)
@@ -546,8 +546,8 @@ class TestHitPipelinePhase4:
         from pokejax.data.extractor import MOVE_FIELDS
         moves_np = np.zeros((4, MOVE_FIELDS), dtype=np.int16)
         # Spikes: Ground-type, Status, target=foeSide(10), always hits (101)
-        moves_np[0] = [0, 101, 9, 2, 0, 20, 10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-        #              bp acc  ty cat pri pp  tgt ... (type=9=Ground, target=10=foeSide)
+        moves_np[0] = [0, 101, 9, 2, 0, 20, 10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        #              bp acc  ty cat pri pp  tgt ... (type=9=Ground, target=10=foeSide, flinch=0)
 
         from pokejax.data.move_effects_data import MOVE_EFFECT_FIELDS, NONE_STAT
         eff_np = np.zeros((4, MOVE_EFFECT_FIELDS), dtype=np.int16)
@@ -583,7 +583,7 @@ class TestHitPipelinePhase4:
         moves_np = np.zeros((4, MOVE_FIELDS), dtype=np.int16)
         # Recover: 0 bp, always hits (101), Normal, Status, target=self(1), heal 1/2
         # heal_num=1 at index 20, heal_den=2 at index 21
-        moves_np[0] = [0, 101, 1, 2, 0, 10, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2]
+        moves_np[0] = [0, 101, 1, 2, 0, 10, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0]
 
         from pokejax.data.move_effects_data import MOVE_EFFECT_FIELDS, NONE_STAT
         eff_np = np.zeros((4, MOVE_EFFECT_FIELDS), dtype=np.int16)
@@ -618,7 +618,7 @@ class TestHitPipelinePhase4:
         moves_np = np.zeros((4, MOVE_FIELDS), dtype=np.int16)
         # Fake Psychic: Special, 90 bp, Psychic-type, 100% secondary, -1 SPD on foe
         # MF_SEC_CHANCE=100, MF_SEC_STATUS=0, MF_SEC_BOOST_STAT=3(SPD), MF_SEC_BOOST_AMT=-1
-        moves_np[0] = [90, 100, 11, 1, 0, 10, 0, 0, 0, 1, 100, 0, BOOST_SPD, -1, 0, 0, 0, 0, 0, 0, 0, 0]
+        moves_np[0] = [90, 100, 11, 1, 0, 10, 0, 0, 0, 1, 100, 0, BOOST_SPD, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
         from pokejax.data.move_effects_data import MOVE_EFFECT_FIELDS, NONE_STAT
         eff_np = np.zeros((4, MOVE_EFFECT_FIELDS), dtype=np.int16)

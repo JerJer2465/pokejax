@@ -34,6 +34,7 @@ from pokejax.core.damage import (
     MF_DRAIN_NUM, MF_DRAIN_DEN,
     MF_RECOIL_NUM, MF_RECOIL_DEN, MF_HEAL_NUM, MF_HEAL_DEN,
     MF_FLAGS_LO, MF_TARGET, FLAG_DEFROST, FLAG_PROTECT,
+    MF_FLINCH_CHANCE,
 )
 from pokejax.core.state import set_fainted
 from pokejax.core.damage import apply_heal, fraction_of_max_hp
@@ -473,6 +474,33 @@ def step8_move_hit_loop(tables, state: BattleState,
     new_def_status = jnp.where(do_defrost, jnp.int8(STATUS_NONE), def_status)
     new_status_arr2 = state.sides_team_status.at[def_side, def_idx].set(new_def_status)
     state = state._replace(sides_team_status=new_status_arr2)
+
+    # Flinch: moves with flinch_chance > 0 may cause the target to flinch.
+    # Substitute blocks flinch (Showdown: secondary effects don't pass sub).
+    # Serene Grace doubles flinch chance.
+    from pokejax.types import VOL_FLINCH
+    flinch_chance = tables.moves[move_id.astype(jnp.int32), MF_FLINCH_CHANCE].astype(jnp.int32)
+    has_flinch = flinch_chance > jnp.int32(0)
+    effective_flinch_chance = jnp.where(
+        has_serene_grace,
+        jnp.minimum(jnp.int32(100), flinch_chance * 2),
+        flinch_chance,
+    )
+    key, flinch_key = rng_utils.split(key)
+    flinch_hits = (has_flinch
+                   & rng_utils.rand_bool_pct(flinch_key, effective_flinch_chance)
+                   & ~cancelled
+                   & ~def_has_sub
+                   & (dmg > jnp.int32(0)))
+    def_vols_flinch = state.sides_team_volatiles[def_side, def_idx]
+    new_def_vols_flinch = jnp.where(
+        flinch_hits,
+        def_vols_flinch | jnp.uint32(1 << VOL_FLINCH),
+        def_vols_flinch,
+    )
+    state = state._replace(
+        sides_team_volatiles=state.sides_team_volatiles.at[def_side, def_idx].set(new_def_vols_flinch)
+    )
 
     return state, dmg.astype(jnp.int32), is_crit, new_key
 

@@ -53,6 +53,7 @@ MF_MULTIHIT_MIN = 18
 MF_MULTIHIT_MAX = 19
 MF_HEAL_NUM     = 20
 MF_HEAL_DEN     = 21
+MF_FLINCH_CHANCE = 22
 
 # Move flag bits (stored in MF_FLAGS_LO and MF_FLAGS_HI, packed into uint16)
 FLAG_CONTACT    = 1 << 0
