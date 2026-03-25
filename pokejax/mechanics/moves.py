@@ -37,6 +37,7 @@ from pokejax.data.move_effects_data import (
     ME_PERISH_SONG, ME_SLEEP_TALK, ME_DEFOG, ME_TRICK, ME_HAZE, ME_TWO_TURN,
     ME_LOCKEDMOVE, ME_COUNTER, ME_MIRROR_COAT, ME_METAL_BURST,
     ME_SECONDARY_CONFUSE, ME_SWAGGER, ME_FLATTER,
+    ME_LEVEL_DAMAGE, ME_FIXED_DAMAGE, ME_SUPER_FANG, ME_ENDEAVOR,
     NONE_STAT,
 )
 from pokejax.core.damage import MF_SEC_CHANCE
@@ -415,16 +416,19 @@ def execute_move_effects(
     # Encoding: bits[1:0] = slot index (0-3), bits[7:2] = timer (starts at 3 turns).
     # Packed value = (timer << 2) | slot.
     # This avoids conflating the slot with the timer counter (slot 0 would expire immediately).
-    is_encore = is_vol_foe & (stat1 == jnp.int32(VOL_ENCORE))
+    # PS: Encore fails if the target has no last move (last_move_id == -1).
+    is_encore_attempt = is_vol_foe & (stat1 == jnp.int32(VOL_ENCORE))
     def_last_move = state.sides_team_last_move_id[def_side, def_idx]
+    has_last_move = def_last_move >= jnp.int16(0)
     encored_slot = jnp.int8(0)
+    slot_matched = jnp.bool_(False)
     for _slot in range(4):
         slot_move = state.sides_team_move_ids[def_side, def_idx, _slot]
-        encored_slot = jnp.where(
-            (slot_move == def_last_move) & (def_last_move >= jnp.int16(0)),
-            jnp.int8(_slot),
-            encored_slot,
-        )
+        match = (slot_move == def_last_move) & has_last_move
+        encored_slot = jnp.where(match, jnp.int8(_slot), encored_slot)
+        slot_matched = slot_matched | match
+    # Encore only succeeds if a matching slot was found
+    is_encore = is_encore_attempt & slot_matched
     # Pack: timer=3 in upper bits, slot in lower 2 bits
     packed_encore = jnp.int8((3 << 2) | encored_slot.astype(jnp.int32))
     old_encore_data = state.sides_team_volatile_data[def_side, def_idx, VOL_ENCORE]
@@ -434,6 +438,11 @@ def execute_move_effects(
             def_side, def_idx, VOL_ENCORE
         ].set(new_encore_data)
     )
+    # If Encore failed (no last move), undo the volatile bit that was set generically above
+    encore_failed = is_encore_attempt & ~is_encore
+    state = _apply_volatile_bit(state, def_side, def_idx,
+                                 jnp.int32(VOL_ENCORE),
+                                 ~encore_failed)  # clears bit if encore_failed
 
     # ------------------------------------------------------------------
     # ME_SUBSTITUTE: create substitute at 25% max HP cost
@@ -848,5 +857,44 @@ def execute_move_effects(
             def_side, def_idx, VOL_CONFUSED
         ].set(new_sw_conf_dat)
     )
+
+    # ------------------------------------------------------------------
+    # ME_LEVEL_DAMAGE: damage = attacker's level (Seismic Toss, Night Shade).
+    # Type immunity already handled by hit pipeline (cancelled=True if immune).
+    # ------------------------------------------------------------------
+    atk_level_val = state.sides_team_level[atk_side, atk_idx].astype(jnp.int32)
+    is_level_dmg = should_apply & (effect_type == jnp.int32(ME_LEVEL_DAMAGE))
+    level_dmg = jnp.where(is_level_dmg, atk_level_val, jnp.int32(0))
+    state = apply_damage(state, def_side, def_idx, level_dmg)
+
+    # ------------------------------------------------------------------
+    # ME_FIXED_DAMAGE: deal exactly amt1 HP (Dragon Rage=40, Sonic Boom=20).
+    # Type immunity already handled by hit pipeline.
+    # ------------------------------------------------------------------
+    is_fixed_dmg = should_apply & (effect_type == jnp.int32(ME_FIXED_DAMAGE))
+    fixed_amt = jnp.where(is_fixed_dmg, amt1, jnp.int32(0))
+    state = apply_damage(state, def_side, def_idx, fixed_amt)
+
+    # ------------------------------------------------------------------
+    # ME_SUPER_FANG: deal 50% of target's current HP (min 1).
+    # ------------------------------------------------------------------
+    is_super_fang = should_apply & (effect_type == jnp.int32(ME_SUPER_FANG))
+    def_hp_sf = state.sides_team_hp[def_side, def_idx].astype(jnp.int32)
+    super_fang_dmg = jnp.where(is_super_fang,
+                                 jnp.maximum(jnp.int32(1), def_hp_sf // 2),
+                                 jnp.int32(0))
+    state = apply_damage(state, def_side, def_idx, super_fang_dmg)
+
+    # ------------------------------------------------------------------
+    # ME_ENDEAVOR: reduce target HP to attacker's HP.
+    # No-op if target HP <= attacker HP; type immunity handled by pipeline.
+    # ------------------------------------------------------------------
+    is_endeavor = should_apply & (effect_type == jnp.int32(ME_ENDEAVOR))
+    atk_hp_end = state.sides_team_hp[atk_side, atk_idx].astype(jnp.int32)
+    def_hp_end = state.sides_team_hp[def_side, def_idx].astype(jnp.int32)
+    endeavor_dmg = jnp.where(is_endeavor,
+                               jnp.maximum(jnp.int32(0), def_hp_end - atk_hp_end),
+                               jnp.int32(0))
+    state = apply_damage(state, def_side, def_idx, endeavor_dmg)
 
     return state, key
