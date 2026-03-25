@@ -120,7 +120,8 @@ def force_switch(state: BattleState, side: int, new_slot: jnp.ndarray,
                  tables, cfg) -> BattleState:
     """
     Forced switch (e.g., from Roar, Whirlwind, Dragon Tail, phazing).
-    Skips switch-out effects (no choice on switching out).
+    Skips switch-out effects (no voluntary choice on switching out).
+    Switch-in abilities (Intimidate, Drizzle, etc.) still trigger.
     """
     state = clear_volatiles(state, side, state.sides_active_idx[side])
     state = reset_boosts(state, side, state.sides_active_idx[side])
@@ -128,6 +129,9 @@ def force_switch(state: BattleState, side: int, new_slot: jnp.ndarray,
     new_active_turns = state.sides_team_active_turns.at[side, new_slot].set(jnp.int8(0))
     state = state._replace(sides_team_active_turns=new_active_turns)
     state = apply_entry_hazards(state, side, tables)
+    # Switch-in abilities trigger for the replacement Pokemon
+    new_idx = state.sides_active_idx[side]
+    state = run_event_switch_in(state, side, new_idx)
     return state
 
 
