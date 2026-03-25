@@ -568,8 +568,10 @@ def _encode_field(state: BattleState, player: int) -> jnp.ndarray:
     tw_opp = (state.sides_side_conditions[opp, SC_TAILWIND] > 0).astype(jnp.float32)
     tailwind = jnp.array([tw_own, tw_opp])
 
-    # Wish (2) — not implemented
-    wish = jnp.zeros(2, dtype=jnp.float32)
+    # Wish (2) — pending wish: 1.0 if wish will heal next turn, 0 otherwise
+    wish_own = (state.sides_wish_turns[own] > jnp.int8(0)).astype(jnp.float32)
+    wish_opp = (state.sides_wish_turns[opp] > jnp.int8(0)).astype(jnp.float32)
+    wish = jnp.array([wish_own, wish_opp])
 
     # Safeguard (2)
     sg_own = (state.sides_side_conditions[own, SC_SAFEGUARD] > 0).astype(jnp.float32)

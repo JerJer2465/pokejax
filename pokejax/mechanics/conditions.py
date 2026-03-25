@@ -746,11 +746,47 @@ def tick_side_conditions(state: BattleState, side: int) -> BattleState:
 # Full residual for one side (called at end of each turn)
 # ---------------------------------------------------------------------------
 
+def apply_wish_residual(state: BattleState, side: int) -> BattleState:
+    """
+    Tick the Wish counter for `side`.
+    When the counter goes from 1 to 0, apply the stored heal to the active Pokemon.
+    (PS Gen 4: Wish heals at end of the turn AFTER it is used.)
+    """
+    wish_turns = state.sides_wish_turns[side].astype(jnp.int32)
+    wish_hp    = state.sides_wish_hp[side].astype(jnp.int32)
+
+    has_wish = wish_turns > jnp.int32(0)
+    new_wish_turns = jnp.where(has_wish, wish_turns - jnp.int32(1), wish_turns).astype(jnp.int8)
+    heals_now = has_wish & (new_wish_turns == jnp.int32(0))
+
+    # Update counter
+    state = state._replace(
+        sides_wish_turns=state.sides_wish_turns.at[side].set(new_wish_turns),
+    )
+
+    # Apply heal to active Pokemon when wish expires
+    idx = state.sides_active_idx[side]
+    cur_hp = state.sides_team_hp[side, idx].astype(jnp.int32)
+    max_hp = state.sides_team_max_hp[side, idx].astype(jnp.int32)
+    new_hp = jnp.minimum(max_hp, cur_hp + wish_hp).astype(jnp.int16)
+    state = state._replace(
+        sides_team_hp=state.sides_team_hp.at[side, idx].set(
+            jnp.where(heals_now, new_hp, state.sides_team_hp[side, idx])
+        ),
+        # Clear wish_hp once used
+        sides_wish_hp=state.sides_wish_hp.at[side].set(
+            jnp.where(heals_now, jnp.int16(0), state.sides_wish_hp[side])
+        ),
+    )
+    return state
+
+
 def apply_residual(state: BattleState, side: int,
                    key: jnp.ndarray, cfg) -> tuple[BattleState, jnp.ndarray]:
     """
     Apply all end-of-turn effects for a side's active Pokemon.
     Order (matches Showdown's residual event order):
+      0. Wish heal
       1. Weather damage
       2. Leech Seed / Partial Trap / Ingrain
       3. Burn / Poison / Toxic
@@ -763,6 +799,9 @@ def apply_residual(state: BattleState, side: int,
 
     # Skip if fainted
     is_alive = ~state.sides_team_fainted[side, idx]
+
+    # 0: Wish delayed heal
+    state = apply_wish_residual(state, side)
 
     # 1-3: status and volatile residuals
     state = apply_volatile_residuals(state, side)

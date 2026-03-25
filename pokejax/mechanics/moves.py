@@ -699,17 +699,25 @@ def execute_move_effects(
             )
 
     # ------------------------------------------------------------------
-    # ME_WISH: store wish data (simplified: heal immediately for RL)
-    # A proper implementation would store turn+heal in side_conditions
-    # and resolve at end of next turn. Simplified as immediate 50% heal.
+    # ME_WISH: store wish — heals 50% of user's max HP at end of NEXT turn.
+    # (Gen 4 PS: wish resolves at the end of the turn after it is used.)
+    # sides_wish_turns[side] counts down: 2 → 1 → 0 (heals when it reaches 1
+    # at the start of the tick, then is set to 0).
+    # sides_wish_hp[side] stores the heal amount.
     # ------------------------------------------------------------------
     is_wish = should_apply & (effect_type == jnp.int32(ME_WISH))
-    wish_heal = jnp.maximum(jnp.int32(1), atk_max_hp // 2)
-    wish_new_hp = jnp.minimum(atk_max_hp, atk_hp + wish_heal).astype(jnp.int16)
+    wish_heal_amt = jnp.maximum(jnp.int32(1), atk_max_hp // 2).astype(jnp.int16)
+    # Only overwrite wish if not already pending (first-come-first-served like PS)
+    wish_pending = state.sides_wish_turns[atk_side] > jnp.int8(0)
+    new_wish_turns = jnp.where(is_wish & ~wish_pending,
+                                jnp.int8(2),
+                                state.sides_wish_turns[atk_side])
+    new_wish_hp = jnp.where(is_wish & ~wish_pending,
+                              wish_heal_amt,
+                              state.sides_wish_hp[atk_side])
     state = state._replace(
-        sides_team_hp=state.sides_team_hp.at[atk_side, atk_idx].set(
-            jnp.where(is_wish, wish_new_hp, state.sides_team_hp[atk_side, atk_idx])
-        )
+        sides_wish_turns=state.sides_wish_turns.at[atk_side].set(new_wish_turns),
+        sides_wish_hp=state.sides_wish_hp.at[atk_side].set(new_wish_hp),
     )
 
     # ------------------------------------------------------------------

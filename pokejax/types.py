@@ -337,6 +337,12 @@ class BattleState(NamedTuple):
     sides_last_dmg_phys:      jnp.ndarray  # int16[2]
     sides_last_dmg_spec:      jnp.ndarray  # int16[2]
 
+    # Wish: pending delayed heal per side.
+    # sides_wish_turns[s] = 0: no wish pending; 1: heals this end-of-turn.
+    # sides_wish_hp[s]: amount to heal (half max HP of the Pokemon that used Wish).
+    sides_wish_turns:         jnp.ndarray  # int8[2]
+    sides_wish_hp:            jnp.ndarray  # int16[2]
+
     field:                    FieldState
 
     # Turn counter and result

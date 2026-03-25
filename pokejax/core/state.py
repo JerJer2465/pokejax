@@ -396,6 +396,8 @@ def make_battle_state(
         sides_team_active_turns  = jnp.zeros((2, 6), dtype=jnp.int8),
         sides_last_dmg_phys      = jnp.zeros(2, dtype=jnp.int16),
         sides_last_dmg_spec      = jnp.zeros(2, dtype=jnp.int16),
+        sides_wish_turns         = jnp.zeros(2, dtype=jnp.int8),
+        sides_wish_hp            = jnp.zeros(2, dtype=jnp.int16),
         field                    = make_field(),
         turn                     = jnp.int16(0),
         finished                 = jnp.bool_(False),
