@@ -28,7 +28,7 @@ from pokejax.types import (
     VOL_CONFUSED, VOL_PARTIALLY_TRAPPED, VOL_SEEDED, VOL_SUBSTITUTE,
     VOL_PROTECT, VOL_ENCORE, VOL_TAUNT, VOL_HEALBLOCK, VOL_EMBARGO,
     VOL_INGRAIN, VOL_YAWN, VOL_RECHARGING, VOL_LOCKEDMOVE, VOL_CHOICELOCK,
-    VOL_FOCUSENERGY, VOL_DISABLE, VOL_PERISH,
+    VOL_FOCUSENERGY, VOL_DISABLE, VOL_PERISH, VOL_NIGHTMARE, VOL_CURSE,
     TYPE_ROCK, TYPE_FLYING, TYPE_GROUND, TYPE_STEEL, TYPE_ICE,
     TYPE_FIRE, TYPE_WATER, TYPE_POISON,
 )
@@ -448,6 +448,29 @@ def apply_volatile_residuals(state: BattleState, side: int) -> BattleState:
     new_hp  = jnp.minimum(max_hp, cur_hp + ingrain_heal.astype(jnp.int16))
     new_hp_arr = state.sides_team_hp.at[side, idx].set(new_hp)
     state = state._replace(sides_team_hp=new_hp_arr)
+
+    # Nightmare: lose 1/4 max HP per turn while asleep
+    nightmared = has_volatile(state, side, idx, VOL_NIGHTMARE)
+    is_asleep  = state.sides_team_status[side, idx] == jnp.int8(STATUS_SLP)
+    nightmare_dmg = fraction_of_max_hp(state, side, idx, 1, 4)
+    nightmare_dmg = jnp.where(nightmared & is_asleep, nightmare_dmg, jnp.int32(0))
+    new_hp = jnp.maximum(jnp.int16(0),
+                          state.sides_team_hp[side, idx] - nightmare_dmg.astype(jnp.int16))
+    state = state._replace(
+        sides_team_hp=state.sides_team_hp.at[side, idx].set(new_hp)
+    )
+    # Clear Nightmare if the Pokemon woke up (status no longer SLP)
+    state = set_volatile(state, side, idx, VOL_NIGHTMARE, nightmared & is_asleep)
+
+    # Ghost Curse: lose 1/4 max HP per turn
+    cursed     = has_volatile(state, side, idx, VOL_CURSE)
+    curse_dmg  = fraction_of_max_hp(state, side, idx, 1, 4)
+    curse_dmg  = jnp.where(cursed, curse_dmg, jnp.int32(0))
+    new_hp = jnp.maximum(jnp.int16(0),
+                          state.sides_team_hp[side, idx] - curse_dmg.astype(jnp.int16))
+    state = state._replace(
+        sides_team_hp=state.sides_team_hp.at[side, idx].set(new_hp)
+    )
 
     return state
 

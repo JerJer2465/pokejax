@@ -110,9 +110,15 @@ def _life_orb_residual_state(state, key, side_i32, slot_i32):
     recoil = jnp.maximum(jnp.int32(1), max_hp // 10)
     new_hp = jnp.maximum(jnp.int32(0), hp - recoil).astype(jnp.int16)
     alive  = hp > jnp.int32(0)
-    # Only apply recoil if the Pokemon used a damaging move this turn
+    # Only apply recoil if the Pokemon dealt damage to the opponent this turn.
+    # sides_last_dmg_phys/spec[opp_side] > 0 means the holder hit the opponent.
+    # (This correctly skips status moves and switches, matching PS behavior.)
+    opp_side = jnp.int32(1) - side_i32
+    dealt_phys = state.sides_last_dmg_phys[opp_side].astype(jnp.int32) > jnp.int32(0)
+    dealt_spec = state.sides_last_dmg_spec[opp_side].astype(jnp.int32) > jnp.int32(0)
+    dealt_damage = dealt_phys | dealt_spec
     moved_this_turn = state.sides_team_move_this_turn[side_i32, slot_i32]
-    should_recoil = alive & moved_this_turn
+    should_recoil = alive & moved_this_turn & dealt_damage
     new_hp_arr = state.sides_team_hp.at[side_i32, slot_i32].set(
         jnp.where(should_recoil, new_hp, state.sides_team_hp[side_i32, slot_i32])
     )
