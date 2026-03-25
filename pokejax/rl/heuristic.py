@@ -21,7 +21,7 @@ from pokejax.types import (
     CATEGORY_PHYSICAL, CATEGORY_SPECIAL, CATEGORY_STATUS,
     STATUS_NONE,
     SC_STEALTHROCK, SC_SPIKES, SC_TOXICSPIKES,
-    BOOST_ATK, BOOST_SPA,
+    BOOST_ATK, BOOST_DEF, BOOST_SPA,
 )
 from pokejax.data.tables import Tables
 from pokejax.env.action_mask import get_action_mask
@@ -388,8 +388,14 @@ def heuristic_action(state: BattleState, side: int, tables: Tables,
     best_switch_score = jnp.max(scores[4:])
 
     # --- Decision: move vs switch ---
-    # PS-style: switch when current matchup is bad (< -2) AND bench has good option (> 0)
-    should_switch_ps = (current_matchup < jnp.float32(-2.0)) & (best_switch_score > jnp.float32(0.0))
+    # PS-style: switch when matchup bad OR severe stat debuff AND bench has good option
+    atk_boost = own_boosts[BOOST_ATK].astype(jnp.float32)
+    def_boost = own_boosts[BOOST_DEF].astype(jnp.float32)
+    spa_boost = own_boosts[BOOST_SPA].astype(jnp.float32)
+    severe_debuff = (atk_boost <= -3) | (def_boost <= -3) | (spa_boost <= -3)
+    should_switch_ps = (
+        (current_matchup < jnp.float32(-2.0)) | severe_debuff
+    ) & (best_switch_score > jnp.float32(0.0))
     # Fallback: switch if no good moves available at all
     should_switch_nomove = (best_move_score <= 0) & (best_switch_score > jnp.float32(-1e8))
     should_switch = should_switch_ps | should_switch_nomove
