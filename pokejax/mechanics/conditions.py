@@ -476,6 +476,33 @@ def decrement_volatile_timers(state: BattleState, side: int,
         state = state._replace(sides_team_volatile_data=new_data)
         state = set_volatile(state, side, idx, vol_bit, active & ~expired)
 
+    # Locked move (Outrage/Thrash/Petal Dance): decrement counter, apply confusion on expiry
+    locked_active = has_volatile(state, side, idx, VOL_LOCKEDMOVE)
+    locked_count  = state.sides_team_volatile_data[side, idx, VOL_LOCKEDMOVE]
+    new_locked_count = jnp.maximum(jnp.int8(0), locked_count - jnp.int8(1))
+    locked_expired = locked_active & (new_locked_count == jnp.int8(0))
+
+    new_locked_data = state.sides_team_volatile_data.at[side, idx, VOL_LOCKEDMOVE].set(
+        jnp.where(locked_active, new_locked_count, locked_count)
+    )
+    state = state._replace(sides_team_volatile_data=new_locked_data)
+    state = set_volatile(state, side, idx, VOL_LOCKEDMOVE, locked_active & ~locked_expired)
+
+    # Apply confusion when lock expires (PS: always confused at end of lock)
+    confusion_from_lock = locked_expired
+    cur_confused = has_volatile(state, side, idx, VOL_CONFUSED)
+    state = set_volatile(state, side, idx, VOL_CONFUSED, cur_confused | confusion_from_lock)
+    key, conf_dur_key = rng_utils.split(key)
+    conf_dur = rng_utils.confusion_roll(conf_dur_key)
+    cur_conf_data = state.sides_team_volatile_data[side, idx, VOL_CONFUSED]
+    new_conf_data = jnp.where(confusion_from_lock, conf_dur,
+                               jnp.where(cur_confused, cur_conf_data, conf_dur))
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[side, idx, VOL_CONFUSED].set(
+            jnp.where(confusion_from_lock, new_conf_data, cur_conf_data)
+        )
+    )
+
     # Yawn: if counter reaches 0, apply sleep
     yawn_active = has_volatile(state, side, idx, VOL_YAWN)
     yawn_count  = state.sides_team_volatile_data[side, idx, VOL_YAWN]

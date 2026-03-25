@@ -385,12 +385,12 @@ def _ice_body_residual(state, key, side_i32, slot_i32):
 
 
 def _shed_skin_residual(state, key, side_i32, slot_i32):
-    """Shed Skin: 30% chance to cure status each turn."""
+    """Shed Skin: 33% chance to cure status each turn (Gen 4 PS: randomChance(1,3))."""
     from pokejax.core import rng as rng_utils
     status = state.sides_team_status[side_i32, slot_i32]
     has_status = status != jnp.int8(STATUS_NONE)
     key, subkey = rng_utils.split(key)
-    cured = has_status & rng_utils.rand_bool_pct(subkey, 30)
+    cured = has_status & rng_utils.rand_bool_pct(subkey, 33)
     new_status = jnp.where(cured, jnp.int8(STATUS_NONE), status)
     new_status_arr = state.sides_team_status.at[side_i32, slot_i32].set(new_status)
     return state._replace(sides_team_status=new_status_arr), key

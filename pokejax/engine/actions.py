@@ -16,7 +16,7 @@ import jax.numpy as jnp
 from pokejax.types import (
     BattleState,
     VOL_PROTECT, VOL_CHOICELOCK, VOL_RECHARGING, VOL_CHARGING, VOL_DESTINYBOND,
-    VOL_TAUNT, VOL_FLINCH,
+    VOL_TAUNT, VOL_FLINCH, VOL_LOCKEDMOVE,
     STATUS_NONE,
     CATEGORY_STATUS,
     MAX_TEAM_SIZE,
@@ -112,6 +112,21 @@ def execute_move_action(
 
     # Get move ID
     move_slot_i = jnp.clip(move_slot.astype(jnp.int32), 0, 3)
+
+    # Locked move (Outrage/Thrash/Petal Dance): force use of last-used move slot
+    atk_locked = (state.sides_team_volatiles[atk_side, atk_idx]
+                  & jnp.uint32(1 << VOL_LOCKEDMOVE)) != jnp.uint32(0)
+    locked_move_id = state.sides_team_last_move_id[atk_side, atk_idx]
+    # Find the slot (0-3) that matches the locked move
+    locked_slot = jnp.int32(0)
+    for _s in range(4):
+        sm = state.sides_team_move_ids[atk_side, atk_idx, _s]
+        locked_slot = jnp.where(
+            (sm == locked_move_id) & (locked_move_id >= jnp.int16(0)),
+            jnp.int32(_s), locked_slot,
+        )
+    move_slot_i = jnp.where(atk_locked, locked_slot, move_slot_i)
+
     move_id = state.sides_team_move_ids[atk_side, atk_idx, move_slot_i]
     move_id = jnp.maximum(jnp.int16(0), move_id)  # clamp invalid slots
 

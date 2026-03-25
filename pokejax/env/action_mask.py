@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from pokejax.types import (
     BattleState,
     VOL_PARTIALLY_TRAPPED, VOL_INGRAIN, VOL_ENCORE, VOL_CHOICELOCK,
-    VOL_RECHARGING, VOL_TAUNT,
+    VOL_RECHARGING, VOL_TAUNT, VOL_LOCKEDMOVE,
     TYPE_FLYING, TYPE_GHOST, TYPE_STEEL,
     CATEGORY_STATUS,
     MAX_TEAM_SIZE, MAX_MOVES,
@@ -141,7 +141,10 @@ def get_switch_mask(state: BattleState, side: int) -> jnp.ndarray:
     vols = state.sides_team_volatiles[side, active]
     recharging = (vols & jnp.uint32(1 << VOL_RECHARGING)) != jnp.uint32(0)
 
-    cant_switch = trapped | recharging
+    # Locked move (Outrage/Thrash/Petal Dance): cannot switch while locked
+    locked = (vols & jnp.uint32(1 << VOL_LOCKEDMOVE)) != jnp.uint32(0)
+
+    cant_switch = trapped | recharging | locked
     return jnp.where(cant_switch, jnp.zeros(6, dtype=jnp.bool_), base_switch)
 
 

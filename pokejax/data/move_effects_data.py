@@ -55,6 +55,7 @@ ME_DEFOG         = 27  # clear hazards + screens from both sides
 ME_TRICK         = 28  # swap items between attacker and defender
 ME_HAZE          = 29  # reset all stat boosts to 0
 ME_TWO_TURN      = 30  # two-turn move: charge turn (set VOL_CHARGING) then release
+ME_LOCKEDMOVE    = 31  # locked multi-turn move (Outrage/Thrash/Petal Dance): 2-3 turns then confuse
 
 # Number of fields per move in the effect table
 MOVE_EFFECT_FIELDS = 8
@@ -340,6 +341,11 @@ GEN4_MOVE_EFFECTS = {
 
     # ---- Haze ----
     "Haze":          _simple_effect(ME_HAZE),
+
+    # ---- Locked multi-turn moves (2-3 turns, then confusion) ----
+    "Outrage":       _simple_effect(ME_LOCKEDMOVE),
+    "Thrash":        _simple_effect(ME_LOCKEDMOVE),
+    "Petal Dance":   _simple_effect(ME_LOCKEDMOVE),
 
     # ---- Two-turn moves (charge turn + release turn) ----
     # User sets VOL_CHARGING on turn 1 (no damage), then attacks on turn 2.

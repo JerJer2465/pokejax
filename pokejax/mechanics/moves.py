@@ -23,8 +23,8 @@ from pokejax.types import (
     TERRAIN_NONE,
     STATUS_NONE, STATUS_SLP,
     VOL_PROTECT, VOL_SUBSTITUTE, VOL_SEEDED, VOL_PARTIALLY_TRAPPED, VOL_YAWN,
-    VOL_DESTINYBOND, VOL_DISABLE, VOL_PERISH,
-    VOL_CONFUSED, VOL_ATTRACT,
+    VOL_DESTINYBOND, VOL_DISABLE, VOL_PERISH, VOL_LOCKEDMOVE,
+    VOL_CONFUSED, VOL_ATTRACT, VOL_ENCORE,
     BOOST_ATK, BOOST_ACC,
     TYPE_GRASS,
 )
@@ -35,6 +35,7 @@ from pokejax.data.move_effects_data import (
     ME_RECOVERY, ME_REST, ME_BELLY_DRUM, ME_KNOCK_OFF, ME_PAIN_SPLIT,
     ME_WISH, ME_HEAL_BELL, ME_DISABLE, ME_YAWN, ME_DESTINY_BOND,
     ME_PERISH_SONG, ME_SLEEP_TALK, ME_DEFOG, ME_TRICK, ME_HAZE, ME_TWO_TURN,
+    ME_LOCKEDMOVE,
     NONE_STAT,
 )
 from pokejax.mechanics.items import (
@@ -382,6 +383,28 @@ def execute_move_effects(
                   & ~blocked_seed)
     state = _apply_volatile_bit(state, def_side, def_idx, stat1, is_vol_foe)
 
+    # Encore: store the defender's last-used move slot in volatile_data[VOL_ENCORE]
+    # so action_mask can restrict the encored Pokemon to only that move.
+    is_encore = is_vol_foe & (stat1 == jnp.int32(VOL_ENCORE))
+    if is_encore is not False:  # always runs under jit; gate with is_encore
+        def_last_move = state.sides_team_last_move_id[def_side, def_idx]
+        # Find the slot (0-3) that has the last move ID
+        encored_slot = jnp.int8(0)
+        for _slot in range(4):
+            slot_move = state.sides_team_move_ids[def_side, def_idx, _slot]
+            encored_slot = jnp.where(
+                (slot_move == def_last_move) & (def_last_move >= jnp.int16(0)),
+                jnp.int8(_slot),
+                encored_slot,
+            )
+        old_encore_data = state.sides_team_volatile_data[def_side, def_idx, VOL_ENCORE]
+        new_encore_data = jnp.where(is_encore, encored_slot, old_encore_data)
+        state = state._replace(
+            sides_team_volatile_data=state.sides_team_volatile_data.at[
+                def_side, def_idx, VOL_ENCORE
+            ].set(new_encore_data)
+        )
+
     # ------------------------------------------------------------------
     # ME_SUBSTITUTE: create substitute at 25% max HP cost
     # ------------------------------------------------------------------
@@ -662,5 +685,27 @@ def execute_move_effects(
         )
 
     # ME_SLEEP_TALK: noop for now (too complex / niche)
+
+    # ------------------------------------------------------------------
+    # ME_LOCKEDMOVE: Outrage, Thrash, Petal Dance — lock attacker for 2-3 turns
+    # On first use: roll duration 2-3; on subsequent uses: duration already set.
+    # After duration expires: apply confusion (handled in decrement_volatile_timers).
+    # ------------------------------------------------------------------
+    from pokejax.core import rng as rng_utils
+    is_locked_move_effect = should_apply & (effect_type == jnp.int32(ME_LOCKEDMOVE))
+    atk_already_locked = (state.sides_team_volatiles[atk_side, atk_idx]
+                          & jnp.uint32(1 << VOL_LOCKEDMOVE)) != jnp.uint32(0)
+    # Only roll new duration on first use
+    key, lock_key = rng_utils.split(key)
+    new_lock_duration = rng_utils.rand_int(lock_key, 2, 4).astype(jnp.int8)  # 2 or 3 turns
+    cur_lock_data = state.sides_team_volatile_data[atk_side, atk_idx, VOL_LOCKEDMOVE]
+    set_lock_data = jnp.where(atk_already_locked, cur_lock_data, new_lock_duration)
+    new_lock_data_val = jnp.where(is_locked_move_effect, set_lock_data, cur_lock_data)
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[
+            atk_side, atk_idx, VOL_LOCKEDMOVE
+        ].set(new_lock_data_val)
+    )
+    state = _apply_volatile_bit(state, atk_side, atk_idx, jnp.int32(VOL_LOCKEDMOVE), is_locked_move_effect)
 
     return state, key
