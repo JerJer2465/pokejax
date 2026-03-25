@@ -305,7 +305,7 @@ def get_crit_stage(move_crit_ratio: jnp.ndarray,
     has_razor_claw = (RAZOR_CLAW_ID >= 0) & (item_id == jnp.int32(RAZOR_CLAW_ID))
     stage = jnp.where(has_razor_claw, stage + 1, stage)
 
-    return jnp.clip(stage, 0, 4).astype(jnp.int32)
+    return jnp.clip(stage, 0, 6).astype(jnp.int32)
 
 
 def roll_crit(key: jnp.ndarray, crit_stage: jnp.ndarray,
@@ -474,26 +474,34 @@ def compute_damage(
     # Base damage
     dmg = base_damage(atk_level, base_power, attack, defense)
 
-    # --- Modifier chain ---
+    # --- Modifier chain (matches PS Gen 4 modifyDamage order) ---
 
-    # 1. Spread
+    # 1. Burn (PS: first modifier, before screens/spread/weather/crit)
+    dmg = apply_burn_modifier(dmg, category, atk_status, guts)
+
+    # 2. Screens (PS: ModifyDamagePhase1, right after burn)
+    reflect_active = state.sides_side_conditions[def_side, 4] > jnp.int8(0)  # SC_REFLECT
+    lightscreen_active = state.sides_side_conditions[def_side, 5] > jnp.int8(0)  # SC_LIGHTSCREEN
+    dmg = apply_screen_modifier(dmg, category, reflect_active, lightscreen_active, is_crit)
+
+    # 3. Spread
     dmg = apply_spread_modifier(dmg, is_spread)
 
-    # 2. Weather
+    # 4. Weather
     dmg = apply_weather_modifier(dmg, jnp.int32(move_type), state.field.weather)
 
-    # 3. Crit (gen-specific multiplier: 2.0 in Gen 4-5, 3.0 with Sniper)
+    # 5. Crit (gen-specific multiplier: 2.0 in Gen 4-5, 3.0 with Sniper)
     dmg = apply_crit_modifier(dmg, is_crit, crit_multiplier=effective_crit_mult)
 
-    # 4. Random roll
+    # 6. Random roll
     key, roll_key = rng_utils.split(key)
     roll = rng_utils.damage_roll(roll_key)
     dmg = apply_random_modifier(dmg, roll)
 
-    # 5. STAB
+    # 7. STAB
     dmg = apply_stab_modifier(dmg, jnp.int32(move_type), atk_types, adaptability)
 
-    # 6. Type effectiveness
+    # 8. Type effectiveness
     effectiveness = type_effectiveness(
         tables,
         jnp.int32(move_type),
@@ -502,7 +510,7 @@ def compute_damage(
     )
     dmg = apply_type_modifier(dmg, effectiveness)
 
-    # 6b. Filter / Solid Rock: 0.75× damage on super-effective hits
+    # 8b. Filter / Solid Rock: 0.75× damage on super-effective hits
     has_filter = (
         ((FILTER_ID >= 0) & (def_ability_id == jnp.int32(FILTER_ID))) |
         ((SOLID_ROCK_ID >= 0) & (def_ability_id == jnp.int32(SOLID_ROCK_ID)))
@@ -511,14 +519,6 @@ def compute_damage(
     dmg = jnp.where(has_filter & is_se,
                      jnp.floor(dmg.astype(jnp.float32) * jnp.float32(0.75)).astype(jnp.int32),
                      dmg)
-
-    # 7. Burn
-    dmg = apply_burn_modifier(dmg, category, atk_status, guts)
-
-    # 8. Screens  (Reflect/Light Screen)
-    reflect_active = state.sides_side_conditions[def_side, 4] > jnp.int8(0)  # SC_REFLECT
-    lightscreen_active = state.sides_side_conditions[def_side, 5] > jnp.int8(0)  # SC_LIGHTSCREEN
-    dmg = apply_screen_modifier(dmg, category, reflect_active, lightscreen_active, is_crit)
 
     # 9. ModifyDamage relay (Life Orb, Expert Belt, Sniper, Tinted Lens, etc.)
     dmg = jnp.where(

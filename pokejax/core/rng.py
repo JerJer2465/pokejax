@@ -72,20 +72,27 @@ def accuracy_roll(key: jnp.ndarray, accuracy: jnp.ndarray) -> jnp.ndarray:
 
 def critical_hit_roll(key: jnp.ndarray, ratio: jnp.ndarray) -> jnp.ndarray:
     """
-    Gen 4-9 crit roll.
+    Gen 4-5 crit roll.
 
-    ratio 0 → 1/16 (crit stage 0)
-    ratio 1 → 1/8  (crit stage 1, e.g. high crit ratio moves)
-    ratio 2 → 1/4  (crit stage 2)
-    ratio 3 → 1/3  (crit stage 3)  — Gen 4 only
-    ratio 4+ → always crit
+    ratio matches Pokemon Showdown's critRatio (1-based):
+      ratio 1 → 1/16   (default, no modifiers)
+      ratio 2 → 1/8    (high-crit move, or +1 item with no other boosts)
+      ratio 3 → 1/4    (e.g. normal + Focus Energy, or high-crit + Scope Lens)
+      ratio 4 → 1/3    (e.g. high-crit + Focus Energy)
+      ratio 5 → 1/2    (max; e.g. high-crit + FE + Scope Lens)
+      ratio 6+ → always crit
+
+    Uses roll out of 48 to represent all stages as integers (LCM of 16, 3, 2).
+    critMult = [0, 16, 8, 4, 3, 2] in PS → thresholds out of 48: [0, 3, 6, 12, 16, 24, 48, 48]
 
     Returns True if crit.
     """
-    # Thresholds per stage (out of 16)
-    thresholds = jnp.array([1, 2, 4, 8, 16, 16, 16, 16], dtype=jnp.int32)
+    # Thresholds out of 48: index = critRatio, value = how many rolls trigger crit
+    # [0]: impossible (ratio 0 never used), [1]=3/48=1/16, [2]=6/48=1/8,
+    # [3]=12/48=1/4, [4]=16/48=1/3, [5]=24/48=1/2, [6+]=always
+    thresholds = jnp.array([0, 3, 6, 12, 16, 24, 48, 48], dtype=jnp.int32)
     threshold = thresholds[jnp.clip(ratio, 0, 7)]
-    roll = jax.random.randint(key, shape=(), minval=0, maxval=16, dtype=jnp.int32)
+    roll = jax.random.randint(key, shape=(), minval=0, maxval=48, dtype=jnp.int32)
     return roll < threshold
 
 

@@ -23,6 +23,8 @@ from pokejax.types import (
     TYPE_NONE, STATUS_FRZ, STATUS_NONE,
     WEATHER_SAND, WEATHER_HAIL,
     CATEGORY_PHYSICAL,
+    TYPE_FIRE, TYPE_POISON, TYPE_STEEL,
+    STATUS_BRN, STATUS_PSN, STATUS_TOX, STATUS_PAR,
 )
 from pokejax.core.damage import (
     compute_damage, type_effectiveness, apply_damage,
@@ -380,16 +382,33 @@ def step8_move_hit_loop(tables, state: BattleState,
     # Apply secondary status if it triggers and target has no status already
     cur_status = state.sides_team_status[def_side, def_idx]
     no_status  = cur_status == jnp.int8(0)
-    new_status = jnp.where(sec_hits & no_status, sec_status, cur_status)
+    # Type immunity: Fire can't be burned; Poison/Steel can't be poisoned/toxicked
+    def_types_sec = state.sides_team_types[def_side, def_idx]
+    def_has_fire = (
+        (def_types_sec[0].astype(jnp.int32) == jnp.int32(TYPE_FIRE)) |
+        (def_types_sec[1].astype(jnp.int32) == jnp.int32(TYPE_FIRE))
+    )
+    def_has_poison_or_steel = (
+        (def_types_sec[0].astype(jnp.int32) == jnp.int32(TYPE_POISON)) |
+        (def_types_sec[1].astype(jnp.int32) == jnp.int32(TYPE_POISON)) |
+        (def_types_sec[0].astype(jnp.int32) == jnp.int32(TYPE_STEEL)) |
+        (def_types_sec[1].astype(jnp.int32) == jnp.int32(TYPE_STEEL))
+    )
+    status_type_blocked = (
+        (def_has_fire & (sec_status == jnp.int8(STATUS_BRN))) |
+        (def_has_poison_or_steel & (
+            (sec_status == jnp.int8(STATUS_PSN)) | (sec_status == jnp.int8(STATUS_TOX))
+        ))
+    )
+    new_status = jnp.where(sec_hits & no_status & ~status_type_blocked, sec_status, cur_status)
     new_status_arr = state.sides_team_status.at[def_side, def_idx].set(new_status)
     state = state._replace(sides_team_status=new_status_arr)
 
     # Synchronize: reflect BRN/PSN/PAR back to attacker
     from pokejax.mechanics.abilities import SYNCHRONIZE_ID
-    from pokejax.types import STATUS_BRN, STATUS_PSN, STATUS_TOX, STATUS_PAR
     def_ability_sync = state.sides_team_ability_id[def_side, def_idx].astype(jnp.int32)
     has_synchronize = (SYNCHRONIZE_ID >= 0) & (def_ability_sync == jnp.int32(SYNCHRONIZE_ID))
-    status_applied = sec_hits & no_status
+    status_applied = sec_hits & no_status & ~status_type_blocked
     # Synchronize only reflects BRN, PSN, PAR (not TOX, SLP, FRZ)
     sync_status = sec_status
     can_sync = (sync_status == jnp.int8(STATUS_BRN)) | (sync_status == jnp.int8(STATUS_PSN)) | (sync_status == jnp.int8(STATUS_PAR))

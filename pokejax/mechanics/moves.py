@@ -26,6 +26,7 @@ from pokejax.types import (
     VOL_DESTINYBOND, VOL_DISABLE, VOL_PERISH,
     VOL_CONFUSED, VOL_ATTRACT,
     BOOST_ATK, BOOST_ACC,
+    TYPE_GRASS,
 )
 from pokejax.data.move_effects_data import (
     ME_NONE, ME_SELF_BOOST, ME_FOE_LOWER, ME_HAZARD, ME_SCREEN,
@@ -369,8 +370,16 @@ def execute_move_effects(
     has_oblivious  = (jnp.int32(OBLIVIOUS_ID) > 0) & (def_ability_mv == jnp.int32(OBLIVIOUS_ID))
     blocked_confusion  = has_own_tempo & (stat1 == jnp.int32(VOL_CONFUSED))
     blocked_infatuation = has_oblivious & (stat1 == jnp.int32(VOL_ATTRACT))
+    # Leech Seed: Grass types are immune (onTryImmunity in PS)
+    def_types_mv = state.sides_team_types[def_side, def_idx]
+    def_is_grass = (
+        (def_types_mv[0].astype(jnp.int32) == jnp.int32(TYPE_GRASS)) |
+        (def_types_mv[1].astype(jnp.int32) == jnp.int32(TYPE_GRASS))
+    )
+    blocked_seed = def_is_grass & (stat1 == jnp.int32(VOL_SEEDED))
     is_vol_foe = (should_apply & (effect_type == jnp.int32(ME_VOLATILE_FOE))
-                  & ~def_has_sub & ~blocked_confusion & ~blocked_infatuation)
+                  & ~def_has_sub & ~blocked_confusion & ~blocked_infatuation
+                  & ~blocked_seed)
     state = _apply_volatile_bit(state, def_side, def_idx, stat1, is_vol_foe)
 
     # ------------------------------------------------------------------
