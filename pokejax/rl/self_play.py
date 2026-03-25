@@ -271,7 +271,7 @@ def _run_ps_eval(checkpoint_path: str, n_games: int, writer, global_step: int):
                     "--vs", vs,
                     "--output-dir", "/tmp/ps_eval",
                 ],
-                capture_output=True, text=True, timeout=600,
+                capture_output=True, text=True, timeout=1800,
             )
             if proc.returncode != 0:
                 print(f"  PS eval vs {vs} failed: {proc.stderr[:200]}")
@@ -327,10 +327,18 @@ def create_model_and_state(
         end_value=cfg.ppo.lr,
         transition_steps=cfg.lr_warmup_steps,
     )
+    # Convert total_timesteps (env steps) → total optimizer steps so schedules
+    # use consistent units. optimizer steps ≈ total_env_steps * n_epochs / minibatch_size
+    transitions_per_rollout = cfg.rollout.n_envs * cfg.rollout.n_steps
+    n_mb = max(transitions_per_rollout // cfg.ppo.minibatch_size, 1)
+    opt_steps_per_update = n_mb * cfg.ppo.n_epochs
+    total_ppo_updates = max(cfg.total_timesteps // transitions_per_rollout, 1)
+    total_opt_steps = total_ppo_updates * opt_steps_per_update
+
     if cfg.lr_schedule_type == "power_law":
         # Wang (2024) schedule: lr / (8x + 1)^1.5 where x = step / total_steps
-        # Critical finding: without this aggressive decay, training stalls at ~55%
-        post_warmup_steps = max(cfg.total_timesteps - cfg.lr_warmup_steps, 1)
+        # Uses optimizer steps (not env steps) so x properly goes 0→1 over training.
+        post_warmup_steps = max(total_opt_steps - cfg.lr_warmup_steps, 1)
         lr_init = cfg.ppo.lr
         lr_min = cfg.lr_min
         def _power_law(count):
@@ -343,7 +351,7 @@ def create_model_and_state(
     else:
         decay_fn = optax.cosine_decay_schedule(
             init_value=cfg.ppo.lr,
-            decay_steps=max(cfg.total_timesteps - cfg.lr_warmup_steps, 1),
+            decay_steps=max(total_opt_steps - cfg.lr_warmup_steps, 1),
             alpha=cfg.lr_min / max(cfg.ppo.lr, 1e-10),
         )
     lr_schedule = optax.join_schedules(
