@@ -133,35 +133,11 @@ def apply_poison_residual(state: BattleState, side: int) -> BattleState:
 def apply_sleep_residual(state: BattleState, side: int,
                           key: jnp.ndarray) -> tuple[BattleState, jnp.ndarray]:
     """
-    Sleep: decrement sleep turn counter.  Wake up when counter reaches 0.
-    Early Bird: decrement by 2 instead of 1 (effectively halving sleep duration).
-    Returns (new_state, new_key).
+    Sleep residual: no-op. Sleep counter is decremented in check_sleep_before_move
+    (matching PS Gen 4 behaviour where the counter ticks at the START of the turn
+    and the Pokemon wakes + CAN act when the counter hits 0).
+    Kept for API compatibility.
     """
-    from pokejax.mechanics.abilities import EARLY_BIRD_ID
-
-    idx = _active_slot(state, side)
-    is_asleep = state.sides_team_status[side, idx] == jnp.int8(STATUS_SLP)
-
-    # Early Bird: decrement by 2 instead of 1
-    ability_id = state.sides_team_ability_id[side, idx].astype(jnp.int32)
-    has_early_bird = (EARLY_BIRD_ID >= 0) & (ability_id == jnp.int32(EARLY_BIRD_ID))
-    decrement = jnp.where(has_early_bird, jnp.int8(2), jnp.int8(1))
-
-    # Decrement sleep counter
-    sleep_counter = state.sides_team_sleep_turns[side, idx]
-    new_counter = jnp.maximum(jnp.int8(0), sleep_counter - decrement)
-    woke_up = is_asleep & (new_counter == jnp.int8(0))
-
-    # Clear status if woke up
-    new_status = jnp.where(woke_up, jnp.int8(STATUS_NONE),
-                            state.sides_team_status[side, idx])
-    new_sleep_turns = jnp.where(is_asleep, new_counter,
-                                 state.sides_team_sleep_turns[side, idx])
-
-    new_status_arr = state.sides_team_status.at[side, idx].set(new_status)
-    new_sleep_arr  = state.sides_team_sleep_turns.at[side, idx].set(new_sleep_turns)
-    state = state._replace(sides_team_status=new_status_arr,
-                            sides_team_sleep_turns=new_sleep_arr)
     return state, key
 
 
@@ -197,12 +173,38 @@ def check_paralysis_before_move(state: BattleState, side: int,
 def check_sleep_before_move(state: BattleState, side: int,
                               key: jnp.ndarray) -> tuple[bool, jnp.ndarray, jnp.ndarray]:
     """
-    Sleep: cannot move while asleep. On the turn of waking up, still cannot move.
-    The sleep counter is decremented in residual (end of turn), not here.
+    Sleep: decrement the sleep counter at the START of the Pokemon's turn.
+    If counter reaches 0, the Pokemon wakes up and CAN act this turn (PS Gen 4 behaviour).
+    Early Bird: decrement by 2 instead of 1.
     """
+    from pokejax.mechanics.abilities import EARLY_BIRD_ID
+
     idx = _active_slot(state, side)
     is_asleep = state.sides_team_status[side, idx] == jnp.int8(STATUS_SLP)
-    return ~is_asleep, key, state
+
+    # Early Bird: halve sleep duration
+    ability_id = state.sides_team_ability_id[side, idx].astype(jnp.int32)
+    has_early_bird = (EARLY_BIRD_ID >= 0) & (ability_id == jnp.int32(EARLY_BIRD_ID))
+    decrement = jnp.where(has_early_bird, jnp.int8(2), jnp.int8(1))
+
+    # Decrement sleep counter
+    sleep_counter = state.sides_team_sleep_turns[side, idx]
+    new_counter = jnp.maximum(jnp.int8(0), sleep_counter - decrement)
+    woke_up = is_asleep & (new_counter == jnp.int8(0))
+
+    # Clear status on wake
+    new_status = jnp.where(woke_up, jnp.int8(STATUS_NONE),
+                            state.sides_team_status[side, idx])
+    new_sleep_arr = state.sides_team_sleep_turns.at[side, idx].set(
+        jnp.where(is_asleep, new_counter, sleep_counter)
+    )
+    new_status_arr = state.sides_team_status.at[side, idx].set(new_status)
+    state = state._replace(sides_team_status=new_status_arr,
+                            sides_team_sleep_turns=new_sleep_arr)
+
+    # Can move if: not asleep at all, OR woke up this turn
+    can_move = ~is_asleep | woke_up
+    return can_move, key, state
 
 
 def check_freeze_before_move(state: BattleState, side: int,
@@ -520,7 +522,7 @@ def decrement_volatile_timers(state: BattleState, side: int,
     apply_sleep = yawn_expired & no_status
     new_status = jnp.where(apply_sleep, jnp.int8(STATUS_SLP),
                             state.sides_team_status[side, idx])
-    # Roll sleep duration (1-3 turns)
+    # Roll sleep duration (2-5 turns, PS Gen 4: random(2,6))
     key, sleep_key = rng_utils.split(key)
     sleep_dur = rng_utils.sleep_roll(sleep_key)
     new_sleep = jnp.where(apply_sleep, sleep_dur,
