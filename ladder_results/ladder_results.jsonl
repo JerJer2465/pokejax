@@ -1,0 +1,9 @@
+{"game": 1, "battle_tag": "battle-gen9randombattle-2560304389", "result": "LOSS", "turns": 2, "rating": 1000, "opponent_rating": 1043, "wins": 0, "losses": 1, "ties": 0, "win_rate": 0.0, "elapsed_s": 10.5}
+{"game": 2, "battle_tag": "battle-gen9randombattle-2560304496", "result": "LOSS", "turns": 4, "rating": 1000, "opponent_rating": 1000, "wins": 0, "losses": 2, "ties": 0, "win_rate": 0.0, "elapsed_s": 81.8}
+{"game": 3, "battle_tag": "battle-gen9randombattle-2560305288", "result": "LOSS", "turns": 1, "rating": 1000, "opponent_rating": 1040, "wins": 0, "losses": 3, "ties": 0, "win_rate": 0.0, "elapsed_s": 89.5}
+{"game": 4, "battle_tag": "battle-gen9randombattle-2560305371", "result": "LOSS", "turns": 2, "rating": 1000, "opponent_rating": 1037, "wins": 0, "losses": 4, "ties": 0, "win_rate": 0.0, "elapsed_s": 110.8}
+{"game": 1, "battle_tag": "battle-gen4randombattle-2560305440", "result": "LOSS", "turns": 18, "rating": 1000, "opponent_rating": 1065, "wins": 0, "losses": 1, "ties": 0, "win_rate": 0.0, "elapsed_s": 249.7}
+{"game": 2, "battle_tag": "battle-gen4randombattle-2560308261", "result": "LOSS", "turns": 20, "rating": 1000, "opponent_rating": 1088, "wins": 0, "losses": 2, "ties": 0, "win_rate": 0.0, "elapsed_s": 600.2}
+{"game": 3, "battle_tag": "battle-gen4randombattle-2560312241", "result": "LOSS", "turns": 12, "rating": 1000, "opponent_rating": 1026, "wins": 0, "losses": 3, "ties": 0, "win_rate": 0.0, "elapsed_s": 655.0}
+{"game": 1, "battle_tag": "battle-gen4randombattle-2561601365", "result": "LOSS", "turns": 23, "rating": 1000, "opponent_rating": 1070, "wins": 0, "losses": 1, "ties": 0, "win_rate": 0.0, "elapsed_s": 269.6}
+{"game": 2, "battle_tag": "battle-gen4randombattle-2561602929", "result": "LOSS", "turns": 1, "rating": 1000, "opponent_rating": 1160, "wins": 0, "losses": 2, "ties": 0, "win_rate": 0.0, "elapsed_s": 275.5}

@@ -1,0 +1,16 @@
+{
+  "best_value": 0.390625,
+  "best_trial": 2,
+  "best_params": {
+    "lr": 0.00019594972058679176,
+    "gamma": 0.9932972565896432,
+    "gae_lambda": 0.9410462985795333,
+    "ent_coef": 0.030489195547657565,
+    "ent_coef_end": 0.0015837031559118749,
+    "n_epochs": 3,
+    "minibatch_size": 16384,
+    "vf_coef": 0.7557861855309373,
+    "clip_eps": 0.1130103185970559
+  },
+  "n_trials_completed": 15
+}
