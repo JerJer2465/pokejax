@@ -21,7 +21,7 @@ from pokejax.types import (
     CATEGORY_PHYSICAL, CATEGORY_SPECIAL, CATEGORY_STATUS,
     STATUS_NONE,
     SC_STEALTHROCK, SC_SPIKES, SC_TOXICSPIKES,
-    BOOST_ATK, BOOST_DEF, BOOST_SPA,
+    BOOST_ATK, BOOST_DEF, BOOST_SPA, BOOST_SPD,
 )
 from pokejax.data.tables import Tables
 from pokejax.env.action_mask import get_action_mask
@@ -114,12 +114,19 @@ def _type_eff(atk_type, def_type1, def_type2, type_chart):
     return eff1 * eff2
 
 
-def _matchup_score_ps(mon_types, mon_stats, mon_hp_frac, opp_types, opp_stats, type_chart):
+def _matchup_score_ps(mon_types, mon_stats, mon_hp_frac, opp_types, opp_stats,
+                      opp_hp_frac, type_chart):
     """
     Matchup score mirroring PS SimpleHeuristicsPlayer._estimate_matchup.
 
     Positive = we have type/speed advantage. Switches when score < -2 AND
     a bench option scores > 0 (matching SWITCH_OUT_MATCHUP_THRESHOLD = -2).
+
+    Mirrors poke-env exactly:
+        score  = best_type_we_deal - best_type_they_deal
+               + speed_bonus
+               + mon_hp_frac * 0.4
+               - opp_hp_frac * 0.4
     """
     # Best of our types vs opp (how hard can we hit?)
     eff1 = _type_eff(mon_types[0], opp_types[0], opp_types[1], type_chart)
@@ -149,7 +156,9 @@ def _matchup_score_ps(mon_types, mon_stats, mon_hp_frac, opp_types, opp_stats, t
         - jnp.where(opp_spe > mon_spe * 1.5, jnp.float32(0.2), jnp.float32(0.0))
     )
 
-    return our_best - opp_best + speed + mon_hp_frac * jnp.float32(0.4)
+    return (our_best - opp_best + speed
+            + mon_hp_frac * jnp.float32(0.4)
+            - opp_hp_frac * jnp.float32(0.4))
 
 
 def _estimate_damage(bp, move_type, category, accuracy,
@@ -319,6 +328,9 @@ def heuristic_action(state: BattleState, side: int, tables: Tables,
     opp_speed = opp_stats[5].astype(jnp.float32)
     opp_atk = opp_stats[1].astype(jnp.float32)
     opp_sc = state.sides_side_conditions[opp]
+    opp_hp = state.sides_team_hp[opp, opp_active_idx].astype(jnp.float32)
+    opp_max_hp = jnp.maximum(state.sides_team_max_hp[opp, opp_active_idx].astype(jnp.float32), 1.0)
+    opp_hp_frac = opp_hp / opp_max_hp
 
     turn = state.turn.astype(jnp.int32)
 
@@ -361,7 +373,7 @@ def heuristic_action(state: BattleState, side: int, tables: Tables,
 
     # --- PS-style matchup for active mon ---
     current_matchup = _matchup_score_ps(
-        own_types, own_stats, own_hp_frac, opp_types, opp_stats, type_chart,
+        own_types, own_stats, own_hp_frac, opp_types, opp_stats, opp_hp_frac, type_chart,
     )
 
     # --- Score switches 4-9 using PS matchup scoring ---
@@ -375,7 +387,7 @@ def heuristic_action(state: BattleState, side: int, tables: Tables,
 
         # PS-style matchup score for this bench slot
         slot_matchup = _matchup_score_ps(
-            slot_types, slot_stats, slot_hp_frac, opp_types, opp_stats, type_chart,
+            slot_types, slot_stats, slot_hp_frac, opp_types, opp_stats, opp_hp_frac, type_chart,
         )
 
         switch_score = slot_matchup
@@ -392,7 +404,8 @@ def heuristic_action(state: BattleState, side: int, tables: Tables,
     atk_boost = own_boosts[BOOST_ATK].astype(jnp.float32)
     def_boost = own_boosts[BOOST_DEF].astype(jnp.float32)
     spa_boost = own_boosts[BOOST_SPA].astype(jnp.float32)
-    severe_debuff = (atk_boost <= -3) | (def_boost <= -3) | (spa_boost <= -3)
+    spd_boost = own_boosts[BOOST_SPD].astype(jnp.float32)
+    severe_debuff = (atk_boost <= -3) | (def_boost <= -3) | (spa_boost <= -3) | (spd_boost <= -3)
     should_switch_ps = (
         (current_matchup < jnp.float32(-2.0)) | severe_debuff
     ) & (best_switch_score > jnp.float32(0.0))
