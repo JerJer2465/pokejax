@@ -297,6 +297,24 @@ def step8_move_hit_loop(tables, state: BattleState,
     # Apply damage to defender (0 if sub absorbed it)
     state = apply_damage(state, def_side, def_idx, real_dmg)
 
+    # Record last physical/special damage taken (for Counter / Mirror Coat / Metal Burst).
+    # Only real damage (not absorbed by sub) counts; sub-absorbed hits use dmg.
+    # We record dmg (not real_dmg) so a hit that breaks the sub still records for Counter.
+    # PS behavior: Counter reflects last physical damage taken from foe this turn,
+    # regardless of whether it hit a sub.
+    move_cat = tables.moves[move_id.astype(jnp.int32), MF_CATEGORY].astype(jnp.int32)
+    is_phys_cat = (move_cat == jnp.int32(0))  # CATEGORY_PHYSICAL = 0
+    is_spec_cat = (move_cat == jnp.int32(1))  # CATEGORY_SPECIAL = 1
+    dmg_i16 = jnp.minimum(dmg, jnp.int32(32767)).astype(jnp.int16)
+    phys_hit = is_phys_cat & ~cancelled & (dmg > jnp.int32(0))
+    spec_hit = is_spec_cat & ~cancelled & (dmg > jnp.int32(0))
+    new_phys_dmg = jnp.where(phys_hit, dmg_i16, state.sides_last_dmg_phys[def_side])
+    new_spec_dmg = jnp.where(spec_hit, dmg_i16, state.sides_last_dmg_spec[def_side])
+    state = state._replace(
+        sides_last_dmg_phys=state.sides_last_dmg_phys.at[def_side].set(new_phys_dmg),
+        sides_last_dmg_spec=state.sides_last_dmg_spec.at[def_side].set(new_spec_dmg),
+    )
+
     # Focus Sash: survive lethal hit at full HP (consume item)
     from pokejax.mechanics.items import FOCUS_SASH_ID
     def_item = state.sides_team_item_id[def_side, def_idx].astype(jnp.int32)

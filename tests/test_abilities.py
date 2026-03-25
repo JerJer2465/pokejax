@@ -529,16 +529,33 @@ class TestSwitchOutState:
 class TestResidualState:
     def test_speed_boost_adds_one_spe(self, tables, cfg):
         state = _make_state(tables, cfg, p1_ability=_ABILITY_IDS["Speed Boost"])
+        # Simulate having been active ≥1 turn (Gen 4 PS: Speed Boost skips turn 0)
+        state = state._replace(
+            sides_team_active_turns=state.sides_team_active_turns.at[0, 0].set(jnp.int8(1))
+        )
         idx = state.sides_active_idx[0]
         key = jax.random.PRNGKey(0)
         state2, _ = run_event_residual_state(state, key, 0, idx)
         spe_boost = int(state2.sides_team_boosts[0, 0, BOOST_SPE])
         assert spe_boost == 1
 
+    def test_speed_boost_skips_first_turn(self, tables, cfg):
+        """Speed Boost should NOT fire on switch-in turn (active_turns==0, Gen 4 PS behavior)."""
+        state = _make_state(tables, cfg, p1_ability=_ABILITY_IDS["Speed Boost"])
+        # active_turns defaults to 0 (switch-in turn)
+        idx = state.sides_active_idx[0]
+        key = jax.random.PRNGKey(0)
+        state2, _ = run_event_residual_state(state, key, 0, idx)
+        spe_boost = int(state2.sides_team_boosts[0, 0, BOOST_SPE])
+        assert spe_boost == 0  # must NOT boost on first turn
+
     def test_speed_boost_caps_at_plus_six(self, tables, cfg):
         state = _make_state(tables, cfg, p1_ability=_ABILITY_IDS["Speed Boost"])
         boosts = state.sides_team_boosts.at[0, 0, BOOST_SPE].set(jnp.int8(6))
-        state = state._replace(sides_team_boosts=boosts)
+        state = state._replace(
+            sides_team_boosts=boosts,
+            sides_team_active_turns=state.sides_team_active_turns.at[0, 0].set(jnp.int8(1)),
+        )
         idx = state.sides_active_idx[0]
         key = jax.random.PRNGKey(0)
         state2, _ = run_event_residual_state(state, key, 0, idx)

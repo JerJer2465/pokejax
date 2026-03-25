@@ -224,6 +224,8 @@ def execute_turn(
         sides_team_times_attacked=new_times_atk,
         sides_team_volatiles=new_vols,
         sides_team_volatile_data=new_vol_data,
+        sides_last_dmg_phys=jnp.zeros(2, dtype=jnp.int16),
+        sides_last_dmg_spec=jnp.zeros(2, dtype=jnp.int16),
     )
 
     # --- PRNG: split key for this turn ---
@@ -301,6 +303,15 @@ def execute_turn(
 
         # 5. Field timer ticking
         s = tick_all_field_timers(s)
+
+        # 6. Increment active_turns for active Pokemon (used by Speed Boost first-turn skip)
+        for _side in range(2):
+            _idx = s.sides_active_idx[_side]
+            cur = s.sides_team_active_turns[_side, _idx].astype(jnp.int32)
+            new_val = jnp.minimum(jnp.int32(127), cur + jnp.int32(1)).astype(jnp.int8)
+            s = s._replace(
+                sides_team_active_turns=s.sides_team_active_turns.at[_side, _idx].set(new_val)
+            )
 
         return s, k
 

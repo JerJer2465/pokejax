@@ -56,6 +56,12 @@ ME_TRICK         = 28  # swap items between attacker and defender
 ME_HAZE          = 29  # reset all stat boosts to 0
 ME_TWO_TURN      = 30  # two-turn move: charge turn (set VOL_CHARGING) then release
 ME_LOCKEDMOVE    = 31  # locked multi-turn move (Outrage/Thrash/Petal Dance): 2-3 turns then confuse
+ME_COUNTER       = 32  # deal 2x last physical damage taken to foe
+ME_MIRROR_COAT   = 33  # deal 2x last special damage taken to foe
+ME_METAL_BURST   = 34  # deal 1.5x last damage taken to foe (max of phys/spec)
+ME_SECONDARY_CONFUSE = 35  # probabilistic confusion (chance from move table's sec_chance field)
+ME_SWAGGER       = 36  # boost foe ATK +2 then 100% confuse (Own Tempo immunity applies)
+ME_FLATTER       = 37  # boost foe SpA +1 then 100% confuse (Own Tempo immunity applies)
 
 # Number of fields per move in the effect table
 MOVE_EFFECT_FIELDS = 8
@@ -125,6 +131,7 @@ _VOL_YAWN         = 26
 _VOL_DESTINYBOND  = 27
 _VOL_SUBSTITUTE   = 4
 _VOL_DISABLE      = 9
+_VOL_EMBARGO      = 16
 
 # ---------------------------------------------------------------------------
 # Helper constructors
@@ -346,6 +353,31 @@ GEN4_MOVE_EFFECTS = {
     "Outrage":       _simple_effect(ME_LOCKEDMOVE),
     "Thrash":        _simple_effect(ME_LOCKEDMOVE),
     "Petal Dance":   _simple_effect(ME_LOCKEDMOVE),
+
+    # ---- Volatile status: foe (additional) ----
+    "Confuse Ray":   _volatile_foe(_VOL_CONFUSED),
+    "Supersonic":    _volatile_foe(_VOL_CONFUSED),
+    "Sweet Kiss":    _volatile_foe(_VOL_CONFUSED),
+    "Teeter Dance":  _volatile_foe(_VOL_CONFUSED),
+    "Embargo":       _volatile_foe(_VOL_EMBARGO),
+
+    # ---- Secondary confusion (chance from move table's sec_chance field) ----
+    "Psybeam":       _simple_effect(ME_SECONDARY_CONFUSE),
+    "Water Pulse":   _simple_effect(ME_SECONDARY_CONFUSE),
+    "Confusion":     _simple_effect(ME_SECONDARY_CONFUSE),
+    "Dizzy Punch":   _simple_effect(ME_SECONDARY_CONFUSE),
+    "Signal Beam":   _simple_effect(ME_SECONDARY_CONFUSE),
+    "Chatter":       _simple_effect(ME_SECONDARY_CONFUSE),
+    "Dynamic Punch": _simple_effect(ME_SECONDARY_CONFUSE),  # 100% confusion
+
+    # ---- Swagger / Flatter: boost foe stat + 100% confuse ----
+    "Swagger":       _simple_effect(ME_SWAGGER),
+    "Flatter":       _simple_effect(ME_FLATTER),
+
+    # ---- Counter / Mirror Coat / Metal Burst ----
+    "Counter":       _simple_effect(ME_COUNTER),
+    "Mirror Coat":   _simple_effect(ME_MIRROR_COAT),
+    "Metal Burst":   _simple_effect(ME_METAL_BURST),
 
     # ---- Two-turn moves (charge turn + release turn) ----
     # User sets VOL_CHARGING on turn 1 (no damage), then attacks on turn 2.

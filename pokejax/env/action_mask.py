@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from pokejax.types import (
     BattleState,
     VOL_PARTIALLY_TRAPPED, VOL_INGRAIN, VOL_ENCORE, VOL_CHOICELOCK,
-    VOL_RECHARGING, VOL_TAUNT, VOL_LOCKEDMOVE,
+    VOL_RECHARGING, VOL_TAUNT, VOL_LOCKEDMOVE, VOL_TORMENT,
     TYPE_FLYING, TYPE_GHOST, TYPE_STEEL,
     CATEGORY_STATUS,
     MAX_TEAM_SIZE, MAX_MOVES,
@@ -50,8 +50,8 @@ def get_move_mask(state: BattleState, side: int, tables=None) -> jnp.ndarray:
     # Encore: only the encored move slot is legal
     vols = state.sides_team_volatiles[side, idx]
     encore_active = (vols & jnp.uint32(1 << VOL_ENCORE)) != jnp.uint32(0)
-    # Encored move slot stored in volatile_data[VOL_ENCORE] (reuse counter as slot index)
-    encored_slot = state.sides_team_volatile_data[side, idx, VOL_ENCORE].astype(jnp.int32)
+    # Encore slot is packed in bits[1:0] of volatile_data[VOL_ENCORE]; bits[7:2] are the timer.
+    encored_slot = (state.sides_team_volatile_data[side, idx, VOL_ENCORE].astype(jnp.int32) & jnp.int32(3))
     slots = jnp.arange(4, dtype=jnp.int32)
     encore_mask = (slots == encored_slot)
     base_mask = jnp.where(encore_active, encore_mask & base_mask, base_mask)
@@ -74,6 +74,13 @@ def get_move_mask(state: BattleState, side: int, tables=None) -> jnp.ndarray:
         categories = tables.moves[move_ids_i32, 3]  # MF_CATEGORY = 3
         is_status = categories == jnp.int8(CATEGORY_STATUS)
         base_mask = jnp.where(taunted, base_mask & ~is_status, base_mask)
+
+    # Torment: cannot use same move as last turn
+    tormented = (vols & jnp.uint32(1 << VOL_TORMENT)) != jnp.uint32(0)
+    last_mid = state.sides_team_last_move_id[side, idx]
+    move_ids_i16 = state.sides_team_move_ids[side, idx]   # int16[4]
+    same_as_last = (move_ids_i16 == last_mid) & (last_mid >= jnp.int16(0))
+    base_mask = jnp.where(tormented, base_mask & ~same_as_last, base_mask)
 
     # If no legal move exists → Struggle (force all moves legal so the policy can pick)
     any_legal = base_mask.any()

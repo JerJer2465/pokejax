@@ -459,8 +459,25 @@ def decrement_volatile_timers(state: BattleState, side: int,
     Handles: Encore, Taunt, Heal Block, Embargo, Yawn.
     """
     idx = _active_slot(state, side)
+    # Encore: packed encoding — bits[1:0] = slot, bits[7:2] = timer.
+    # Decrement only the timer portion; keep slot bits intact.
+    encore_active = has_volatile(state, side, idx, VOL_ENCORE)
+    enc_data = state.sides_team_volatile_data[side, idx, VOL_ENCORE].astype(jnp.int32)
+    enc_timer = enc_data >> 2
+    enc_slot  = enc_data & jnp.int32(3)
+    new_enc_timer = jnp.maximum(jnp.int32(0), enc_timer - jnp.int32(1))
+    encore_expired = encore_active & (new_enc_timer == jnp.int32(0))
+    new_enc_data = jnp.where(
+        encore_active,
+        ((new_enc_timer << 2) | enc_slot).astype(jnp.int8),
+        state.sides_team_volatile_data[side, idx, VOL_ENCORE],
+    )
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[side, idx, VOL_ENCORE].set(new_enc_data)
+    )
+    state = set_volatile(state, side, idx, VOL_ENCORE, encore_active & ~encore_expired)
+
     timed_vols = [
-        (VOL_ENCORE, 3),    # Encore lasts 3 turns (Gen 4-5)
         (VOL_TAUNT, 3),     # Taunt lasts 3 turns
         (VOL_HEALBLOCK, 5), # Heal Block lasts 5 turns
         (VOL_EMBARGO, 5),   # Embargo lasts 5 turns
@@ -504,6 +521,25 @@ def decrement_volatile_timers(state: BattleState, side: int,
             jnp.where(confusion_from_lock, new_conf_data, cur_conf_data)
         )
     )
+
+    # Disable: decrement timer; when expired, clear VOL_DISABLE bit and un-disable the move.
+    dis_active = has_volatile(state, side, idx, VOL_DISABLE)
+    dis_count = state.sides_team_volatile_data[side, idx, VOL_DISABLE]
+    new_dis_count = jnp.maximum(jnp.int8(0), dis_count - jnp.int8(1))
+    dis_expired = dis_active & (new_dis_count == jnp.int8(0))
+    new_dis_data = state.sides_team_volatile_data.at[side, idx, VOL_DISABLE].set(
+        jnp.where(dis_active, new_dis_count, dis_count)
+    )
+    state = state._replace(sides_team_volatile_data=new_dis_data)
+    state = set_volatile(state, side, idx, VOL_DISABLE, dis_active & ~dis_expired)
+    # Clear all move_disabled entries for this Pokemon when Disable expires
+    for _ms in range(4):
+        cur_d = state.sides_team_move_disabled[side, idx, _ms]
+        state = state._replace(
+            sides_team_move_disabled=state.sides_team_move_disabled.at[side, idx, _ms].set(
+                jnp.where(dis_expired, jnp.bool_(False), cur_d)
+            )
+        )
 
     # Yawn: if counter reaches 0, apply sleep
     yawn_active = has_volatile(state, side, idx, VOL_YAWN)

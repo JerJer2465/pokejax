@@ -24,8 +24,8 @@ from pokejax.types import (
     STATUS_NONE, STATUS_SLP,
     VOL_PROTECT, VOL_SUBSTITUTE, VOL_SEEDED, VOL_PARTIALLY_TRAPPED, VOL_YAWN,
     VOL_DESTINYBOND, VOL_DISABLE, VOL_PERISH, VOL_LOCKEDMOVE,
-    VOL_CONFUSED, VOL_ATTRACT, VOL_ENCORE,
-    BOOST_ATK, BOOST_ACC,
+    VOL_CONFUSED, VOL_ATTRACT, VOL_ENCORE, VOL_TAUNT, VOL_HEALBLOCK, VOL_EMBARGO,
+    BOOST_ATK, BOOST_SPA, BOOST_ACC,
     TYPE_GRASS,
 )
 from pokejax.data.move_effects_data import (
@@ -35,9 +35,11 @@ from pokejax.data.move_effects_data import (
     ME_RECOVERY, ME_REST, ME_BELLY_DRUM, ME_KNOCK_OFF, ME_PAIN_SPLIT,
     ME_WISH, ME_HEAL_BELL, ME_DISABLE, ME_YAWN, ME_DESTINY_BOND,
     ME_PERISH_SONG, ME_SLEEP_TALK, ME_DEFOG, ME_TRICK, ME_HAZE, ME_TWO_TURN,
-    ME_LOCKEDMOVE,
+    ME_LOCKEDMOVE, ME_COUNTER, ME_MIRROR_COAT, ME_METAL_BURST,
+    ME_SECONDARY_CONFUSE, ME_SWAGGER, ME_FLATTER,
     NONE_STAT,
 )
+from pokejax.core.damage import MF_SEC_CHANCE
 from pokejax.mechanics.items import (
     DAMP_ROCK_ID, HEAT_ROCK_ID, ICY_ROCK_ID, SMOOTH_ROCK_ID, LIGHT_CLAY_ID,
 )
@@ -383,27 +385,55 @@ def execute_move_effects(
                   & ~blocked_seed)
     state = _apply_volatile_bit(state, def_side, def_idx, stat1, is_vol_foe)
 
-    # Encore: store the defender's last-used move slot in volatile_data[VOL_ENCORE]
-    # so action_mask can restrict the encored Pokemon to only that move.
-    is_encore = is_vol_foe & (stat1 == jnp.int32(VOL_ENCORE))
-    if is_encore is not False:  # always runs under jit; gate with is_encore
-        def_last_move = state.sides_team_last_move_id[def_side, def_idx]
-        # Find the slot (0-3) that has the last move ID
-        encored_slot = jnp.int8(0)
-        for _slot in range(4):
-            slot_move = state.sides_team_move_ids[def_side, def_idx, _slot]
-            encored_slot = jnp.where(
-                (slot_move == def_last_move) & (def_last_move >= jnp.int16(0)),
-                jnp.int8(_slot),
-                encored_slot,
-            )
-        old_encore_data = state.sides_team_volatile_data[def_side, def_idx, VOL_ENCORE]
-        new_encore_data = jnp.where(is_encore, encored_slot, old_encore_data)
+    # Initialize timers for timed volatiles when applied.
+    # VOL_TAUNT = 3 turns; VOL_HEALBLOCK = 5 turns; VOL_EMBARGO = 5 turns.
+    # VOL_CONFUSED = random 2-5 turns (rolled here).
+    # (Encore uses its own packed timer/slot encoding handled below.)
+    from pokejax.core import rng as rng_utils_mv
+    is_confused_apply = is_vol_foe & (stat1 == jnp.int32(VOL_CONFUSED))
+    key, conf_key = rng_utils_mv.split(key)
+    conf_dur = rng_utils_mv.confusion_roll(conf_key)
+    old_conf_dat = state.sides_team_volatile_data[def_side, def_idx, VOL_CONFUSED]
+    new_conf_dat = jnp.where(is_confused_apply, conf_dur, old_conf_dat)
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[
+            def_side, def_idx, VOL_CONFUSED
+        ].set(new_conf_dat)
+    )
+
+    for _vol_bit, _timer_val in [(VOL_TAUNT, 3), (VOL_HEALBLOCK, 5), (VOL_EMBARGO, 5)]:
+        is_this_vol = is_vol_foe & (stat1 == jnp.int32(_vol_bit))
+        old_dat = state.sides_team_volatile_data[def_side, def_idx, _vol_bit]
+        new_dat = jnp.where(is_this_vol, jnp.int8(_timer_val), old_dat)
         state = state._replace(
             sides_team_volatile_data=state.sides_team_volatile_data.at[
-                def_side, def_idx, VOL_ENCORE
-            ].set(new_encore_data)
+                def_side, def_idx, _vol_bit
+            ].set(new_dat)
         )
+
+    # Encore: store both timer and slot in volatile_data[VOL_ENCORE] as a packed byte.
+    # Encoding: bits[1:0] = slot index (0-3), bits[7:2] = timer (starts at 3 turns).
+    # Packed value = (timer << 2) | slot.
+    # This avoids conflating the slot with the timer counter (slot 0 would expire immediately).
+    is_encore = is_vol_foe & (stat1 == jnp.int32(VOL_ENCORE))
+    def_last_move = state.sides_team_last_move_id[def_side, def_idx]
+    encored_slot = jnp.int8(0)
+    for _slot in range(4):
+        slot_move = state.sides_team_move_ids[def_side, def_idx, _slot]
+        encored_slot = jnp.where(
+            (slot_move == def_last_move) & (def_last_move >= jnp.int16(0)),
+            jnp.int8(_slot),
+            encored_slot,
+        )
+    # Pack: timer=3 in upper bits, slot in lower 2 bits
+    packed_encore = jnp.int8((3 << 2) | encored_slot.astype(jnp.int32))
+    old_encore_data = state.sides_team_volatile_data[def_side, def_idx, VOL_ENCORE]
+    new_encore_data = jnp.where(is_encore, packed_encore, old_encore_data)
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[
+            def_side, def_idx, VOL_ENCORE
+        ].set(new_encore_data)
+    )
 
     # ------------------------------------------------------------------
     # ME_SUBSTITUTE: create substitute at 25% max HP cost
@@ -613,16 +643,31 @@ def execute_move_effects(
             sides_team_move_disabled=state.sides_team_move_disabled
                 .at[def_side, def_idx, slot].set(jnp.where(should_disable, True, cur_disabled))
         )
-    # Set volatile
+    # Set volatile and initialize timer (Gen 4: 4 turns fixed)
     state = _apply_volatile_bit(state, def_side, def_idx,
                                  jnp.int32(VOL_DISABLE), is_disable)
+    old_dis_dat = state.sides_team_volatile_data[def_side, def_idx, VOL_DISABLE]
+    new_dis_dat = jnp.where(is_disable, jnp.int8(4), old_dis_dat)
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[
+            def_side, def_idx, VOL_DISABLE
+        ].set(new_dis_dat)
+    )
 
     # ------------------------------------------------------------------
-    # ME_YAWN: inflict drowsiness (sleep next turn via volatile)
+    # ME_YAWN: inflict drowsiness — sleep at end of NEXT turn.
+    # Timer starts at 2: decremented at end of THIS turn (→1), then NEXT turn (→0 = sleep).
     # ------------------------------------------------------------------
     is_yawn = should_apply & (effect_type == jnp.int32(ME_YAWN))
     state = _apply_volatile_bit(state, def_side, def_idx,
                                  jnp.int32(VOL_YAWN), is_yawn)
+    old_yawn_dat = state.sides_team_volatile_data[def_side, def_idx, VOL_YAWN]
+    new_yawn_dat = jnp.where(is_yawn, jnp.int8(2), old_yawn_dat)
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[
+            def_side, def_idx, VOL_YAWN
+        ].set(new_yawn_dat)
+    )
 
     # ------------------------------------------------------------------
     # ME_DESTINY_BOND: set volatile on self
@@ -707,5 +752,101 @@ def execute_move_effects(
         ].set(new_lock_data_val)
     )
     state = _apply_volatile_bit(state, atk_side, atk_idx, jnp.int32(VOL_LOCKEDMOVE), is_locked_move_effect)
+
+    # ------------------------------------------------------------------
+    # ME_COUNTER: deal 2x last physical damage taken by attacker to foe.
+    # ME_MIRROR_COAT: deal 2x last special damage taken by attacker to foe.
+    # ME_METAL_BURST: deal 1.5x last damage taken (max of phys/spec) to foe.
+    # All three fail if no damage was taken this turn (last_dmg == 0).
+    # ------------------------------------------------------------------
+    from pokejax.core.damage import apply_damage
+    last_phys = state.sides_last_dmg_phys[atk_side].astype(jnp.int32)
+    last_spec = state.sides_last_dmg_spec[atk_side].astype(jnp.int32)
+    last_any  = jnp.maximum(last_phys, last_spec)
+
+    is_counter      = should_apply & (effect_type == jnp.int32(ME_COUNTER))
+    is_mirror_coat  = should_apply & (effect_type == jnp.int32(ME_MIRROR_COAT))
+    is_metal_burst  = should_apply & (effect_type == jnp.int32(ME_METAL_BURST))
+
+    counter_dmg     = jnp.where(last_phys > jnp.int32(0), last_phys * 2, jnp.int32(0))
+    mirror_dmg      = jnp.where(last_spec > jnp.int32(0), last_spec * 2, jnp.int32(0))
+    metal_dmg       = jnp.where(last_any  > jnp.int32(0), last_any * 3 // 2, jnp.int32(0))
+
+    retort_dmg = jnp.where(is_counter,
+                            counter_dmg,
+                            jnp.where(is_mirror_coat,
+                                       mirror_dmg,
+                                       jnp.where(is_metal_burst, metal_dmg, jnp.int32(0))))
+    do_retort = (is_counter | is_mirror_coat | is_metal_burst) & (retort_dmg > jnp.int32(0))
+    retort_dmg = jnp.where(do_retort, retort_dmg, jnp.int32(0))
+    state = apply_damage(state, def_side, def_idx, retort_dmg)
+
+    # ------------------------------------------------------------------
+    # ME_SECONDARY_CONFUSE: apply confusion with probability from sec_chance field.
+    # Substitute blocks it; Own Tempo prevents confusion.
+    # Called AFTER damage pipeline, so we gate on ~cancelled (already in should_apply).
+    # ------------------------------------------------------------------
+    from pokejax.mechanics.abilities import OWN_TEMPO_ID as _OWN_TEMPO_ID_sc
+    is_secondary_confuse = should_apply & (effect_type == jnp.int32(ME_SECONDARY_CONFUSE))
+    sc_chance_val = tables.moves[mid, MF_SEC_CHANCE].astype(jnp.int32)
+    # Serene Grace: double secondary chance (check attacker's ability)
+    from pokejax.mechanics.abilities import SERENE_GRACE_ID as _SG_ID_sc
+    atk_ability_sc = state.sides_team_ability_id[atk_side, atk_idx].astype(jnp.int32)
+    has_sg_sc = (_SG_ID_sc >= 0) & (atk_ability_sc == jnp.int32(_SG_ID_sc))
+    sc_chance_val = jnp.where(has_sg_sc,
+                               jnp.minimum(jnp.int32(100), sc_chance_val * 2),
+                               sc_chance_val)
+    key, sc_key = jax.random.split(key)
+    sc_rolls = jax.random.randint(sc_key, shape=(), minval=0, maxval=100) < sc_chance_val
+    def_has_sub_sc = (state.sides_team_volatiles[def_side, def_idx]
+                      & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
+    def_ability_sc = state.sides_team_ability_id[def_side, def_idx].astype(jnp.int32)
+    has_own_tempo_sc = (_OWN_TEMPO_ID_sc >= 0) & (def_ability_sc == jnp.int32(_OWN_TEMPO_ID_sc))
+    apply_sec_confuse = is_secondary_confuse & sc_rolls & ~def_has_sub_sc & ~has_own_tempo_sc
+    state = _apply_volatile_bit(state, def_side, def_idx, jnp.int32(VOL_CONFUSED), apply_sec_confuse)
+    from pokejax.core import rng as _rng_sc
+    key, sc_dur_key = _rng_sc.split(key)
+    sc_dur = _rng_sc.confusion_roll(sc_dur_key)
+    old_sc_conf_dat = state.sides_team_volatile_data[def_side, def_idx, VOL_CONFUSED]
+    new_sc_conf_dat = jnp.where(apply_sec_confuse, sc_dur, old_sc_conf_dat)
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[
+            def_side, def_idx, VOL_CONFUSED
+        ].set(new_sc_conf_dat)
+    )
+
+    # ------------------------------------------------------------------
+    # ME_SWAGGER: boost foe's ATK by +2, then confuse foe (100% chance).
+    # ME_FLATTER: boost foe's SpA by +1, then confuse foe (100% chance).
+    # Own Tempo blocks confusion; Substitute blocks both effects.
+    # ------------------------------------------------------------------
+    from pokejax.mechanics.abilities import OWN_TEMPO_ID as _OWN_TEMPO_ID_sw
+    def_has_sub_sw = (state.sides_team_volatiles[def_side, def_idx]
+                      & jnp.uint32(1 << VOL_SUBSTITUTE)) != jnp.uint32(0)
+    def_ability_sw = state.sides_team_ability_id[def_side, def_idx].astype(jnp.int32)
+    has_own_tempo_sw = (_OWN_TEMPO_ID_sw >= 0) & (def_ability_sw == jnp.int32(_OWN_TEMPO_ID_sw))
+
+    is_swagger = should_apply & (effect_type == jnp.int32(ME_SWAGGER)) & ~def_has_sub_sw
+    is_flatter = should_apply & (effect_type == jnp.int32(ME_FLATTER)) & ~def_has_sub_sw
+
+    # Stat boosts (ATK +2 for Swagger, SpA +1 for Flatter) — goes through ability interactions
+    state = _apply_stat_boost(state, def_side, def_idx, jnp.int32(BOOST_ATK), jnp.int32(2), is_swagger, is_foe=True)
+    state = _apply_stat_boost(state, def_side, def_idx, jnp.int32(BOOST_SPA), jnp.int32(1), is_flatter, is_foe=True)
+
+    # Confusion application (blocked by Own Tempo)
+    apply_swagger_confuse = is_swagger & ~has_own_tempo_sw
+    apply_flatter_confuse = is_flatter & ~has_own_tempo_sw
+    apply_either_confuse  = apply_swagger_confuse | apply_flatter_confuse
+    state = _apply_volatile_bit(state, def_side, def_idx, jnp.int32(VOL_CONFUSED), apply_either_confuse)
+    from pokejax.core import rng as _rng_sw
+    key, sw_dur_key = _rng_sw.split(key)
+    sw_dur = _rng_sw.confusion_roll(sw_dur_key)
+    old_sw_conf_dat = state.sides_team_volatile_data[def_side, def_idx, VOL_CONFUSED]
+    new_sw_conf_dat = jnp.where(apply_either_confuse, sw_dur, old_sw_conf_dat)
+    state = state._replace(
+        sides_team_volatile_data=state.sides_team_volatile_data.at[
+            def_side, def_idx, VOL_CONFUSED
+        ].set(new_sw_conf_dat)
+    )
 
     return state, key

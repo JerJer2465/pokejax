@@ -180,6 +180,20 @@ def execute_move_action(
     is_status_move = (move_category == jnp.int32(CATEGORY_STATUS))
     can_move = can_move & ~(atk_taunted & is_status_move)
 
+    # Attract/Infatuation: 50% chance not to act (Gen 4: randomChance(1, 2))
+    from pokejax.types import VOL_ATTRACT as _VOL_ATTRACT
+    atk_infatuated = (atk_vols & jnp.uint32(1 << _VOL_ATTRACT)) != jnp.uint32(0)
+    key, attract_key = jax.random.split(key)
+    attract_stops = atk_infatuated & (jax.random.randint(attract_key, shape=(), minval=0, maxval=2, dtype=jnp.int32) == jnp.int32(0))
+    can_move = can_move & ~attract_stops
+
+    # Torment: cannot use same move as last turn
+    from pokejax.types import VOL_TORMENT as _VOL_TORMENT
+    atk_tormented = (atk_vols & jnp.uint32(1 << _VOL_TORMENT)) != jnp.uint32(0)
+    last_mid = state.sides_team_last_move_id[atk_side, atk_idx]
+    same_as_last = (move_id.astype(jnp.int16) == last_mid) & (last_mid >= jnp.int16(0))
+    can_move = can_move & ~(atk_tormented & same_as_last)
+
     # Deduct PP (always, even if frozen/paralyzed that turn)
     # Pressure: if the defender has Pressure, deduct 2 PP instead of 1
     from pokejax.mechanics.abilities import PRESSURE_ID

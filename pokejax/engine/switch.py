@@ -77,6 +77,12 @@ def switch_out(state: BattleState, side: int, cfg) -> BattleState:
     new_moved = state.sides_team_move_this_turn.at[side, idx].set(False)
     state = state._replace(sides_team_move_this_turn=new_moved)
 
+    # Clear move_disabled (Disable doesn't persist through switch-out)
+    for _ms in range(4):
+        state = state._replace(
+            sides_team_move_disabled=state.sides_team_move_disabled.at[side, idx, _ms].set(jnp.bool_(False))
+        )
+
     # SwitchOut ability effects (e.g., Natural Cure clears status)
     state = run_event_switch_out(state, side, idx)
 
@@ -95,6 +101,10 @@ def switch_in(state: BattleState, side: int, new_slot: int,
     """
     # Set the new Pokemon as active
     state = set_active(state, side, new_slot)
+
+    # Reset active-turns counter to 0 (Speed Boost skips first turn after switch-in)
+    new_active_turns = state.sides_team_active_turns.at[side, new_slot].set(jnp.int8(0))
+    state = state._replace(sides_team_active_turns=new_active_turns)
 
     # Apply entry hazards (tables needed for Stealth Rock type-effectiveness)
     state = apply_entry_hazards(state, side, tables)
@@ -115,6 +125,8 @@ def force_switch(state: BattleState, side: int, new_slot: jnp.ndarray,
     state = clear_volatiles(state, side, state.sides_active_idx[side])
     state = reset_boosts(state, side, state.sides_active_idx[side])
     state = set_active(state, side, new_slot)
+    new_active_turns = state.sides_team_active_turns.at[side, new_slot].set(jnp.int8(0))
+    state = state._replace(sides_team_active_turns=new_active_turns)
     state = apply_entry_hazards(state, side, tables)
     return state
 

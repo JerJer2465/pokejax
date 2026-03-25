@@ -164,7 +164,15 @@ def _natural_cure_switch_out(state, side_i32, slot_i32):
 # ---------------------------------------------------------------------------
 
 def _speed_boost_residual(state, key, side_i32, slot_i32):
-    return _apply_boost(state, side_i32, slot_i32, BOOST_SPE, 1), key
+    # Gen 4 PS: Speed Boost skips the turn the Pokemon switches in (activeTurns == 0).
+    # active_turns is incremented AFTER residuals fire, so it equals 0 on switch-in turn.
+    active_turns = state.sides_team_active_turns[side_i32, slot_i32].astype(jnp.int32)
+    already_active = active_turns > jnp.int32(0)
+    cur_spe = state.sides_team_boosts[side_i32, slot_i32, BOOST_SPE]
+    new_spe = jnp.clip(cur_spe.astype(jnp.int32) + jnp.int32(1), -6, 6).astype(jnp.int8)
+    final_spe = jnp.where(already_active, new_spe, cur_spe)
+    final_boosts = state.sides_team_boosts.at[side_i32, slot_i32, BOOST_SPE].set(final_spe)
+    return state._replace(sides_team_boosts=final_boosts), key
 
 
 def _poison_heal_residual(state, key, side_i32, slot_i32):

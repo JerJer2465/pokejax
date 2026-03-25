@@ -327,6 +327,16 @@ class BattleState(NamedTuple):
     sides_side_conditions:    jnp.ndarray  # int8[2, MAX_SIDE_CONDS]
     sides_dynamax_turns:      jnp.ndarray  # int8[2]
 
+    # Number of full turns each Pokemon has been active (incremented at end of turn).
+    # Speed Boost skips activation on turn 0 (the turn the Pokemon switched in).
+    # Reset to 0 on switch-in.
+    sides_team_active_turns:  jnp.ndarray  # int8[2, 6]
+
+    # Tracks last physical/special damage taken by the ACTIVE Pokemon this turn
+    # Used for Counter (2x last phys), Mirror Coat (2x last spec), Metal Burst (1.5x last)
+    sides_last_dmg_phys:      jnp.ndarray  # int16[2]
+    sides_last_dmg_spec:      jnp.ndarray  # int16[2]
+
     field:                    FieldState
 
     # Turn counter and result
