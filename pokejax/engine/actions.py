@@ -16,12 +16,13 @@ import jax.numpy as jnp
 from pokejax.types import (
     BattleState,
     VOL_PROTECT, VOL_CHOICELOCK, VOL_RECHARGING, VOL_CHARGING, VOL_DESTINYBOND,
+    VOL_TAUNT,
     STATUS_NONE,
     CATEGORY_STATUS,
     MAX_TEAM_SIZE,
 )
 from pokejax.core.damage import (
-    MF_CATEGORY, MF_BASE_POWER,
+    MF_CATEGORY, MF_BASE_POWER, MF_FLAGS_LO, FLAG_RECHARGE,
     apply_damage, apply_heal, fraction_of_max_hp,
 )
 from pokejax.core.state import (
@@ -149,8 +150,15 @@ def execute_move_action(
     can_move = can_move & frz_can_move
 
     # Confusion (deals self-hit and sets can_move=False if hit)
-    conf_can_move, key, state = check_confusion_before_move(state, atk_side, key)
+    conf_can_move, key, state = check_confusion_before_move(state, atk_side, key, tables)
     can_move = can_move & conf_can_move
+
+    # Taunt: cannot use status moves (CATEGORY_STATUS) while taunted
+    atk_vols = state.sides_team_volatiles[atk_side, atk_idx]
+    atk_taunted = (atk_vols & jnp.uint32(1 << VOL_TAUNT)) != jnp.uint32(0)
+    move_category = tables.moves[move_id.astype(jnp.int32), MF_CATEGORY].astype(jnp.int32)
+    is_status_move = (move_category == jnp.int32(CATEGORY_STATUS))
+    can_move = can_move & ~(atk_taunted & is_status_move)
 
     # Deduct PP (always, even if frozen/paralyzed that turn)
     # Pressure: if the defender has Pressure, deduct 2 PP instead of 1
@@ -213,6 +221,34 @@ def execute_move_action(
     new_moved = state.sides_team_move_this_turn.at[atk_side, atk_idx].set(True)
     state = state._replace(sides_team_move_this_turn=new_moved)
 
+    # ------------------------------------------------------------------
+    # Choice item lock: if attacker has Choice Band/Specs/Scarf and the
+    # move was not cancelled, lock to this move slot for future turns.
+    # Clears on switch-out (handled in switch.py).
+    # ------------------------------------------------------------------
+    from pokejax.mechanics.items import CHOICE_BAND_ID, CHOICE_SPECS_ID, CHOICE_SCARF_ID
+    atk_item = state.sides_team_item_id[atk_side, atk_idx].astype(jnp.int32)
+    has_choice = (
+        ((CHOICE_BAND_ID >= 0) & (atk_item == jnp.int32(CHOICE_BAND_ID))) |
+        ((CHOICE_SPECS_ID >= 0) & (atk_item == jnp.int32(CHOICE_SPECS_ID))) |
+        ((CHOICE_SCARF_ID >= 0) & (atk_item == jnp.int32(CHOICE_SCARF_ID)))
+    )
+    should_lock = has_choice & ~move_cancelled
+    atk_vols_choice = state.sides_team_volatiles[atk_side, atk_idx]
+    new_vols_choice = jnp.where(
+        should_lock,
+        atk_vols_choice | jnp.uint32(1 << VOL_CHOICELOCK),
+        atk_vols_choice,
+    )
+    # Store the locked move slot in volatile_data[VOL_CHOICELOCK]
+    old_locked_slot = state.sides_team_volatile_data[atk_side, atk_idx, VOL_CHOICELOCK]
+    new_locked_slot = jnp.where(should_lock, move_slot_i.astype(jnp.int8), old_locked_slot)
+    new_vol_data_choice = state.sides_team_volatile_data.at[atk_side, atk_idx, VOL_CHOICELOCK].set(new_locked_slot)
+    state = state._replace(
+        sides_team_volatiles=state.sides_team_volatiles.at[atk_side, atk_idx].set(new_vols_choice),
+        sides_team_volatile_data=new_vol_data_choice,
+    )
+
     # Check for faints
     def_was_alive = ~state.sides_team_fainted[def_side, def_idx]
     state = check_fainted(state, def_side)
@@ -222,6 +258,25 @@ def execute_move_action(
     # also faints (direct KO trigger — branchless).
     # ------------------------------------------------------------------
     def_just_fainted = def_was_alive & state.sides_team_fainted[def_side, def_idx]
+
+    # ------------------------------------------------------------------
+    # Recharge mechanic (Hyper Beam, Giga Impact, Blast Burn, etc.)
+    # PS Gen 4: "if (!target.fainted)" → set mustrecharge volatile.
+    # So recharge is required UNLESS the target just fainted this turn.
+    # ------------------------------------------------------------------
+    move_flags_lo = tables.moves[move_id.astype(jnp.int32), MF_FLAGS_LO].astype(jnp.int32)
+    has_recharge_flag = (move_flags_lo & jnp.int32(FLAG_RECHARGE)) != jnp.int32(0)
+    should_recharge = has_recharge_flag & ~move_cancelled & ~def_just_fainted
+    old_atk_vols = state.sides_team_volatiles[atk_side, atk_idx]
+    new_atk_vols_rc = jnp.where(
+        should_recharge,
+        old_atk_vols | jnp.uint32(1 << VOL_RECHARGING),
+        old_atk_vols,
+    )
+    state = state._replace(
+        sides_team_volatiles=state.sides_team_volatiles.at[atk_side, atk_idx].set(new_atk_vols_rc)
+    )
+
     def_had_dbond = ((state.sides_team_volatiles[def_side, def_idx]
                       & jnp.uint32(1 << VOL_DESTINYBOND)) != jnp.uint32(0))
     dbond_trigger = def_just_fainted & def_had_dbond & ~move_cancelled

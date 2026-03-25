@@ -388,8 +388,8 @@ class PokeJAXEnv:
     def get_action_masks(self, env_state: EnvState) -> jnp.ndarray:
         """Return bool[2, 10] legal action masks for both players."""
         state = env_state.battle
-        mask0 = get_action_mask(state, 0)
-        mask1 = get_action_mask(state, 1)
+        mask0 = get_action_mask(state, 0, self.tables)
+        mask1 = get_action_mask(state, 1, self.tables)
         return jnp.stack([mask0, mask1], axis=0)
 
     # ------------------------------------------------------------------

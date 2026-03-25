@@ -97,8 +97,8 @@ def critical_hit_roll(key: jnp.ndarray, ratio: jnp.ndarray) -> jnp.ndarray:
 
 
 def sleep_roll(key: jnp.ndarray) -> jnp.ndarray:
-    """Roll sleep duration: 1-3 turns (uniform, Gen 3+ rule)."""
-    return jax.random.randint(key, shape=(), minval=1, maxval=4, dtype=jnp.int8)
+    """Roll sleep duration: 2-5 turns (uniform, Gen 4 PS: random(2, 6))."""
+    return jax.random.randint(key, shape=(), minval=2, maxval=6, dtype=jnp.int8)
 
 
 def confusion_roll(key: jnp.ndarray) -> jnp.ndarray:

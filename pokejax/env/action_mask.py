@@ -22,8 +22,9 @@ import jax.numpy as jnp
 from pokejax.types import (
     BattleState,
     VOL_PARTIALLY_TRAPPED, VOL_INGRAIN, VOL_ENCORE, VOL_CHOICELOCK,
-    VOL_RECHARGING,
+    VOL_RECHARGING, VOL_TAUNT,
     TYPE_FLYING, TYPE_GHOST, TYPE_STEEL,
+    CATEGORY_STATUS,
     MAX_TEAM_SIZE, MAX_MOVES,
 )
 
@@ -31,7 +32,7 @@ from pokejax.types import (
 N_ACTIONS = 10  # 4 moves + 6 switches
 
 
-def get_move_mask(state: BattleState, side: int) -> jnp.ndarray:
+def get_move_mask(state: BattleState, side: int, tables=None) -> jnp.ndarray:
     """
     Returns bool[4] — which move slots are legal to choose.
     """
@@ -64,6 +65,15 @@ def get_move_mask(state: BattleState, side: int) -> jnp.ndarray:
     # Recharging: no moves are legal (engine auto-skips the turn)
     recharging = (vols & jnp.uint32(1 << VOL_RECHARGING)) != jnp.uint32(0)
     base_mask = jnp.where(recharging, jnp.zeros(4, dtype=jnp.bool_), base_mask)
+
+    # Taunt: cannot use status (category=2) moves while taunted
+    if tables is not None:
+        taunted = (vols & jnp.uint32(1 << VOL_TAUNT)) != jnp.uint32(0)
+        move_ids_i32 = move_ids.astype(jnp.int32)
+        # Category field index 3 in move table
+        categories = tables.moves[move_ids_i32, 3]  # MF_CATEGORY = 3
+        is_status = categories == jnp.int8(CATEGORY_STATUS)
+        base_mask = jnp.where(taunted, base_mask & ~is_status, base_mask)
 
     # If no legal move exists → Struggle (force all moves legal so the policy can pick)
     any_legal = base_mask.any()
@@ -135,11 +145,12 @@ def get_switch_mask(state: BattleState, side: int) -> jnp.ndarray:
     return jnp.where(cant_switch, jnp.zeros(6, dtype=jnp.bool_), base_switch)
 
 
-def get_action_mask(state: BattleState, side: int) -> jnp.ndarray:
+def get_action_mask(state: BattleState, side: int, tables=None) -> jnp.ndarray:
     """
     Full action mask: bool[10].
     [0:4] = move mask, [4:10] = switch mask.
+    Pass tables to enable Taunt enforcement in move mask.
     """
-    move_mask   = get_move_mask(state, side)    # bool[4]
-    switch_mask = get_switch_mask(state, side)  # bool[6]
+    move_mask   = get_move_mask(state, side, tables)  # bool[4]
+    switch_mask = get_switch_mask(state, side)         # bool[6]
     return jnp.concatenate([move_mask, switch_mask])

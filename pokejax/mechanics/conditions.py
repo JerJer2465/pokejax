@@ -230,10 +230,12 @@ def check_freeze_before_move(state: BattleState, side: int,
 
 
 def check_confusion_before_move(state: BattleState, side: int,
-                                  key: jnp.ndarray) -> tuple[bool, jnp.ndarray, BattleState]:
+                                  key: jnp.ndarray,
+                                  tables=None) -> tuple[bool, jnp.ndarray, BattleState]:
     """
     Confusion: decrement counter. If it reaches 0, snap out.
-    If still confused: 33% chance to hurt self (typeless, physical, 40 bp at 1/2 atk).
+    If still confused: Gen 4 = 50% chance to hurt self (typeless, physical, 40 bp).
+    Damage uses boosted Attack/Defense (same as PS getDamage(pokemon, pokemon, 40)).
     Returns (can_move, new_key, new_state).
     """
     idx = _active_slot(state, side)
@@ -252,18 +254,32 @@ def check_confusion_before_move(state: BattleState, side: int,
     state = set_volatile(state, side, idx, VOL_CONFUSED,
                          is_confused & ~snapped_out)
 
-    # Roll for self-hit (33% = roll < 33 out of 100)
+    # Gen 4: 50% chance to hurt self (PS: randomChance(1, 2))
     key, subkey = rng_utils.split(key)
-    self_hit = is_confused & ~snapped_out & rng_utils.rand_bool_pct(subkey, 33)
+    self_hit = is_confused & ~snapped_out & rng_utils.speed_tie_roll(subkey).astype(jnp.bool_)
 
-    # Confusion self-hit: 40 bp, typeless Physical, uses Attack vs Def
-    # We approximate: floor(40 * atk / def / 50) * 2 -- simplified
-    # Full formula applied inline here
-    atk_stat = state.sides_team_base_stats[side, idx, 1].astype(jnp.int32)  # ATK
-    def_stat = state.sides_team_base_stats[side, idx, 2].astype(jnp.int32)  # DEF
+    # Confusion self-hit: 40 bp, typeless Physical, uses boosted Attack vs boosted Defense
+    # PS: getDamage(pokemon, pokemon, 40) — includes stat boosts, no crit, no STAB/type
+    atk_base  = state.sides_team_base_stats[side, idx, 1].astype(jnp.float32)  # ATK
+    def_base  = state.sides_team_base_stats[side, idx, 2].astype(jnp.float32)  # DEF
+    atk_boost = state.sides_team_boosts[side, idx, 0]  # BOOST_ATK = 0
+    def_boost = state.sides_team_boosts[side, idx, 1]  # BOOST_DEF = 1
     level     = state.sides_team_level[side, idx].astype(jnp.int32)
-    conf_dmg  = ((2 * level // 5 + 2) * 40 * atk_stat // def_stat) // 50 + 2
-    conf_dmg  = jnp.maximum(jnp.int32(1), conf_dmg)
+    # Boost multiplier: max(2, 2+stage) / max(2, 2-stage)
+    if tables is not None:
+        atk_mult = tables.get_boost_multiplier(atk_boost)
+        def_mult = tables.get_boost_multiplier(def_boost)
+    else:
+        # Fallback: compute inline without tables
+        def _boost_mult(s):
+            s = s.astype(jnp.float32)
+            return jnp.maximum(2.0, 2.0 + s) / jnp.maximum(2.0, 2.0 - s)
+        atk_mult = _boost_mult(atk_boost)
+        def_mult = _boost_mult(def_boost)
+    atk_eff  = jnp.maximum(jnp.int32(1), jnp.floor(atk_base * atk_mult).astype(jnp.int32))
+    def_eff  = jnp.maximum(jnp.int32(1), jnp.floor(def_base * def_mult).astype(jnp.int32))
+    conf_dmg = ((2 * level // 5 + 2) * 40 * atk_eff // def_eff) // 50 + 2
+    conf_dmg = jnp.maximum(jnp.int32(1), conf_dmg)
 
     new_hp = jnp.where(
         self_hit,

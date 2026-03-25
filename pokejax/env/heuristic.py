@@ -94,7 +94,7 @@ def smart_heuristic_action(
 
     Pass _np_cache from _state_to_numpy() to avoid repeated device→host transfers.
     """
-    mask = np.array(get_action_mask(state, side))
+    mask = np.array(get_action_mask(state, side, tables))
     legal = np.where(mask)[0]
     if len(legal) == 0:
         return 0
