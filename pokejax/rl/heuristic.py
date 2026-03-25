@@ -114,6 +114,44 @@ def _type_eff(atk_type, def_type1, def_type2, type_chart):
     return eff1 * eff2
 
 
+def _matchup_score_ps(mon_types, mon_stats, mon_hp_frac, opp_types, opp_stats, type_chart):
+    """
+    Matchup score mirroring PS SimpleHeuristicsPlayer._estimate_matchup.
+
+    Positive = we have type/speed advantage. Switches when score < -2 AND
+    a bench option scores > 0 (matching SWITCH_OUT_MATCHUP_THRESHOLD = -2).
+    """
+    # Best of our types vs opp (how hard can we hit?)
+    eff1 = _type_eff(mon_types[0], opp_types[0], opp_types[1], type_chart)
+    eff2 = jnp.where(
+        mon_types[1] > 0,
+        _type_eff(mon_types[1], opp_types[0], opp_types[1], type_chart),
+        jnp.float32(0.0),
+    )
+    our_best = jnp.maximum(eff1, eff2)
+
+    # Best of opp types vs us (how hard can they hit us?)
+    oeff1 = _type_eff(opp_types[0], mon_types[0], mon_types[1], type_chart)
+    oeff2 = jnp.where(
+        opp_types[1] > 0,
+        _type_eff(opp_types[1], mon_types[0], mon_types[1], type_chart),
+        jnp.float32(0.0),
+    )
+    opp_best = jnp.maximum(oeff1, oeff2)
+
+    # Speed tier (±0.1 base, +0.2 more if 1.5× faster/slower)
+    mon_spe = mon_stats[5].astype(jnp.float32)
+    opp_spe = opp_stats[5].astype(jnp.float32)
+    speed = (
+        jnp.where(mon_spe > opp_spe, jnp.float32(0.1), jnp.float32(0.0))
+        + jnp.where(mon_spe > opp_spe * 1.5, jnp.float32(0.2), jnp.float32(0.0))
+        - jnp.where(opp_spe > mon_spe, jnp.float32(0.1), jnp.float32(0.0))
+        - jnp.where(opp_spe > mon_spe * 1.5, jnp.float32(0.2), jnp.float32(0.0))
+    )
+
+    return our_best - opp_best + speed + mon_hp_frac * jnp.float32(0.4)
+
+
 def _estimate_damage(bp, move_type, category, accuracy,
                      atk_types, atk_stats, def_types, def_stats,
                      type_chart):
@@ -321,7 +359,12 @@ def heuristic_action(state: BattleState, side: int, tables: Tables,
 
     best_move_score = jnp.max(scores[:4])
 
-    # --- Score switches 4-9 ---
+    # --- PS-style matchup for active mon ---
+    current_matchup = _matchup_score_ps(
+        own_types, own_stats, own_hp_frac, opp_types, opp_stats, type_chart,
+    )
+
+    # --- Score switches 4-9 using PS matchup scoring ---
     for slot in range(6):  # unrolled by JIT
         slot_hp = state.sides_team_hp[side, slot].astype(jnp.float32)
         slot_max_hp = jnp.maximum(state.sides_team_max_hp[side, slot].astype(jnp.float32), 1.0)
@@ -330,59 +373,29 @@ def heuristic_action(state: BattleState, side: int, tables: Tables,
         slot_types = state.sides_team_types[side, slot]
         slot_stats = state.sides_team_base_stats[side, slot]
 
-        # Best outgoing damage from this bench mon
-        best_dmg = jnp.float32(0.0)
-        for sm in range(4):  # unrolled
-            mid = state.sides_team_move_ids[side, slot, sm].astype(jnp.int32)
-            safe_mid = jnp.clip(mid, 0, n_moves - 1)
-            mrow = moves_table[safe_mid]
-            mbp = mrow[MF_BASE_POWER].astype(jnp.int32)
-            mtype = mrow[MF_TYPE].astype(jnp.int32)
-            mcat = mrow[MF_CATEGORY].astype(jnp.int32)
-            macc = mrow[MF_ACCURACY].astype(jnp.int32)
-            d = _estimate_damage(
-                mbp, mtype, mcat, macc,
-                slot_types, slot_stats, opp_types, opp_stats, type_chart,
-            )
-            d = jnp.where(mid >= 0, d, 0.0)
-            best_dmg = jnp.maximum(best_dmg, d)
+        # PS-style matchup score for this bench slot
+        slot_matchup = _matchup_score_ps(
+            slot_types, slot_stats, slot_hp_frac, opp_types, opp_stats, type_chart,
+        )
 
-        # Worst incoming damage from opponent
-        worst_inc = jnp.float32(0.0)
-        for om in range(4):  # unrolled
-            oid = state.sides_team_move_ids[opp, opp_active_idx, om].astype(jnp.int32)
-            safe_oid = jnp.clip(oid, 0, n_moves - 1)
-            orow = moves_table[safe_oid]
-            obp = orow[MF_BASE_POWER].astype(jnp.int32)
-            otype = orow[MF_TYPE].astype(jnp.int32)
-            ocat = orow[MF_CATEGORY].astype(jnp.int32)
-            oacc = orow[MF_ACCURACY].astype(jnp.int32)
-            inc = _estimate_damage(
-                obp, otype, ocat, oacc,
-                opp_types, opp_stats, slot_types, slot_stats, type_chart,
-            )
-            inc = jnp.where(oid >= 0, inc, 0.0)
-            worst_inc = jnp.maximum(worst_inc, inc)
-
-        switch_score = (best_dmg * 1.2 - worst_inc * 0.3) * slot_hp_frac
+        switch_score = slot_matchup
         # Skip if HP too low
-        switch_score = jnp.where(slot_hp_frac < 0.15, -1e9, switch_score)
+        switch_score = jnp.where(slot_hp_frac < 0.15, jnp.float32(-1e9), switch_score)
         # Ensure illegal switches get -inf
-        switch_score = jnp.where(mask[4 + slot], switch_score, -1e9)
+        switch_score = jnp.where(mask[4 + slot], switch_score, jnp.float32(-1e9))
         scores = scores.at[4 + slot].set(switch_score)
 
     best_switch_score = jnp.max(scores[4:])
 
     # --- Decision: move vs switch ---
-    # Switch if best_move_score <= 0 or switch_score > move_score * 2
-    should_switch = (
-        ((best_move_score <= 0) & (best_switch_score > -1e8)) |
-        ((best_switch_score > best_move_score * 2.0) & (best_switch_score > -1e8))
-    )
+    # PS-style: switch when current matchup is bad (< -2) AND bench has good option (> 0)
+    should_switch_ps = (current_matchup < jnp.float32(-2.0)) & (best_switch_score > jnp.float32(0.0))
+    # Fallback: switch if no good moves available at all
+    should_switch_nomove = (best_move_score <= 0) & (best_switch_score > jnp.float32(-1e8))
+    should_switch = should_switch_ps | should_switch_nomove
 
     # Override: if switch is chosen but no switch is legal, use best move
     any_switch_legal = mask[4:].any()
-    any_move_legal = mask[:4].any()
     should_switch = should_switch & any_switch_legal
 
     # Select action
