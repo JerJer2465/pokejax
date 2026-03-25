@@ -667,11 +667,14 @@ def execute_move_hit(tables, state: BattleState,
     from pokejax.mechanics.abilities import SKILL_LINK_ID
     has_skill_link = (SKILL_LINK_ID >= 0) & (atk_ability_id == jnp.int32(SKILL_LINK_ID))
     key, hit_key = rng_utils.split(key)
+    # Roll using the standard 2-5 PS distribution, then clamp to [multi_min, multi_max].
+    # This correctly handles fixed-hit moves (e.g., Bonemerang min=max=2 → always 2 hits)
+    # because clip(roll, 2, 2) = 2 regardless of roll.
+    raw_roll = rng_utils.multi_hit_roll(hit_key, 2, 5).astype(jnp.int32)
+    clamped_roll = jnp.clip(raw_roll, multi_min, multi_max)
     n_hits = jnp.where(
         is_multihit,
-        jnp.where(has_skill_link,
-                   jnp.int32(5),
-                   rng_utils.multi_hit_roll(hit_key, 2, 5).astype(jnp.int32)),
+        jnp.where(has_skill_link, jnp.int32(5), clamped_roll),
         jnp.int32(1)
     )
 
