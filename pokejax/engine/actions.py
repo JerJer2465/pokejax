@@ -31,7 +31,7 @@ from pokejax.core.state import (
 )
 from pokejax.core import rng as rng_utils
 from pokejax.engine.hit_pipeline import execute_move_hit
-from pokejax.engine.switch import switch_out, switch_in
+from pokejax.engine.switch import switch_out, switch_in, force_switch
 from pokejax.mechanics.moves import execute_move_effects
 
 
@@ -366,6 +366,45 @@ def execute_move_action(
     state = jax.tree.map(
         lambda x, y: jnp.where(will_pivot, x, y),
         pivoted, state,
+    )
+
+    # ------------------------------------------------------------------
+    # ME_ROAR: force defender to switch to a random alive non-active mon.
+    # Roar, Whirlwind, Dragon Tail, Circle Throw.
+    # Fails if: cancelled, no valid replacement, defender is the only one left.
+    # Entry hazards apply on the forced switch-in.
+    # ------------------------------------------------------------------
+    from pokejax.data.move_effects_data import ME_ROAR as _ME_ROAR
+    effect_type_roar = tables.move_effects[move_id.astype(jnp.int32), 0].astype(jnp.int32)
+    is_roar = (~move_cancelled) & (effect_type_roar == jnp.int32(_ME_ROAR))
+
+    # Build validity mask for defender's team (alive, not currently active)
+    def_active_now = state.sides_active_idx[def_side].astype(jnp.int32)
+    slots_i32 = jnp.arange(6, dtype=jnp.int32)
+    roar_valid = (
+        ~state.sides_team_fainted[def_side] &
+        (slots_i32 != def_active_now)
+    )  # bool[6]
+    has_roar_target = roar_valid.any()
+
+    # Pick random slot from valid targets (branchless):
+    # Generate per-slot random values, zero out invalid, pick argmax.
+    key, roar_key = rng_utils.split(key)
+    rand_vals = jax.random.uniform(roar_key, shape=(6,), dtype=jnp.float32)
+    masked_rand = jnp.where(roar_valid, rand_vals, jnp.float32(-1.0))
+    roar_slot = jnp.argmax(masked_rand).astype(jnp.int32)
+
+    will_roar = is_roar & has_roar_target & ~state.finished
+
+    # Compute forced-switch state (always traced, branchlessly selected)
+    safe_roar_slot = jnp.maximum(jnp.int32(0), roar_slot)
+    roared_state = force_switch(state, def_side, safe_roar_slot, tables, cfg)
+    roared_state = check_fainted(roared_state, def_side)
+    roared_state = check_win(roared_state)
+
+    state = jax.tree.map(
+        lambda x, y: jnp.where(will_roar, x, y),
+        roared_state, state,
     )
 
     return state, key
